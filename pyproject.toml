@@ -17,12 +17,12 @@ authors = [
   { name="Jonas Schwab", email="jonas.schwab@uni-wuerzburg.de" },
 ]
 description = "Python interface for ALF, plus scripts and Jupyter notebooks."
-license = {file = "LICENSE"}
+license = "GPL-2.0-or-later"
+license-files = ['LICENSE']
 readme = "README.md"
 requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
     "Operating System :: OS Independent",
 ]
 dependencies = [

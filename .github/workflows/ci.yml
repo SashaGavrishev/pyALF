@@ -108,3 +108,14 @@ jobs:
           name: jupyter-book-html
           path: doc/_build/html
           if-no-files-found: error
+
+  build_package:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/astral-sh/uv:alpine
+    steps:
+      - name: install git
+        run: apk add --no-cache git
+      - name: Checkout
+        uses: actions/checkout@v6
+      - run: uv build
