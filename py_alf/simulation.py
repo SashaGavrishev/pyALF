@@ -6,6 +6,8 @@ __author__ = "Jonas Schwab"
 __copyright__ = "Copyright 2020-2022, The ALF Project"
 __license__ = "GPL"
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -44,11 +46,18 @@ class Simulation:
     ham_name : str
         Name of the Hamiltonian.
     sim_dict : dict or list of dicts
-        Dictionary specfying parameters owerwriting defaults.
+        Dictionary specifying parameters overwriting defaults.
         Can be a list of dictionaries to enable parallel tempering.
     sim_dir : path-like object, optional
         Directory in which the Monte Carlo will be run.
         If not specified, sim_dir is generated from sim_dict.
+    sim_dir_hash : bool, default=False
+        Whether to use a hash of the parameters for the directory name.
+        This is an experimental feature to get shorter directory names
+        that take into account all simulation parameters except for
+        Nbin and CPU_MAX. It is not fully supported and may lead to
+        issues with reproducibility if parameters are changed without
+        changing the directory name. Use with caution.
     sim_root : path-like object, default="ALF_data"
         Directory to prepend to sim_dir.
     mpi : bool, default=False
@@ -90,10 +99,18 @@ class Simulation:
         self.alf_src = alf_src
         self.ham_name = ham_name
         self.sim_dict = sim_dict
+        sim_root = kwargs.pop("sim_root", "ALF_data")
+        sim_dir_hash = kwargs.pop("sim_dir_hash", False)
+        explicit_sim_dir = kwargs.pop("sim_dir", None)
+        if explicit_sim_dir is not None:
+            # Explicitly provided sim_dir takes precedence over hash-based naming
+            dir_component = explicit_sim_dir
+        elif sim_dir_hash:
+            dir_component = directory_name_hash(alf_src, ham_name, sim_dict)
+        else:
+            dir_component = directory_name(alf_src, ham_name, sim_dict)
         self.sim_dir = os.path.abspath(os.path.expanduser(os.path.join(
-            kwargs.pop("sim_root", "ALF_data"),
-            kwargs.pop("sim_dir",
-                       directory_name(alf_src, ham_name, sim_dict)))))
+            sim_root, dir_component)))
         self.mpi = kwargs.pop("mpi", False)
         self.parallel_params = kwargs.pop("parallel_params", False)
         self.n_mpi = kwargs.pop("n_mpi", 2)
@@ -406,6 +423,47 @@ def directory_name(alf_src, ham_name, sim_dict):
                 name_temp = name[4:] if name.upper().startswith('HAM_') else name
                 dirname = f'{dirname}{name_temp}={value}_'
     return dirname[:-1]
+
+
+def get_hashable_parameters(parameters):
+    """Build a deterministic, JSON-serializable subset of parameters for hashing.
+
+    This helper removes non-essential or run-dependent fields (such as post-
+    processing namespaces and certain QMC controls) and keeps only the raw
+    parameter values. The returned nested dictionary is intended to be
+    serialized (for example with ``json.dumps``) and then hashed; this
+    function itself does not perform any serialization or hashing.
+    """
+    # Use only the parameter values for hashing.
+    parameters_hashable = {}
+    for namespace in parameters:
+        if namespace in ['VAR_errors', 'VAR_Max_Stoch']:
+            # Exclude postprocessing parameters from hash.
+            continue
+        parameters_hashable[namespace] = {}
+        for var in parameters[namespace]:
+            if namespace == 'VAR_QMC' and var in ['Nbin', 'CPU_MAX']:
+                # Exclude Nbin and CPU_MAX from hash.
+                continue
+            parameters_hashable[namespace][var] = parameters[namespace][var]['value']
+    return parameters_hashable
+
+
+def directory_name_hash(alf_src, ham_name, sim_dict):
+    """Return name of directory for simulations, given a set of simulation
+    parameters. The name is a hash of the parameters, so that it is short
+    and does not contain any special characters."""
+    if isinstance(sim_dict, list):
+        # For tempering / parallel parameters, incorporate all parameter sets
+        to_hash = [
+            get_hashable_parameters(
+                set_param(alf_src, ham_name, sim_dict_single))
+            for sim_dict_single in sim_dict
+        ]
+    else:
+        to_hash = get_hashable_parameters(set_param(alf_src, ham_name, sim_dict))
+    dump = json.dumps(to_hash, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(dump.encode("utf-8")).hexdigest()[:15]
 
 
 def _update_var(params, var, value):
