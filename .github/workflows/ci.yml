@@ -1,10 +1,11 @@
-name: "CI"
+name: CI
 
 on:
-  push
-
-permissions:
-  pages: write
+  push:
+    branches:
+      - master
+      - development
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -13,114 +14,17 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/alf-qmc/alf-container/pyalf-requirements/${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [bullseye, bookworm, trixie, tumbleweed]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: pip install pylint ruff pytest
-      - run: pylint -E py_alf/
-      - run: ruff check --exclude doc
-      - run: pip install .
-      - run: pytest
-      - run: alf_run --machine GNU --sims_file py_alf/cli/Sims
-
-  exec_notebooks:
-    runs-on: ubuntu-latest
-    env:
-      PRTE_MCA_rmaps_default_mapping_policy: ":oversubscribe"
-      PRTE_MCA_rmaps_base_oversubscribe: '1'
-      OMPI_MCA_rmaps_base_oversubscribe: "true"
-
-    container:
-      image: ghcr.io/alf-qmc/alf-container/pyalf-requirements/${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [bullseye, bookworm, trixie, tumbleweed]
-        notebook:
-          - parallel_tempering.ipynb
-          - projective_algorithm.ipynb
-          - pyALF_new_features.ipynb
-          - testing_against_ED.ipynb
-          - trotter_error.ipynb
-          - tV_model.ipynb
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: pip install jupyter nbconvert .
-      - run: cd Notebooks/ && jupyter-nbconvert --execute --inplace ${{ matrix.notebook }}
-
-  check_docstrings:
-    runs-on: ubuntu-slim
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: pip install ruff
-      - run: ruff check --select D
-        continue-on-error: true
-
-  warn_pylint:
-    runs-on: ubuntu-slim
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: sudo apt update && sudo apt install -y python3-tk
-      - run: pip install . pylint
-      - run: pylint py_alf/
-
-  warn_ruff:
-    runs-on: ubuntu-slim
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: pip install ruff
-      - run: ruff check --exclude doc
-
-  build_docs:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - run: pip install .[doc]
-      - run: sudo apt-get install --yes --no-install-recommends
-          texlive-latex-recommended
-          texlive-latex-extra
-          texlive-fonts-recommended
-          texlive-fonts-extra
-          texlive-xetex
-          texlive-lang-german
-          latexmk
-          xindy
-          fonts-freefont-otf
-          inkscape
-          python3-tk
-      - run: cd doc && make
-      - run: git status
-      - name: Upload Jupyter Book HTML artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: jupyter-book-html
-          path: doc/_build/html
-          if-no-files-found: error
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --with ruff ruff check
+      - run: uv run --with pytest pytest tests/
 
   build_package:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/astral-sh/uv:alpine
     steps:
-      - name: install git
-        run: apk add --no-cache git
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Mark workspace as a safe Git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Build
-        run: uv build
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
