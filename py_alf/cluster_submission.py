@@ -26,15 +26,13 @@ class ClusterSubmitter:
     """
     Handles job submission to a SLURM cluster using Jinja2 templates.
     """
-    def __init__(self, cluster_name: str):
-        # Locate job template directory and load the template for the given cluster.
-        base_dir = Path(__file__).resolve().parent
-        template_dir = base_dir / "Jobfile_templates"
+    def __init__(self, template_path: Union[str, Path]):
+        template_path = Path(template_path).resolve()
         self.env = Environment(
-            loader=FileSystemLoader(str(template_dir)),
+            loader=FileSystemLoader(str(template_path.parent)),
             undefined=StrictUndefined
         )
-        self.template = self.env.get_template(f"{cluster_name}.slurm.j2")
+        self.template = self.env.get_template(template_path.name)
 
     def render(self, context: Dict[str, Any]) -> str:
         """
