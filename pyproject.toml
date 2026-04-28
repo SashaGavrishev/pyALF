@@ -35,9 +35,14 @@ dependencies = [
   "numpy",
   "pandas",
   "scipy",
+  "colorama",
+  "Jinja2",
+  "tabulate2",
+  "tqdm",
 ]
 
 [project.optional-dependencies]
+dev = ["pytest>=7.4.4"]
 doc = [
   "sphinxcontrib-svg2pdfconverter",
   "jupyter-book<2.0",

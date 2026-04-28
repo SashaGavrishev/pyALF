@@ -4,13 +4,14 @@
 
 # Classes
 from .alf_source import ALF_source
+from .cluster_submission import ClusterSubmitter
 from .lattice import Lattice
 from .simulation import Simulation
 
-__all__ = ['ALF_source', 'Simulation', 'Lattice']
+__all__ = ["ALF_source", "Simulation", "Lattice", "ClusterSubmitter"]
 
 
-def check_warmup(*args, gui='tk', **kwargs):
+def check_warmup(*args, gui="tk", **kwargs):
     """Plot bins to determine n_skip.
 
     Calls either :func:`py_alf.check_warmup_tk` or
@@ -23,16 +24,19 @@ def check_warmup(*args, gui='tk', **kwargs):
     **kwargs
 
     """
-    if gui == 'tk':
+    if gui == "tk":
         from .check_warmup_tk import check_warmup_tk
+
         check_warmup_tk(*args, **kwargs)
-    elif gui == 'ipy':
+    elif gui == "ipy":
         from .check_warmup_ipy import check_warmup_ipy
+
         return check_warmup_ipy(*args, **kwargs)
     else:
-        raise TypeError(f'Illegal value gui={gui}')
+        raise TypeError(f"Illegal value gui={gui}")
 
-def check_rebin(*args, gui='tk', **kwargs):
+
+def check_rebin(*args, gui="tk", **kwargs):
     """Plot error vs n_rebin in a Jupyter Widget.
 
     Calls either :func:`py_alf.check_rebin_tk` or
@@ -45,11 +49,13 @@ def check_rebin(*args, gui='tk', **kwargs):
     **kwargs
 
     """
-    if gui == 'tk':
+    if gui == "tk":
         from .check_rebin_tk import check_rebin_tk
+
         check_rebin_tk(*args, **kwargs)
-    elif gui == 'ipy':
+    elif gui == "ipy":
         from .check_rebin_ipy import check_rebin_ipy
+
         return check_rebin_ipy(*args, **kwargs)
     else:
-        raise TypeError(f'Illegal value gui={gui}')
+        raise TypeError(f"Illegal value gui={gui}")
