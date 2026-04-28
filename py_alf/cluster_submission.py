@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from colorama import Fore
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from jinja2 import Environment, FileSystemLoader, StrictUndefined, meta
 from tabulate import tabulate
 from tqdm import tqdm
 
@@ -40,7 +40,8 @@ class ClusterSubmitter:
         Warns about unused context variables.
         """
         provided = set(context.keys())
-        referenced = set(self.template.module.__dict__.keys())
+        ast = self.env.parse(self.env.loader.get_source(self.env, self.template.name)[0])
+        referenced = meta.find_undeclared_variables(ast)
         unused = provided - referenced
         if unused:
             logger.warning(f"Unused variables in template: {unused}")
