@@ -1,7 +1,8 @@
 """Tests for ClusterSubmitter in py_alf.cluster_submission."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from py_alf.cluster_submission import ClusterSubmitter
 
@@ -36,6 +37,7 @@ def test_init_accepts_string_path():
 
 def test_init_invalid_path():
     from jinja2 import TemplateNotFound
+
     with pytest.raises(TemplateNotFound):
         ClusterSubmitter("/nonexistent/path/to/template.slurm.j2")
 
@@ -68,6 +70,7 @@ def test_render_slurm_id_file():
 
 def test_render_missing_variable():
     from jinja2 import UndefinedError
+
     cs = ClusterSubmitter(TEMPLATE_PATH)
     incomplete = {k: v for k, v in MINIMAL_CONTEXT.items() if k != "name"}
     with pytest.raises(UndefinedError):

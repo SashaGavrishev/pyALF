@@ -42,6 +42,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = ["pytest>=7.4.4"]
 doc = [
   "sphinxcontrib-svg2pdfconverter",
   "jupyter-book<2.0",
