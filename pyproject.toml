@@ -37,6 +37,7 @@ dependencies = [
   "scipy",
   "colorama",
   "Jinja2",
+  "submitit",
   "tabulate2",
   "tqdm",
 ]
