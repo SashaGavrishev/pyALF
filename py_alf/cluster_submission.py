@@ -145,7 +145,7 @@ class ClusterSubmitter:
             "time": MaxRunTime,
             "mem": "2G",
             "threads": sim.n_omp,
-            "tasks": sim.n_mpi,
+            "tasks": sim.n_mpi if sim.mpi else 1,
             "partition": "short",
         }
         if job_properties:
