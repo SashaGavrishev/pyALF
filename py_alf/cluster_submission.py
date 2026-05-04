@@ -1,4 +1,11 @@
-"""Provides interfaces for runnin AFL simulations on a cluster."""
+"""
+
+cluster_submission
+==================
+
+Provides interfaces for running ALF simulations on a cluster.
+
+"""
 
 __author__ = "Johannes Hofmann"
 __copyright__ = "Copyright 2020-2025, The ALF Project"
@@ -22,15 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 def _run_alf(sim: Simulation) -> None:
-    """Execute an ALF simulation on a cluster node.
+    """
+    Execute an ALF simulation on a cluster node.
 
-    Called by submitit on the remote worker. Assumes the binary has already
-    been copied into sim.sim_dir by the pre-submission preparation step.
+    Called by submitit on the remote worker. Assumes the binary has already been copied
+    into sim.sim_dir by the pre-submission preparation step.
     """
     sim.run(bin_in_sim_dir=True)
 
 
-# --- ClusterSubmitter class ---
 class ClusterSubmitter:
     """
     Handles job submission to a SLURM cluster using submitit.
@@ -440,7 +447,9 @@ def get_status_all(
     **tabargs,
 ) -> tuple[Optional[List[Simulation]], Optional[List[Simulation]]]:
     """
+
     Prints a table of statuses for all simulations (bulk SLURM query).
+
     Args:
         sims: Iterable of Simulation instances.
         header: List of column headers.
@@ -452,6 +461,7 @@ def get_status_all(
         refresh_cache: Whether to refresh bin count cache.
         min_bins: Minimum number of bins required; simulations with fewer are returned.
         tabargs: Additional arguments for tabulate.
+
     Returns:
         Tuple of (sims_with_too_few_bins, crashed_sims)
     """

@@ -20,7 +20,7 @@ description = "Python interface for ALF, plus scripts and Jupyter notebooks."
 license = "GPL-2.0-or-later"
 license-files = ['LICENSE']
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -43,7 +43,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4.4"]
+dev = ["pytest>=7.4.4", "pytest-asyncio>=1.2.0"]
+tui = ['textual>=0.70']
 doc = [
   "sphinxcontrib-svg2pdfconverter",
   "jupyter-book<2.0",
@@ -68,6 +69,14 @@ alf_run = 'py_alf.cli.alf_run:_main'
 alf_show_obs = 'py_alf.cli.alf_show_obs:_main'
 alf_test_branch = 'py_alf.cli.alf_test_branch:_main'
 minimal_ALF_run = 'py_alf.cli.minimal_ALF_run:_main'
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.2.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff.lint]
 select = [
