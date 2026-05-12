@@ -9,7 +9,6 @@ from py_alf.cluster_submission import ClusterSubmitter
 from py_alf.monitor import ConfirmScreen, LogViewerScreen, SimulationMonitor, _styled
 from py_alf.simulation import Simulation
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -260,7 +259,10 @@ async def test_action_view_logs_errors_when_log_not_found(tmp_path):
     sim = _make_mock_sim(tmp_path / "sim0")
     with (
         patch("py_alf.monitor.get_job_id", return_value="99"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"99": {"status": "COMPLETED", "runtime": None}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"99": {"status": "COMPLETED", "runtime": None}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=0),
         patch("py_alf.monitor._find_job_log", return_value=None),
     ):
@@ -272,7 +274,9 @@ async def test_action_view_logs_errors_when_log_not_found(tmp_path):
                 await pilot.press("l")
                 await app.workers.wait_for_complete()
                 await pilot.pause()
-    assert any("Cannot locate" in str(call.args[0]) for call in mock_notify.call_args_list)
+    assert any(
+        "Cannot locate" in str(call.args[0]) for call in mock_notify.call_args_list
+    )
 
 
 async def test_action_view_logs_opens_log_screen(tmp_path):
@@ -281,7 +285,10 @@ async def test_action_view_logs_opens_log_screen(tmp_path):
     log_file.write_text("first line\nsecond line\n")
     with (
         patch("py_alf.monitor.get_job_id", return_value="55"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"55": {"status": "COMPLETED", "runtime": None}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"55": {"status": "COMPLETED", "runtime": None}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=8),
         patch("py_alf.monitor._find_job_log", return_value=log_file),
     ):
@@ -311,7 +318,10 @@ async def test_action_cancel_job_confirmed(tmp_path):
     sim = _make_mock_sim(tmp_path / "sim0")
     with (
         patch("py_alf.monitor.get_job_id", return_value="77"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"77": {"status": "RUNNING", "runtime": "00:01:00"}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"77": {"status": "RUNNING", "runtime": "00:01:00"}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=0),
         patch("py_alf.monitor.cancel_cluster_job", return_value=True) as mock_cancel,
     ):
@@ -332,7 +342,10 @@ async def test_action_cancel_job_declined(tmp_path):
     sim = _make_mock_sim(tmp_path / "sim0")
     with (
         patch("py_alf.monitor.get_job_id", return_value="77"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"77": {"status": "RUNNING", "runtime": "00:01:00"}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"77": {"status": "RUNNING", "runtime": "00:01:00"}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=0),
         patch("py_alf.monitor.cancel_cluster_job", return_value=True) as mock_cancel,
     ):
@@ -352,7 +365,10 @@ async def test_action_cancel_array_uses_base_id(tmp_path):
     sim = _make_mock_sim(tmp_path / "sim0")
     with (
         patch("py_alf.monitor.get_job_id", return_value="88_2"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"88_2": {"status": "RUNNING", "runtime": "00:02:00"}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"88_2": {"status": "RUNNING", "runtime": "00:02:00"}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=0),
         patch("py_alf.monitor.subprocess.run") as mock_run,
     ):
@@ -367,16 +383,17 @@ async def test_action_cancel_array_uses_base_id(tmp_path):
             await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
-    mock_run.assert_called_once_with(
-        ["scancel", "88"], capture_output=True, text=True
-    )
+    mock_run.assert_called_once_with(["scancel", "88"], capture_output=True, text=True)
 
 
 async def test_action_cancel_array_declined(tmp_path):
     sim = _make_mock_sim(tmp_path / "sim0")
     with (
         patch("py_alf.monitor.get_job_id", return_value="88_2"),
-        patch("py_alf.monitor._get_slurm_status_bulk", return_value={"88_2": {"status": "RUNNING", "runtime": None}}),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"88_2": {"status": "RUNNING", "runtime": None}},
+        ),
         patch("py_alf.monitor._bin_count", return_value=0),
         patch("py_alf.monitor.subprocess.run") as mock_run,
     ):
@@ -401,8 +418,7 @@ async def test_action_resubmit_errors_without_submitter(tmp_path, no_slurm):
             await pilot.press("r")
             await pilot.pause()
     assert any(
-        "ClusterSubmitter" in str(call.args[0])
-        for call in mock_notify.call_args_list
+        "ClusterSubmitter" in str(call.args[0]) for call in mock_notify.call_args_list
     )
 
 
