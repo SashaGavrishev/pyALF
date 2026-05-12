@@ -69,7 +69,7 @@ def test_submit_multiple_sims_uses_map_array(tmp_path):
         jobs = cs.submit(sims)
 
     assert jobs == mock_jobs
-    for i, sim in enumerate(sims):
+    for i, _sim in enumerate(sims):
         assert (tmp_path / f"sim{i}" / "jobid.txt").read_text() == f"99_{i}"
     mock_executor.return_value.map_array.assert_called_once_with(_run_alf, sims)
 
