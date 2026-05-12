@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 try:
     from rich.text import Text
@@ -40,7 +40,7 @@ from .cluster_submission import (
 )
 from .simulation import Simulation
 
-_STATUS_COLORS: Dict[str, str] = {
+_STATUS_COLORS: dict[str, str] = {
     "RUNNING": "bold green",
     "PENDING": "bold yellow",
     "FAILED": "bold red",
@@ -217,28 +217,28 @@ class SimulationMonitor(App):
 
     def __init__(
         self,
-        sims: List[Simulation],
-        cluster_submitter: Optional[ClusterSubmitter] = None,
-        submit_dir: Optional[Union[str, Path]] = None,
+        sims: list[Simulation],
+        cluster_submitter: ClusterSubmitter | None = None,
+        submit_dir: str | Path | None = None,
         refresh_interval: float = 30.0,
-        param_keys: Optional[List[str]] = None,
-        param_headers: Optional[List[str]] = None,
+        param_keys: list[str] | None = None,
+        param_headers: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._sims = list(sims)
         self._cs = cluster_submitter
         if submit_dir is not None:
-            self._submit_dir: Optional[Path] = Path(submit_dir)
+            self._submit_dir: Path | None = Path(submit_dir)
         elif cluster_submitter is not None:
             self._submit_dir = cluster_submitter.submit_dir
         else:
             self._submit_dir = None
         self._refresh_interval = refresh_interval
-        self._param_keys: List[str] = list(param_keys or [])
-        self._param_headers: List[str] = (
+        self._param_keys: list[str] = list(param_keys or [])
+        self._param_headers: list[str] = (
             list(param_headers) if param_headers else list(self._param_keys)
         )
-        self._row_data: List[Dict[str, Any]] = []
+        self._row_data: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Layout
@@ -278,7 +278,7 @@ class SimulationMonitor(App):
 
     @work(thread=True)
     def _fetch_and_update(self) -> None:
-        jobid_map: Dict[str, str] = {}
+        jobid_map: dict[str, str] = {}
         for sim in self._sims:
             jid = get_job_id(sim)
             if jid:
@@ -290,7 +290,7 @@ class SimulationMonitor(App):
             else {}
         )
 
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         for idx, sim in enumerate(self._sims):
             jobid = jobid_map.get(sim.sim_dir)
             if jobid:
@@ -308,7 +308,7 @@ class SimulationMonitor(App):
             if isinstance(sim_dict, list):
                 sim_dict = sim_dict[0] if sim_dict else {}
 
-            row: Dict[str, Any] = {
+            row: dict[str, Any] = {
                 "idx": idx,
                 "ham": sim.ham_name,
                 "n_omp": sim.n_omp,
@@ -327,14 +327,14 @@ class SimulationMonitor(App):
 
         self.call_from_thread(self._apply_rows, rows)
 
-    def _apply_rows(self, rows: List[Dict[str, Any]]) -> None:
+    def _apply_rows(self, rows: list[dict[str, Any]]) -> None:
         self._row_data = rows
         table = self.query_one("#sim-table", DataTable)
         saved_cursor = table.cursor_row
 
         table.clear()
         for row in rows:
-            values: List[Any] = [row["idx"], row["ham"]]
+            values: list[Any] = [row["idx"], row["ham"]]
             for key in self._param_keys:
                 values.append(row.get(key, "-"))
             values.extend([row["n_omp"], row["n_mpi"]])
@@ -356,7 +356,7 @@ class SimulationMonitor(App):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _selected_sim(self) -> Optional[Simulation]:
+    def _selected_sim(self) -> Simulation | None:
         table = self.query_one("#sim-table", DataTable)
         row = table.cursor_row
         if 0 <= row < len(self._sims):
@@ -419,7 +419,7 @@ class SimulationMonitor(App):
             self.notify("No job ID for this simulation.", severity="warning")
             return
 
-        def _on_confirm(confirmed: Optional[bool]) -> None:
+        def _on_confirm(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             ok = cancel_cluster_job(sim)
@@ -442,7 +442,7 @@ class SimulationMonitor(App):
             return
         base_id = jobid.split("_")[0]
 
-        def _on_confirm(confirmed: Optional[bool]) -> None:
+        def _on_confirm(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             try:
@@ -480,7 +480,7 @@ class SimulationMonitor(App):
             return
         sim_name = Path(sim.sim_dir).name
 
-        def _on_confirm(confirmed: Optional[bool]) -> None:
+        def _on_confirm(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             try:

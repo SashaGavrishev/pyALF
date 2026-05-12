@@ -16,7 +16,7 @@ import os
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import submitit
 from colorama import Fore
@@ -71,10 +71,10 @@ class ClusterSubmitter:
 
     def submit(
         self,
-        sims: Union[Simulation, Iterable[Simulation]],
-        job_properties: Optional[Dict[str, Any]] = None,
-        submit_dir: Optional[Union[str, Path]] = None,
-    ) -> List[submitit.Job]:
+        sims: Simulation | Iterable[Simulation],
+        job_properties: dict[str, Any] | None = None,
+        submit_dir: str | Path | None = None,
+    ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
 
@@ -117,7 +117,7 @@ class ClusterSubmitter:
             jobid_file = Path(s.sim_dir) / "jobid.txt"
             running_file = Path(s.sim_dir) / "RUNNING"
 
-            jobid: Optional[str] = (
+            jobid: str | None = (
                 jobid_file.read_text().strip() if jobid_file.exists() else None
             )
 
@@ -174,7 +174,7 @@ class ClusterSubmitter:
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "name": sim.ham_name,
             "timeout_min": timeout_hours * 60,
             "nodes": 1,
@@ -216,8 +216,8 @@ class ClusterSubmitter:
     def resubmission(
         self,
         sims_to_resubmit: Iterable[Simulation],
-        job_properties: Optional[Dict[str, Any]] = None,
-        params: Optional[Dict[str, str]] = None,
+        job_properties: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
         print_first: bool = True,
         confirm: bool = True,
         counting_obs: str = "Ener_scal",
@@ -292,7 +292,7 @@ def get_status(sim: Simulation, colored: bool = True) -> str:
     return status
 
 
-def get_job_id(sim: Simulation) -> Optional[str]:
+def get_job_id(sim: Simulation) -> str | None:
     """
     Returns colorized SLURM job status for a simulation.
     Args:
@@ -308,7 +308,7 @@ def get_job_id(sim: Simulation) -> Optional[str]:
         return jobid_file.read_text().strip()
 
 
-def _get_slurm_status_sacct(jobid: str) -> Dict[str, Optional[str]]:
+def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
     """
     Query SLURM sacct for job status and elapsed time.
     Returns dict: {'status': <status_str>, 'runtime': <elapsed_or_None>}
@@ -335,13 +335,13 @@ def _get_slurm_status_sacct(jobid: str) -> Dict[str, Optional[str]]:
 
 
 def _get_slurm_status_bulk_sacct(
-    jobids: List[str],
-) -> Dict[str, Dict[str, Optional[str]]]:
+    jobids: list[str],
+) -> dict[str, dict[str, str | None]]:
     """
     Query SLURM sacct for multiple job IDs (including array tasks) in one call.
     Returns dict: jobid[_index] -> {'status': <str>, 'runtime': <str|None>}
     """
-    status_map: Dict[str, Dict[str, Optional[str]]] = {
+    status_map: dict[str, dict[str, str | None]] = {
         jid: {"status": "UNKNOWN", "runtime": None} for jid in jobids
     }
     if not jobids:
@@ -368,7 +368,7 @@ def _get_slurm_status_bulk_sacct(
     return status_map
 
 
-def _get_slurm_status_bulk(jobids: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]]:
     """
     Query SLURM for multiple job IDs (including array tasks) in one call.
     Args:
@@ -379,7 +379,7 @@ def _get_slurm_status_bulk(jobids: List[str]) -> Dict[str, Dict[str, Optional[st
     if not jobids:
         return {}
 
-    status_map: Dict[str, Dict[str, Optional[str]]] = {
+    status_map: dict[str, dict[str, str | None]] = {
         jid: {"status": "FINISHED_OR_NOT_FOUND", "runtime": None} for jid in jobids
     }
     found_in_squeue = set()
@@ -436,16 +436,16 @@ def _get_slurm_status_bulk(jobids: List[str]) -> Dict[str, Dict[str, Optional[st
 
 def get_status_all(
     sims: Iterable[Simulation],
-    header: Optional[List[str]] = None,
-    keys: Optional[List[str]] = None,
-    filter_out: Optional[List[str]] = None,
-    crash_tags: Optional[List[str]] = None,
+    header: list[str] | None = None,
+    keys: list[str] | None = None,
+    filter_out: list[str] | None = None,
+    crash_tags: list[str] | None = None,
     showid: bool = True,
     counting_obs: str = "Ener_scal",
     refresh_cache: bool = False,
     min_bins: int = 4,
     **tabargs,
-) -> tuple[Optional[List[Simulation]], Optional[List[Simulation]]]:
+) -> tuple[list[Simulation] | None, list[Simulation] | None]:
     """
 
     Prints a table of statuses for all simulations (bulk SLURM query).
@@ -480,7 +480,7 @@ def get_status_all(
             crash_tags.append("FAILED")
     else:
         crash_tags = ["CRASHED", "FAILED"]
-    jobid_map: Dict[str, str] = {}
+    jobid_map: dict[str, str] = {}
     for sim in sims:
         jobid_file = Path(sim.sim_dir) / "jobid.txt"
         if jobid_file.exists():
@@ -488,16 +488,16 @@ def get_status_all(
 
     statuses = _get_slurm_status_bulk(list(jobid_map.values()))
 
-    summary: Dict[str, int] = {}
+    summary: dict[str, int] = {}
     header = header + ["N_bin", "JobID", "status", "time"]
     if showid:
         header = ["SimID"] + header
-    entries: List[List[Any]] = []
+    entries: list[list[Any]] = []
 
-    sims_with_too_few_bins: List[Simulation] = []
-    crashed_sims: List[Simulation] = []
+    sims_with_too_few_bins: list[Simulation] = []
+    crashed_sims: list[Simulation] = []
     for idx, sim in enumerate(sims):
-        runtime: Optional[str] = None
+        runtime: str | None = None
         jobid = jobid_map.get(sim.sim_dir)
         if jobid is None:
             running_file = Path(sim.sim_dir) / "RUNNING"
@@ -569,8 +569,8 @@ def get_status_all(
 
 
 def find_sims_by_status(
-    sims: Iterable[Simulation], filter: List[str]
-) -> Optional[List[Simulation]]:
+    sims: Iterable[Simulation], filter: list[str]
+) -> list[Simulation] | None:
     """
     Prints a table of statuses for all simulations (bulk SLURM query).
     Args:
@@ -578,7 +578,7 @@ def find_sims_by_status(
         filter: List of statuses to return.
     """
     sims = list(sims)  # Accept any iterable
-    jobid_map: Dict[str, str] = {}
+    jobid_map: dict[str, str] = {}
     for sim in sims:
         jobid_file = Path(sim.sim_dir) / "jobid.txt"
         if jobid_file.exists():
@@ -586,7 +586,7 @@ def find_sims_by_status(
 
     statuses = _get_slurm_status_bulk(list(jobid_map.values()))
 
-    sims_with_status: List[Simulation] = []
+    sims_with_status: list[Simulation] = []
     for sim in sims:
         jobid = jobid_map.get(sim.sim_dir)
         if jobid is None:
@@ -603,7 +603,7 @@ def find_sims_by_status(
 
 
 def _print_summary_entry(
-    key: str, val: int, total: int, filter_out: Optional[List[str]] = None
+    key: str, val: int, total: int, filter_out: list[str] | None = None
 ) -> None:
     if filter_out and key in filter_out:
         print(_colorize_status(key), f":\t{val}/{total}\t(not shown)")
@@ -628,7 +628,7 @@ def _get_slurm_status(jobid_element: str) -> str:
     return status if status else "FINISHED_OR_NOT_FOUND"
 
 
-_bin_cache: Dict[Any, int] = {}
+_bin_cache: dict[Any, int] = {}
 
 
 def _bin_count(
@@ -685,7 +685,7 @@ def _colorize_status(status: str) -> str:
     return status
 
 
-def _pad_runtime(runtime: Optional[str], width: int = 10) -> str:
+def _pad_runtime(runtime: str | None, width: int = 10) -> str:
     """
     Pads runtime string for table formatting.
     Args:
@@ -699,13 +699,13 @@ def _pad_runtime(runtime: Optional[str], width: int = 10) -> str:
 
 def print_logfile(
     sim: Simulation,
-    logfile: Optional[str] = None,
-    tail: Optional[int] = None,
-    head: Optional[int] = None,
+    logfile: str | None = None,
+    tail: int | None = None,
+    head: int | None = None,
     return_content: bool = False,
     show_progress: bool = False,
-    submit_dir: Optional[Union[str, Path]] = None,
-) -> Optional[str]:
+    submit_dir: str | Path | None = None,
+) -> str | None:
     """
     Prints the logfile of a simulation to the terminal, with options for tail/head
     and progress.
@@ -778,9 +778,9 @@ def print_logfile(
 
 def _find_job_log(
     jobid: str,
-    root_dir: List[str] = None,
-    submit_dir: Optional[Union[str, Path]] = None,
-) -> Optional[Path]:
+    root_dir: list[str] | None = None,
+    submit_dir: str | Path | None = None,
+) -> Path | None:
     if root_dir is None:
         root_dir = ["."]
     if jobid is None:
@@ -816,7 +816,7 @@ Simulation.bin_count = _bin_count
 def simulation_submit_to_cluster(
     self: Simulation,
     cluster_submitter: ClusterSubmitter,
-    job_properties: Optional[Dict[str, Any]] = None,
+    job_properties: dict[str, Any] | None = None,
 ) -> None:
     """
     Submits this simulation as a single job to the cluster using the provided ClusterSubmitter.
