@@ -26,7 +26,6 @@ from py_alf.monitor import SimulationMonitor
 from py_alf.simulation import Simulation
 from py_alf.submission_tui import SubmissionReview
 
-
 # ---------------------------------------------------------------------------
 # Cluster partition table (excluding the graphic/GPU partition)
 #
@@ -42,10 +41,10 @@ from py_alf.submission_tui import SubmissionReview
 # ---------------------------------------------------------------------------
 
 CPU_PARTITIONS: dict[str, float] = {
-    "short":      2,        # 2 h
-    "medium":     48,       # 2 days
-    "long":       336,      # 14 days
-    "extra_long": 672,      # 28 days
+    "short": 2,  # 2 h
+    "medium": 48,  # 2 days
+    "long": 336,  # 14 days
+    "extra_long": 672,  # 28 days
 }
 
 
@@ -66,7 +65,7 @@ def make_mock_sim(
 ) -> MagicMock:
     """Return a Simulation-shaped mock; no ALF source or filesystem needed."""
     sim = MagicMock()
-    sim.__class__ = Simulation          # satisfies isinstance checks
+    sim.__class__ = Simulation  # satisfies isinstance checks
     sim.ham_name = ham_name
     sim.sim_dir = sim_dir
     sim.sim_dict = sim_dict
@@ -85,7 +84,6 @@ def make_mock_sim(
 # ---------------------------------------------------------------------------
 
 BATCHES: dict[str, dict] = {
-
     # ── short partition: 1 process × 4 OMP, CPU_MAX=1h (1 ≤ 2h limit) ──
     "short  · serial  · 4 OMP": dict(
         sims=[
@@ -102,7 +100,6 @@ BATCHES: dict[str, dict] = {
             partition_rules=CPU_PARTITIONS,
         ),
     ),
-
     # ── medium partition: 2 ranks × 4 OMP, CPU_MAX=24h (2 < 24 ≤ 48h) ──
     "medium · MPI×2   · 4 OMP": dict(
         sims=[
@@ -121,7 +118,6 @@ BATCHES: dict[str, dict] = {
             partition_rules=CPU_PARTITIONS,
         ),
     ),
-
     # ── long partition: 4 ranks × 4 OMP, CPU_MAX=72h (48 < 72 ≤ 336h) ──
     "long   · MPI×4   · 4 OMP": dict(
         sims=[
@@ -140,7 +136,6 @@ BATCHES: dict[str, dict] = {
             partition_rules=CPU_PARTITIONS,
         ),
     ),
-
     # ── extra_long: 8 ranks × 8 OMP; full grid exercises 2-row layout ──
     "extra_long · MPI×8 · 8 OMP": dict(
         sims=[
@@ -160,7 +155,6 @@ BATCHES: dict[str, dict] = {
             partition_rules=CPU_PARTITIONS,
         ),
     ),
-
     # ── local executor: no SLURM params, architecture shows local mode ──
     "local executor (no cluster)": dict(
         sims=[
@@ -198,7 +192,7 @@ def main() -> None:
     print("Available demo batches:\n")
     for i, name in enumerate(names):
         print(f"  {i}  {name}")
-    raw = input(f"\nPick batch [0–{len(names)-1}, default 0]: ").strip()
+    raw = input(f"\nPick batch [0–{len(names) - 1}, default 0]: ").strip()
     idx = int(raw) if raw.isdigit() and int(raw) < len(names) else 0
     chosen = names[idx]
     print(f"\nLaunching: {chosen}\n")
