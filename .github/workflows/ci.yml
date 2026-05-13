@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv run --with ruff ruff check
-      - run: uv run --extra tui --with pytest pytest tests/
+      - run: uv run --with pytest pytest tests/
 
   build_package:
     runs-on: ubuntu-latest

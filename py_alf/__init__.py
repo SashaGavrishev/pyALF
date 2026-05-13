@@ -4,11 +4,27 @@
 
 # Classes
 from .alf_source import ALF_source
-from .cluster_submission import ClusterSubmitter
+from .cluster_submission import ClusterSubmitter, PartitionSpec, detect_partition_rules
 from .lattice import Lattice
 from .simulation import Simulation
 
-__all__ = ["ALF_source", "Simulation", "Lattice", "ClusterSubmitter"]
+__all__ = [
+    "ALF_source",
+    "Simulation",
+    "Lattice",
+    "ClusterSubmitter",
+    "PartitionSpec",
+    "detect_partition_rules",
+    "SubmissionReview",
+]
+
+
+def __getattr__(name: str):
+    if name == "SubmissionReview":
+        from .submission_tui import SubmissionReview  # noqa: PLC0415
+
+        return SubmissionReview
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def check_warmup(*args, gui="tk", **kwargs):

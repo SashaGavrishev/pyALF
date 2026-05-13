@@ -30,7 +30,7 @@ def _make_mock_sim(sim_dir: Path, ham="Hubbard", n_omp=4, n_mpi=1, mpi=False):
 def _make_mock_cs(submit_dir=None):
     cs = MagicMock()
     cs.__class__ = ClusterSubmitter
-    cs.slurm_partition = "short"
+    cs.executor = "slurm"
     cs.slurm_mem = "4G"
     cs.submit_dir = Path(submit_dir) if submit_dir else Path("submitit")
     return cs
@@ -471,3 +471,173 @@ async def test_f5_retriggers_refresh(tmp_path, no_slurm):
         await pilot.pause()
         # Table should still have one row after the refresh
         assert app.query_one("DataTable").row_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _sanitise_nodelist
+# ---------------------------------------------------------------------------
+
+
+def test_sanitise_nodelist_returns_real_node():
+    from py_alf.cluster_submission import _sanitise_nodelist
+
+    assert _sanitise_nodelist("compute01") == "compute01"
+    assert _sanitise_nodelist("node[001-004]") == "node[001-004]"
+
+
+def test_sanitise_nodelist_rejects_pending_reason():
+    from py_alf.cluster_submission import _sanitise_nodelist
+
+    assert _sanitise_nodelist("(Priority)") is None
+    assert _sanitise_nodelist("(Resources)") is None
+    assert _sanitise_nodelist("(None)") is None
+
+
+def test_sanitise_nodelist_rejects_sacct_none_literal():
+    from py_alf.cluster_submission import _sanitise_nodelist
+
+    assert _sanitise_nodelist("None") is None
+    assert _sanitise_nodelist("N/A") is None
+    assert _sanitise_nodelist("none") is None
+
+
+def test_sanitise_nodelist_rejects_empty_and_none():
+    from py_alf.cluster_submission import _sanitise_nodelist
+
+    assert _sanitise_nodelist("") is None
+    assert _sanitise_nodelist(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Node column — table structure
+# ---------------------------------------------------------------------------
+
+
+async def test_monitor_table_has_node_column(tmp_path, no_slurm):
+    """The monitor table always includes a 'Node' column."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    app = _monitor([sim])
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        col_labels = [
+            str(col.label) for col in app.query_one("DataTable").columns.values()
+        ]
+    assert "Node" in col_labels
+
+
+async def test_node_column_position_between_status_and_elapsed(tmp_path, no_slurm):
+    """'Node' appears immediately after 'Status' and before 'Elapsed'."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    app = _monitor([sim])
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        labels = [str(col.label) for col in app.query_one("DataTable").columns.values()]
+    status_idx = labels.index("Status")
+    node_idx = labels.index("Node")
+    elapsed_idx = labels.index("Elapsed")
+    assert status_idx < node_idx < elapsed_idx
+
+
+# ---------------------------------------------------------------------------
+# Node column — per-status display values
+# ---------------------------------------------------------------------------
+
+
+async def test_node_shown_for_running_job(tmp_path):
+    """A RUNNING job with a nodelist shows the node name in the Node column."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="42_0"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "42_0": {
+                    "status": "RUNNING",
+                    "runtime": "01:00:00",
+                    "nodelist": "compute03",
+                }
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=5),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["node"] == "compute03"
+
+
+async def test_node_dash_for_pending_job(tmp_path):
+    """A PENDING job (no nodelist from SLURM) shows '-' in the Node column."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="7"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "7": {"status": "PENDING", "runtime": None, "nodelist": None}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=0),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["node"] == "-"
+
+
+async def test_node_dash_for_inactive_sim(tmp_path, no_slurm):
+    """A sim with no jobid.txt (INACTIVE) always shows '-' in the Node column."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    # no_slurm fixture: get_job_id returns None → INACTIVE path
+    app = _monitor([sim])
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    assert app._row_data[0]["node"] == "-"
+
+
+async def test_node_shown_for_completed_job_from_sacct(tmp_path):
+    """sacct history also carries nodelist; completed jobs display the node."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="99"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "99": {
+                    "status": "COMPLETED",
+                    "runtime": "02:30:00",
+                    "nodelist": "hpc-node07",
+                }
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=40),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["node"] == "hpc-node07"
+
+
+async def test_node_dash_when_nodelist_key_absent(tmp_path):
+    """Old mock dicts without 'nodelist' key are handled gracefully."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="55"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            # Legacy dict without 'nodelist' key
+            return_value={"55": {"status": "RUNNING", "runtime": "00:30:00"}},
+        ),
+        patch("py_alf.monitor._bin_count", return_value=2),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["node"] == "-"
