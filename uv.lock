@@ -3286,6 +3286,7 @@ dependencies = [
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "submitit" },
     { name = "tabulate2" },
+    { name = "textual" },
     { name = "tqdm" },
 ]
 
@@ -3303,9 +3304,6 @@ doc = [
     { name = "sphinx-argparse", version = "0.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "sphinx-argparse", version = "0.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "sphinxcontrib-svg2pdfconverter" },
-]
-tui = [
-    { name = "textual" },
 ]
 
 [package.dev-dependencies]
@@ -3335,10 +3333,10 @@ requires-dist = [
     { name = "sphinxcontrib-svg2pdfconverter", marker = "extra == 'doc'" },
     { name = "submitit" },
     { name = "tabulate2" },
-    { name = "textual", marker = "extra == 'tui'", specifier = ">=0.70" },
+    { name = "textual", specifier = ">=0.70" },
     { name = "tqdm" },
 ]
-provides-extras = ["dev", "tui", "doc"]
+provides-extras = ["dev", "doc"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest-asyncio", specifier = ">=1.2.0" }]
