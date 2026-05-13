@@ -269,7 +269,8 @@ def detect_partition_rules(
             continue
 
         try:
-            cpus = int(cpus_raw.strip())
+            # sinfo may report "72+" meaning ≥72 CPUs; strip any trailing non-digit chars
+            cpus = int(cpus_raw.strip().rstrip("+"))
         except ValueError:
             logger.warning(
                 "detect_partition_rules: cannot parse CPU count %r for %r — skipping row",
@@ -436,7 +437,7 @@ class ClusterSubmitter:
         self,
         executor: Literal["slurm", "local", "debug"] = "slurm",
         *,
-        submit_dir: str | Path = "submitit",
+        submit_dir: str | Path = "array_submission",
         slurm_mem: str | None = None,
         partition_rules: dict[str, Any] | None = None,
         job_name: str | None = None,
@@ -482,7 +483,7 @@ class ClusterSubmitter:
                 raise ValueError(f"Invalid partition_rules: {exc}") from exc
 
         self.executor = executor
-        self.submit_dir = Path(submit_dir)
+        self.submit_dir = Path(submit_dir).resolve()
         self.slurm_mem = slurm_mem
         self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
         self.job_name = job_name
@@ -950,8 +951,17 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
     found_in_squeue = set()
 
     try:
+        # Query by parent array IDs so all tasks are returned reliably.
+        # Querying individual task IDs (e.g. "12345_1") is unreliable on some
+        # SLURM versions; the parent ID "12345" always returns every task row.
+        _seen_parents: dict[str, None] = {}
+        for _jid in jobids:
+            _parts = _jid.rsplit("_", 1)
+            _parent = _parts[0] if len(_parts) == 2 and _parts[1].isdigit() else _jid
+            _seen_parents[_parent] = None
+        parent_ids = list(_seen_parents)
         result = subprocess.run(
-            ["squeue", "-h", "-o", "%A %i %T %M %N", "--array", "-j", ",".join(jobids)],
+            ["squeue", "-h", "-o", "%A %i %T %M %N", "--array", "-j", ",".join(parent_ids)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1004,6 +1014,85 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             )
 
     return status_map
+
+
+_resource_cache: dict[str, dict[str, str | None]] = {}
+
+_TERMINAL_STATES: frozenset[str] = frozenset({
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
+    "OUT_OF_MEMORY", "DEADLINE", "NODE_FAIL", "PREEMPTED",
+})
+
+
+def _get_jobs_resources_bulk(
+    jobids: list[str],
+) -> dict[str, dict[str, str | None]]:
+    """Return peak memory and CPU efficiency for a list of completed job IDs.
+
+    Results are cached per job ID — completed-job accounting data is immutable.
+    Each entry maps to ``{'max_rss': str|None, 'cpu_eff': str|None}``.
+    """
+    to_query = [jid for jid in jobids if jid not in _resource_cache]
+    if to_query:
+        parents: dict[str, None] = {}
+        for jid in to_query:
+            p = jid.rsplit("_", 1)
+            parents[p[0] if len(p) == 2 and p[1].isdigit() else jid] = None
+
+        task_rss_gb: dict[str, float] = {}
+        task_total_h: dict[str, float] = {}
+        task_cpu_h: dict[str, float] = {}
+
+        try:
+            proc = subprocess.run(
+                [
+                    "sacct", "-j", ",".join(parents),
+                    "--format=JobID,MaxRSS,TotalCPU,CPUTime",
+                    "--noheader", "--array",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in proc.stdout.strip().splitlines():
+                cols = line.split()
+                if len(cols) < 4:
+                    continue
+                raw_jid, rss_str, total_cpu_str, cpu_time_str = cols[:4]
+                canonical = raw_jid.split(".")[0]
+                if canonical not in to_query:
+                    continue
+                try:
+                    gb = _parse_mem_gb(rss_str.strip())
+                    if gb > 0:
+                        task_rss_gb[canonical] = max(
+                            task_rss_gb.get(canonical, 0.0), gb
+                        )
+                except ValueError:
+                    pass
+                if "." not in raw_jid:
+                    h_total = _parse_slurm_time_hours(total_cpu_str)
+                    h_alloc = _parse_slurm_time_hours(cpu_time_str)
+                    if h_total is not None:
+                        task_total_h[canonical] = h_total
+                    if h_alloc is not None:
+                        task_cpu_h[canonical] = h_alloc
+        except Exception as e:
+            logger.debug("sacct resource query failed: %s", e)
+
+        for jid in to_query:
+            entry: dict[str, str | None] = {"max_rss": None, "cpu_eff": None}
+            gb = task_rss_gb.get(jid)
+            if gb:
+                entry["max_rss"] = f"{gb:.2g}G" if gb >= 1 else f"{gb * 1024:.0f}M"
+            h_total = task_total_h.get(jid)
+            h_alloc = task_cpu_h.get(jid)
+            if h_total is not None and h_alloc and h_alloc > 0:
+                entry["cpu_eff"] = f"{100 * h_total / h_alloc:.0f}%"
+            _resource_cache[jid] = entry
+
+    return {
+        jid: _resource_cache.get(jid, {"max_rss": None, "cpu_eff": None})
+        for jid in jobids
+    }
 
 
 def get_status_all(

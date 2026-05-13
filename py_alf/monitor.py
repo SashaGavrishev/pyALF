@@ -26,9 +26,11 @@ from textual.theme import Theme
 from textual.widgets import Button, DataTable, Footer, Label, Static
 
 from .cluster_submission import (
+    _TERMINAL_STATES,
     ClusterSubmitter,
     _bin_count,
     _find_job_log,
+    _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
     cancel_cluster_job,
     get_job_id,
@@ -73,6 +75,18 @@ def _parse_elapsed_hours(runtime: str) -> float | None:
         return days * 24 + h + m / 60 + s / 3600
     except (ValueError, IndexError):
         return None
+
+
+def _bins_cell(n_bins: int, nbin_target: int | None) -> Any:
+    """Return a Rich Text progress bar for the N_bins column."""
+    if nbin_target is None or nbin_target <= 0:
+        return str(n_bins)
+    bar_width = 8
+    filled = min(bar_width, round(bar_width * n_bins / nbin_target))
+    bar = "█" * filled + "░" * (bar_width - filled)
+    t = Text(f"{n_bins}/{nbin_target} ")
+    t.append(bar, style="green" if n_bins >= nbin_target else "yellow")
+    return t
 
 
 def _eta_str(cpu_max_h: float, elapsed_h: float) -> str:
@@ -195,6 +209,31 @@ class _SessionEntry:
         self.mpi = mpi
         self.sim_dict = sim_dict
         self.config = ""
+
+    def run(
+        self,
+        copy_bin: bool = False,
+        only_prep: bool = False,
+        bin_in_sim_dir: bool = False,
+    ) -> None:
+        """Run the simulation from the already-prepared sim_dir."""
+        import os
+        import subprocess
+
+        from .simulation import cd
+
+        if only_prep:
+            return
+        executable = os.path.join(str(self.sim_dir), "ALF.out")
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(self.n_omp)
+        cmd = (
+            ["mpiexec", "-n", str(self.n_mpi), executable]
+            if self.mpi
+            else [executable]
+        )
+        with cd(str(self.sim_dir)):
+            subprocess.run(cmd, check=True, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +360,7 @@ class SimulationMonitor(App):
         Binding("c", "cancel_job", "Cancel Job", show=True),
         Binding("a", "cancel_array", "Cancel Array", show=True),
         Binding("r", "resubmit", "Resubmit", show=True),
-        Binding("f5", "refresh_data", "Refresh", show=True),
+        Binding("f", "refresh_data", "Refresh", show=True),
         Binding("left", "pan_left", show=False),
         Binding("right", "pan_right", show=False),
     ]
@@ -422,6 +461,8 @@ class SimulationMonitor(App):
         table.add_column("Node", key="node")
         table.add_column("Elapsed", key="elapsed")
         table.add_column("ETA", key="eta")
+        table.add_column("Peak Mem", key="peak_mem")
+        table.add_column("CPU Eff", key="cpu_eff")
 
         self._trigger_refresh()
         self.set_interval(self._refresh_interval, self._trigger_refresh)
@@ -450,9 +491,30 @@ class SimulationMonitor(App):
             if jid:
                 jobid_map[sim.sim_dir] = jid
 
-        statuses = (
-            _get_slurm_status_bulk(list(set(jobid_map.values()))) if jobid_map else {}
-        )
+        all_jids = list(set(jobid_map.values()))
+        statuses = _get_slurm_status_bulk(all_jids) if all_jids else {}
+
+        terminal_jids = [
+            jid for jid in all_jids
+            if statuses.get(jid, {}).get("status") in _TERMINAL_STATES
+        ]
+        resources = _get_jobs_resources_bulk(terminal_jids) if terminal_jids else {}
+
+        # Compute partition once from the first sim's CPU_MAX — matches the
+        # behaviour of ClusterSubmitter.submit(), which uses filtered_sims[0]
+        # for the whole array's SLURM parameters.
+        _shared_partition: str | None = None
+        _shared_mem: str | None = None
+        if self._cs is not None and self._cs.executor == "slurm" and self._sims:
+            _first_sd = self._sims[0].sim_dict
+            if isinstance(_first_sd, list):
+                _first_sd = _first_sd[0] if _first_sd else {}
+            _timeout_h_0 = max(1, int(_first_sd.get("CPU_MAX", 24)))
+            try:
+                _shared_partition = self._cs._select_partition(_timeout_h_0)
+            except ValueError:
+                _shared_partition = "???"
+            _shared_mem = self._cs.slurm_mem
 
         rows: list[dict[str, Any]] = []
         for idx, sim in enumerate(self._sims):
@@ -488,29 +550,31 @@ class SimulationMonitor(App):
             else:
                 eta = "-"
 
+            nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
+
+            res = resources.get(jobid, {}) if (jobid and status in _TERMINAL_STATES) else {}
+
             row: dict[str, Any] = {
                 "idx": idx,
                 "ham": sim.ham_name,
                 "n_omp": sim.n_omp,
                 "n_mpi": sim.n_mpi if getattr(sim, "mpi", False) else 1,
                 "n_bins": n_bins,
+                "nbin_target": int(nbin_target) if nbin_target is not None else None,
                 "array_id": array_id,
                 "jobid": jobid or "-",
                 "status": status,
                 "node": nodelist or "-",
                 "elapsed": runtime or "-",
                 "eta": eta,
+                "peak_mem": res.get("max_rss") or "-",
+                "cpu_eff": res.get("cpu_eff") or "-",
             }
             for key in self._param_keys:
                 row[key] = str(sim_dict.get(key, "-"))
             if self._cs is not None and self._cs.executor == "slurm":
-                timeout_h = max(1, int(sim_dict.get("CPU_MAX", 24)))
-                try:
-                    partition = self._cs._select_partition(timeout_h)
-                except ValueError:
-                    partition = "???"
-                row["partition"] = partition
-                row["mem"] = self._cs.slurm_mem
+                row["partition"] = _shared_partition
+                row["mem"] = _shared_mem
             rows.append(row)
 
         self.call_from_thread(self._apply_rows, rows)
@@ -536,10 +600,10 @@ class SimulationMonitor(App):
             values.extend([row["n_omp"], row["n_mpi"]])
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
-            values.extend([row["n_bins"], row["array_id"], row["jobid"]])
+            values.extend([_bins_cell(row["n_bins"], row.get("nbin_target")), row["array_id"], row["jobid"]])
             values.append(_styled(row["status"]))
             values.append(row["node"])
-            values.extend([row["elapsed"], row["eta"]])
+            values.extend([row["elapsed"], row["eta"], row.get("peak_mem", "-"), row.get("cpu_eff", "-")])
             table.add_row(*values, key=str(row["idx"]))
 
         if rows:

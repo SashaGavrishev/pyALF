@@ -608,6 +608,7 @@ class SubmissionReview(App):
     #arch-col .sl { height: 1; content-align: left middle; }
     #arch-col Input { height: 1; border: none; padding: 0 1; background: transparent; color: ansi_blue; }
     #arch-col Input:focus { border: none; background: transparent; color: ansi_blue; }
+    #walltime-note { height: 1; }
 
     Button { border: blank; color: ansi_default; background: transparent; }
     Button.-primary { background: ansi_bright_black; color: ansi_default; }
@@ -744,10 +745,13 @@ class SubmissionReview(App):
                 with ScrollableContainer(id="arch-col"):
                     yield Label("Architecture", classes="hd")
                     yield Static("", id="arch-panel")
+                    yield Label("Machine", classes="hd")
+                    yield Static("", id="machine-panel")
                     yield Label("Schedule", classes="hd")
                     with Horizontal(classes="sr"):
                         yield Label("Wall time", classes="sl")
                         yield Input("", id="walltime-input", placeholder="HH:MM:SS")
+                    yield Static("[dim]Wall time applies to all jobs in the array[/dim]", id="walltime-note")
                     yield Static("", id="schedule-panel")
         # ── footer row: key hints left, submit button right ──
         with Horizontal(id="footer-bar"):
@@ -834,9 +838,18 @@ class SubmissionReview(App):
             _arch_renderable(sim, self._executor_state, self._cs, mem_display=mem)
         )
 
+        config_str = getattr(sim, "config", "") or "—"
+        self.query_one("#machine-panel", Static).update(config_str)
+
         wt_input = self.query_one("#walltime-input", Input)
         if not wt_input.has_focus:
-            wt_input.value = _hours_to_hms(timeout_h)
+            # Use the first sim's CPU_MAX — SLURM arrays share a single --time
+            # derived from filtered_sims[0], so the display should not jump when
+            # the cursor moves between rows.
+            array_timeout_h = max(
+                0.0, float(_sim_dict_of(self._sims[0]).get("CPU_MAX", 24))
+            )
+            wt_input.value = _hours_to_hms(array_timeout_h)
 
         self.query_one("#schedule-panel", Static).update(
             f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]\n"
@@ -1125,6 +1138,20 @@ class SubmissionReview(App):
 
         self.push_screen(EditSimScreen(proxy, all_keys), callback=on_done)
 
+    def run_with_monitor(self, refresh_interval: float = 30.0) -> None:
+        """Run the submission TUI, then open the monitor automatically if requested.
+
+        Replaces the ``app.run()`` / ``if app.open_monitor`` pattern that the
+        caller would otherwise have to write manually.
+        """
+        self.run()
+        if self.open_monitor and self.session_path:
+            from .monitor import SimulationMonitor
+
+            SimulationMonitor.from_session(
+                self.session_path, refresh_interval=refresh_interval
+            ).run()
+
     def action_quit_cancel(self) -> None:
         self.exit(self._submitted_result)
 
@@ -1157,8 +1184,9 @@ class SubmissionReview(App):
     def _on_walltime_changed(self) -> None:
         val = self.query_one("#walltime-input", Input).value
         hours = _parse_wall_time(val)
-        if hours is not None and self._focused_idx < len(self._sims):
-            _sim_dict_of(self._sims[self._focused_idx])["CPU_MAX"] = hours
+        if hours is not None and self._sims:
+            for sim in self._sims:
+                _sim_dict_of(sim)["CPU_MAX"] = hours
             self._refresh_right_panel()
             self._refresh_submit_button()
 
