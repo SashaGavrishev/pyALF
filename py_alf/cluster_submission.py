@@ -7,6 +7,8 @@ Provides interfaces for running ALF simulations on a cluster.
 
 """
 
+from __future__ import annotations
+
 __author__ = "Johannes Hofmann"
 __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
@@ -16,16 +18,311 @@ import os
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
-import submitit
 from colorama import Fore
 from tabulate import tabulate
 from tqdm import tqdm
 
+import submitit
+
 from .simulation import Simulation
 
 logger = logging.getLogger(__name__)
+
+
+class PartitionSpec(TypedDict, total=False):
+    """Per-partition SLURM node resource limits.
+
+    Used as values in the *partition_rules* mapping passed to
+    :class:`ClusterSubmitter`.  A bare ``float`` is also accepted and is
+    interpreted as *max_hours* only.
+
+    max_hours : float
+        Wall-time limit in hours (required).
+    max_cpus : int, optional
+        Maximum CPUs available per node.  When supplied the submitter
+        raises :class:`ValueError` if the job's ``n_mpi * n_omp`` (or
+        just ``n_omp`` for non-MPI runs) would exceed this.
+    max_mem_gb : float, optional
+        Maximum node memory in GB.  When supplied the submitter raises
+        :class:`ValueError` if ``slurm_mem`` would exceed this.
+    """
+
+    max_hours: float
+    max_cpus: int
+    max_mem_gb: float
+
+
+def _parse_mem_gb(mem_str: str) -> float:
+    """Parse a SLURM-style memory string into GB.
+
+    Accepted suffixes (case-insensitive): K, M, G, T.
+    No suffix → megabytes (SLURM's default unit for ``--mem``).
+
+    Examples
+    --------
+    >>> _parse_mem_gb("8G")
+    8.0
+    >>> _parse_mem_gb("512M")
+    0.5
+    >>> _parse_mem_gb("1T")
+    1024.0
+    """
+    s = mem_str.strip()
+    if not s:
+        raise ValueError("Empty memory string")
+    suffix = s[-1].upper() if s[-1].isalpha() else ""
+    try:
+        num = float(s[:-1]) if suffix else float(s)
+    except ValueError:
+        raise ValueError(f"Cannot parse memory string: {mem_str!r}")
+    factors: dict[str, float] = {
+        "K": 1 / 1024**2,  # KB → GB
+        "M": 1 / 1024,  # MB → GB
+        "G": 1.0,
+        "T": 1024.0,  # TB → GB
+        "": 1 / 1024,  # no suffix = MB (SLURM default)
+    }
+    if suffix not in factors:
+        raise ValueError(f"Unknown memory suffix {suffix!r} in {mem_str!r}")
+    return num * factors[suffix]
+
+
+def _normalise_partition_spec(
+    name: str, value: "float | int | PartitionSpec | dict"
+) -> PartitionSpec:
+    """Coerce a *partition_rules* value to a :class:`PartitionSpec` dict."""
+    if isinstance(value, (int, float)):
+        return PartitionSpec(max_hours=float(value))
+    d = dict(value)
+    if "max_hours" not in d:
+        raise ValueError(
+            f"partition_rules[{name!r}]: dict entries must contain 'max_hours'; "
+            f"got keys {sorted(d)!r}"
+        )
+    unknown = set(d) - {"max_hours", "max_cpus", "max_mem_gb"}
+    if unknown:
+        raise ValueError(
+            f"partition_rules[{name!r}]: unknown keys {sorted(unknown)!r}; "
+            f"valid keys are 'max_hours', 'max_cpus', 'max_mem_gb'"
+        )
+    return PartitionSpec(**d)
+
+
+def _sanitise_nodelist(raw: str | None) -> str | None:
+    """Return the raw SLURM nodelist string, or *None* when there is no real node.
+
+    ``squeue``'s ``%N`` field returns a parenthesised reason string such as
+    ``(Priority)`` for pending or blocked jobs, and the actual node list
+    (e.g. ``compute01`` or ``node[1-4]``) for running jobs.
+    ``sacct``'s ``NodeList`` column returns the literal string ``"None"`` when
+    no allocation has been made yet.
+    """
+    if not raw or raw in ("None", "N/A", "none"):
+        return None
+    if raw.startswith("("):  # pending-reason e.g. "(Priority)", "(Resources)"
+        return None
+    return raw
+
+
+def _parse_slurm_time_hours(time_str: str) -> float | None:
+    """Parse a SLURM time-limit string into fractional hours.
+
+    Accepted formats (case-insensitive):
+
+    * ``UNLIMITED`` / ``INFINITE`` / ``NOT_SET`` → *None*
+    * ``MM``
+    * ``MM:SS``
+    * ``HH:MM:SS``
+    * ``D-HH:MM:SS``
+
+    Returns *None* for unlimited or unparseable values.
+    """
+    s = time_str.strip()
+    if not s or s.upper() in ("UNLIMITED", "INFINITE", "NOT_SET"):
+        return None
+    try:
+        days = 0
+        if "-" in s:
+            day_part, s = s.split("-", 1)
+            days = int(day_part)
+        parts = s.split(":")
+        if len(parts) == 3:
+            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, sec = 0, int(parts[0]), int(parts[1])
+        elif len(parts) == 1:
+            h, m, sec = 0, 0, int(parts[0])
+        else:
+            return None
+        return days * 24 + h + m / 60 + sec / 3600
+    except (ValueError, IndexError):
+        return None
+
+
+def detect_partition_rules(
+    exclude: list[str] | None = None,
+    include: list[str] | None = None,
+    mem_headroom_gb: float = 2.0,
+    timeout: float = 10.0,
+) -> dict[str, PartitionSpec]:
+    """Query the local SLURM installation and build a *partition_rules* dict.
+
+    Runs ``sinfo -o "%P|%l|%c|%m" --noheader`` and converts the output into
+    a mapping of partition name → :class:`PartitionSpec`.  When a partition
+    has multiple node groups (multiple ``sinfo`` lines), the *minimum* CPU
+    count and *minimum* memory are used — the conservative choice that
+    guarantees the limits hold for every node in the partition.
+
+    Partitions with an ``UNLIMITED`` time limit are excluded because
+    :class:`ClusterSubmitter` requires a finite ``max_hours`` to select
+    a partition automatically.
+
+    Parameters
+    ----------
+    exclude : list of str, optional
+        Partition names to ignore, e.g. GPU-only or interactive partitions.
+        Matching is case-insensitive.
+    include : list of str, optional
+        If given, *only* these partition names are returned; all others are
+        dropped.  Matching is case-insensitive.
+    mem_headroom_gb : float
+        Gigabytes subtracted from the raw per-node memory reported by
+        ``sinfo`` to leave headroom for OS and system daemons.
+        Default is ``2.0``.
+    timeout : float
+        Seconds to wait for the ``sinfo`` subprocess before raising.
+        Default is ``10.0``.
+
+    Returns
+    -------
+    dict[str, PartitionSpec]
+        Ready to pass directly to :class:`ClusterSubmitter` as
+        *partition_rules*.
+
+    Raises
+    ------
+    RuntimeError
+        If ``sinfo`` is not found on PATH, times out, or returns no
+        partitions that survive the filters and have finite time limits.
+
+    Examples
+    --------
+    Detect all finite-time-limit partitions, excluding the GPU queue::
+
+        rules = detect_partition_rules(exclude=["gpu"])
+        cs = ClusterSubmitter("slurm", slurm_mem="8G", partition_rules=rules)
+
+    Detect only specific partitions::
+
+        rules = detect_partition_rules(include=["short", "medium", "long"])
+    """
+    exclude_set = {p.lower() for p in (exclude or [])}
+    include_set = {p.lower() for p in include} if include else None
+
+    try:
+        result = subprocess.run(
+            ["sinfo", "-o", "%P|%l|%c|%m", "--noheader"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "detect_partition_rules: 'sinfo' not found — "
+            "is SLURM installed and on PATH?"
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"detect_partition_rules: 'sinfo' timed out after {timeout} s"
+        ) from None
+
+    # Accumulate (max_hours, cpus, mem_mb) tuples per partition name.
+    # Multiple tuples arise when a partition spans several node groups.
+    raw: dict[str, list[tuple[float, int, int]]] = {}
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 4:
+            logger.debug("detect_partition_rules: skipping unrecognised line %r", line)
+            continue
+        name_raw, time_raw, cpus_raw, mem_raw = parts[:4]
+
+        # SLURM marks the default partition with a trailing '*'
+        name = name_raw.strip().rstrip("*").strip()
+        if not name:
+            continue
+
+        if name.lower() in exclude_set:
+            continue
+        if include_set is not None and name.lower() not in include_set:
+            continue
+
+        hours = _parse_slurm_time_hours(time_raw)
+        if hours is None:
+            logger.debug(
+                "detect_partition_rules: skipping partition %r (UNLIMITED time)", name
+            )
+            continue
+
+        try:
+            cpus = int(cpus_raw.strip())
+        except ValueError:
+            logger.warning(
+                "detect_partition_rules: cannot parse CPU count %r for %r — skipping row",
+                cpus_raw,
+                name,
+            )
+            continue
+
+        try:
+            mem_mb = int(mem_raw.strip())
+        except ValueError:
+            logger.warning(
+                "detect_partition_rules: cannot parse memory %r for %r — skipping row",
+                mem_raw,
+                name,
+            )
+            continue
+
+        raw.setdefault(name, []).append((hours, cpus, mem_mb))
+
+    if not raw:
+        raise RuntimeError(
+            "detect_partition_rules: no usable partitions found after filtering. "
+            "Verify that 'sinfo' is working and adjust the exclude/include lists."
+        )
+
+    rules: dict[str, PartitionSpec] = {}
+    for name, entries in raw.items():
+        max_hours = min(h for h, _, _ in entries)
+        max_cpus = min(c for _, c, _ in entries)
+        raw_mem_gb = min(m for _, _, m in entries) / 1024 - mem_headroom_gb
+        if raw_mem_gb <= 0:
+            logger.warning(
+                "detect_partition_rules: partition %r has %.1f GB after headroom "
+                "deduction — skipping.",
+                name,
+                raw_mem_gb + mem_headroom_gb,
+            )
+            continue
+        rules[name] = PartitionSpec(
+            max_hours=max_hours,
+            max_cpus=max_cpus,
+            max_mem_gb=round(raw_mem_gb, 3),
+        )
+
+    if not rules:
+        raise RuntimeError(
+            "detect_partition_rules: all detected partitions were excluded or had "
+            "unusable specs (e.g. memory too small after headroom deduction)."
+        )
+
+    return rules
 
 
 def _run_alf(sim: Simulation) -> None:
@@ -38,36 +335,226 @@ def _run_alf(sim: Simulation) -> None:
     sim.run(bin_in_sim_dir=True)
 
 
+def _format_hours(h: float) -> str:
+    """Return a human-readable string for a duration expressed in hours."""
+    if h < 1:
+        return f"{round(h * 60)}min"
+    if h < 24:
+        return f"{h:g}h"
+    days = h / 24
+    return f"{int(days)}d" if days == int(days) else f"{days:.1f}d"
+
+
 class ClusterSubmitter:
     """
-    Handles job submission to a SLURM cluster using submitit.
+    Handles job submission using submitit.
 
     Parameters
     ----------
+    executor : {'slurm', 'local', 'debug'}
+        Backend to use. ``'slurm'`` submits to a SLURM cluster; ``'local'``
+        runs jobs in local processes (useful for testing without SLURM);
+        ``'debug'`` runs jobs inline and synchronously.
     submit_dir : str or Path
         Directory where submitit writes job logs and state.
-    slurm_partition : str
-        SLURM partition to submit to.
     slurm_mem : str
-        Memory request per node (e.g. ``'2G'``, ``'8G'``). Required.
+        Memory request per node (e.g. ``'2G'``, ``'8G'``). Required when
+        *executor* is ``'slurm'``.
+    partition_rules : dict[str, float | PartitionSpec]
+        Mapping of SLURM partition name → resource limits.  Each value is
+        either a plain ``float`` (wall-time limit in hours, backward
+        compatible) or a :class:`PartitionSpec` dict with keys:
+
+        * ``max_hours`` (**required**) – wall-time limit in hours
+          (fractions allowed, e.g. ``10/60`` for 10 minutes).
+        * ``max_cpus`` (*optional*) – maximum CPUs per node; submission
+          fails if ``n_mpi × n_omp`` would exceed this.
+        * ``max_mem_gb`` (*optional*) – maximum node memory in GB;
+          submission fails if ``slurm_mem`` would exceed this.
+
+        At submission time the partition with the smallest *max_hours*
+        that is still ≥ the job's ``CPU_MAX`` is selected automatically.
+        Required when *executor* is ``'slurm'``.  Exclude GPU-only
+        partitions from CPU workloads.
+
+        Example (typical HPC cluster, minimal)::
+
+            partition_rules={
+                "short":      2,      # 2 h
+                "medium":     48,     # 2 days
+                "long":       336,    # 14 days
+                "extra_long": 672,    # 28 days
+            }
+
+        Example with per-node resource limits::
+
+            partition_rules={
+                "short":  {"max_hours": 2,   "max_cpus": 64,  "max_mem_gb": 256},
+                "medium": {"max_hours": 48,  "max_cpus": 128, "max_mem_gb": 512},
+                "long":   {"max_hours": 336, "max_cpus": 128, "max_mem_gb": 512},
+            }
+
+        The ``debug`` partition (10-minute wall time) is intentionally
+        omitted here because ``CPU_MAX`` is always at least 1 hour; submit
+        debug-partition jobs explicitly via ``job_properties``.
+
+    job_name : str, optional
+        SLURM job name (``--job-name``). Defaults to the hamiltonian name.
+        Accepted for all executors.
+    mail_type : str, optional
+        SLURM mail event type, e.g. ``'END'``, ``'FAIL'``, ``'ALL'``.
+        Only valid when *executor* is ``'slurm'``.
+    wckey : str, optional
+        SLURM workload-characterisation key (``--wckey``).
+        Only valid when *executor* is ``'slurm'``.
+    stderr_to_stdout : bool
+        Redirect stderr to the stdout log file. Accepted for all executors.
     **slurm_kwargs
-        Additional keyword arguments passed to
-        ``executor.update_parameters()``. Any key prefixed with ``slurm_``
-        is forwarded as a raw ``#SBATCH`` directive.
+        Additional keyword arguments forwarded to
+        ``executor.update_parameters()``. Keys prefixed with ``slurm_``
+        are sent as raw ``#SBATCH`` directives. Only valid when *executor*
+        is ``'slurm'``.
+
+    Raises
+    ------
+    ValueError
+        If *executor* is not one of the accepted values; if SLURM-specific
+        parameters are supplied for a non-SLURM executor; or if required
+        SLURM parameters are missing for a SLURM executor.
     """
+
+    _VALID_EXECUTORS = ("slurm", "local", "debug")
 
     def __init__(
         self,
-        submit_dir="submitit",
-        slurm_partition="short",
+        executor: Literal["slurm", "local", "debug"] = "slurm",
         *,
-        slurm_mem: str,
+        submit_dir: str | Path = "submitit",
+        slurm_mem: str | None = None,
+        partition_rules: dict[str, Any] | None = None,
+        job_name: str | None = None,
+        mail_type: str | None = None,
+        wckey: str | None = None,
+        stderr_to_stdout: bool = False,
         **slurm_kwargs,
     ):
+        if executor not in self._VALID_EXECUTORS:
+            raise ValueError(
+                f"executor must be one of {self._VALID_EXECUTORS!r}, got {executor!r}"
+            )
+
+        if executor != "slurm":
+            slurm_specific = [k for k in slurm_kwargs if k.startswith("slurm_")]
+            problems = (
+                (["slurm_mem"] if slurm_mem is not None else [])
+                + (["partition_rules"] if partition_rules is not None else [])
+                + (["mail_type"] if mail_type is not None else [])
+                + (["wckey"] if wckey is not None else [])
+                + slurm_specific
+            )
+            if problems:
+                raise ValueError(
+                    f"Parameters {problems!r} are only valid for executor='slurm'"
+                )
+        else:
+            if slurm_mem is None:
+                raise ValueError("slurm_mem is required for executor='slurm'")
+            if partition_rules is None:
+                raise ValueError(
+                    "partition_rules is required for executor='slurm'. "
+                    "Example: partition_rules={'short': 2, 'medium': 48, 'long': 336}"
+                )
+
+        if partition_rules is not None:
+            try:
+                partition_rules = {
+                    name: _normalise_partition_spec(name, spec)
+                    for name, spec in partition_rules.items()
+                }
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid partition_rules: {exc}") from exc
+
+        self.executor = executor
         self.submit_dir = Path(submit_dir)
-        self.slurm_partition = slurm_partition
         self.slurm_mem = slurm_mem
+        self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
+        self.job_name = job_name
+        self.mail_type = mail_type
+        self.wckey = wckey
+        self.stderr_to_stdout = stderr_to_stdout
         self.slurm_kwargs = slurm_kwargs
+
+    def _select_partition(self, timeout_hours: float) -> str:
+        """Select the smallest-limit partition that accommodates *timeout_hours*."""
+        for name, spec in sorted(
+            self.partition_rules.items(), key=lambda kv: kv[1]["max_hours"]
+        ):
+            if timeout_hours <= spec["max_hours"]:
+                return name
+        configured = ", ".join(
+            f"{n}: {_format_hours(s['max_hours'])}"
+            for n, s in self.partition_rules.items()
+        )
+        raise ValueError(
+            f"No configured partition fits a {_format_hours(timeout_hours)} timeout. "
+            f"Extend partition_rules or reduce CPU_MAX. "
+            f"Configured: {{{configured}}}"
+        )
+
+    def _check_node_fit(
+        self,
+        sim: "Simulation",
+        partition: str,
+        slurm_mem: str | None = None,
+    ) -> None:
+        """Raise :class:`ValueError` if resources exceed the partition's per-node limits.
+
+        Parameters
+        ----------
+        sim:
+            The simulation whose ``n_mpi``, ``n_omp``, and ``mpi`` attributes
+            define the CPU footprint.
+        partition:
+            Name of the SLURM partition that has been (or will be) selected.
+        slurm_mem:
+            Memory string to check (e.g. ``'8G'``).  Defaults to
+            ``self.slurm_mem`` when *None*.
+
+        Raises
+        ------
+        ValueError
+            If ``n_mpi × n_omp`` exceeds ``max_cpus``, or if the requested
+            memory exceeds ``max_mem_gb`` for the given *partition*.
+        """
+        spec = self.partition_rules[partition]
+
+        # ── CPU check ──────────────────────────────────────────────────────────
+        total_cpus = (sim.n_mpi if sim.mpi else 1) * sim.n_omp
+        max_cpus = spec.get("max_cpus")
+        if max_cpus is not None and total_cpus > max_cpus:
+            detail = (
+                f"n_mpi={sim.n_mpi} × n_omp={sim.n_omp}"
+                if sim.mpi
+                else f"n_omp={sim.n_omp}"
+            )
+            raise ValueError(
+                f"Requested {total_cpus} CPU(s) ({detail}) exceeds "
+                f"partition '{partition}' per-node CPU limit of {max_cpus}."
+            )
+
+        # ── Memory check ───────────────────────────────────────────────────────
+        effective_mem = slurm_mem if slurm_mem is not None else self.slurm_mem
+        max_mem_gb = spec.get("max_mem_gb")
+        if max_mem_gb is not None and effective_mem:
+            try:
+                req_gb = _parse_mem_gb(effective_mem)
+            except ValueError:
+                return  # unparseable → skip
+            if req_gb > max_mem_gb:
+                raise ValueError(
+                    f"Requested memory {effective_mem} ({req_gb:.3g} GB) exceeds "
+                    f"partition '{partition}' per-node memory limit of {max_mem_gb} GB."
+                )
 
     def submit(
         self,
@@ -100,16 +587,22 @@ class ClusterSubmitter:
             One Job object per submitted simulation.
         """
 
-        if isinstance(sims, Iterable) and not isinstance(
-            sims, (str, bytes, Simulation)
+        _SIM_ATTRS = ("sim_dir", "sim_dict", "ham_name", "n_omp", "n_mpi", "mpi", "run")
+        if (
+            isinstance(sims, Iterable)
+            and not isinstance(sims, (str, bytes))
+            and not all(hasattr(sims, a) for a in _SIM_ATTRS)
         ):
             sim_list = list(sims)
         else:
             sim_list = [sims]
 
         for s in sim_list:
-            if not isinstance(s, Simulation):
-                raise TypeError(f"Expected Simulation, got {type(s)}")
+            missing = [a for a in _SIM_ATTRS if not hasattr(s, a)]
+            if missing:
+                raise TypeError(
+                    f"Expected Simulation-like object (missing {missing!r}), got {type(s)}"
+                )
 
         filtered_sims = []
 
@@ -121,7 +614,7 @@ class ClusterSubmitter:
                 jobid_file.read_text().strip() if jobid_file.exists() else None
             )
 
-            if jobid is not None:
+            if jobid is not None and self.executor == "slurm":
                 status_entry = _get_slurm_status_sacct(jobid)
                 if status_entry.get("status") in ("PENDING", "RUNNING"):
                     logger.info(
@@ -131,7 +624,7 @@ class ClusterSubmitter:
                     continue
 
             if running_file.exists():
-                if jobid is not None:
+                if jobid is not None and self.executor == "slurm":
                     status_entry = _get_slurm_status_sacct(jobid)
                     if status_entry.get("status") == "RUNNING":
                         logger.info(f"Skipping {s.sim_dir}: job {jobid} is RUNNING")
@@ -174,15 +667,51 @@ class ClusterSubmitter:
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
+        #
+        # Resource layout for a hybrid MPI + OpenMP job
+        # -----------------------------------------------
+        # tasks_per_node = n_mpi  →  SLURM allocates n_mpi task slots per node,
+        #                            each with cpus_per_task = n_omp CPU cores.
+        # Total cores on the node  = n_mpi × n_omp, matching exactly what
+        # `mpiexec -n n_mpi ./ALF.out` with OMP_NUM_THREADS=n_omp will consume.
+        #
+        # For a pure-OpenMP (no MPI) job tasks_per_node is 1, so a single task
+        # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
         params: dict[str, Any] = {
-            "name": sim.ham_name,
+            "name": self.job_name if self.job_name is not None else sim.ham_name,
             "timeout_min": timeout_hours * 60,
             "nodes": 1,
             "cpus_per_task": sim.n_omp,
             "tasks_per_node": sim.n_mpi if sim.mpi else 1,
-            "slurm_mem": self.slurm_mem,
-            "slurm_partition": self.slurm_partition,
         }
+        if self.executor == "slurm":
+            params["slurm_mem"] = self.slurm_mem
+            params["slurm_partition"] = self._select_partition(timeout_hours)
+            self._check_node_fit(sim, params["slurm_partition"])  # ← add this line
+            if self.mail_type is not None:
+                params["slurm_mail_type"] = self.mail_type
+            if self.wckey is not None:
+                params["slurm_wckey"] = self.wckey
+            if sim.mpi:
+                # submitit's default batch script wraps the Python launcher in
+                # `srun` *without* an explicit -n flag.  With
+                # #SBATCH --ntasks-per-node=n_mpi that outer srun therefore
+                # spawns n_mpi copies of the Python process.  Each copy then
+                # independently calls `mpiexec -n n_mpi ./ALF.out`, producing
+                # n_mpi² ALF processes and triggering a nested srun / mpiexec
+                # PMI conflict (see facebookincubator/submitit#1757).
+                #
+                # use_srun=False makes the batch script call Python directly
+                # (exactly one process).  That single process then invokes
+                # `mpiexec -n n_mpi`, which sees the n_mpi SLURM task slots
+                # and distributes processes correctly across them.
+                #
+                # OMP_NUM_THREADS is set to sim.n_omp inside sim.run() before
+                # mpiexec is called, consistent with cpus_per_task=n_omp so
+                # each MPI rank fills exactly its allocated cores with threads.
+                params["use_srun"] = False
+        if self.stderr_to_stdout:
+            params["stderr_to_stdout"] = True
         params.update(self.slurm_kwargs)
         if job_properties:
             params.update(job_properties)
@@ -197,7 +726,7 @@ class ClusterSubmitter:
         effective_submit_dir.mkdir(parents=True, exist_ok=True)
 
         executor = submitit.AutoExecutor(
-            folder=str(effective_submit_dir), cluster="slurm"
+            folder=str(effective_submit_dir), cluster=self.executor
         )
         executor.update_parameters(**params)
 
@@ -310,12 +839,19 @@ def get_job_id(sim: Simulation) -> str | None:
 
 def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
     """
-    Query SLURM sacct for job status and elapsed time.
-    Returns dict: {'status': <status_str>, 'runtime': <elapsed_or_None>}
+    Query SLURM sacct for job status, elapsed time, and allocated node.
+    Returns dict: {'status': ..., 'runtime': ..., 'nodelist': ...}
     """
     try:
         result = subprocess.run(
-            ["sacct", "-j", jobid, "--format=State,Elapsed", "--noheader", "--array"],
+            [
+                "sacct",
+                "-j",
+                jobid,
+                "--format=State,Elapsed,NodeList",
+                "--noheader",
+                "--array",
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -327,11 +863,16 @@ def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
             if len(parts) >= 1:
                 state = parts[0]
                 runtime = parts[1] if len(parts) > 1 else None
-                return {"status": state, "runtime": runtime}
-        return {"status": "UNKNOWN", "runtime": None}
+                raw_node = parts[2] if len(parts) > 2 else None
+                return {
+                    "status": state,
+                    "runtime": runtime,
+                    "nodelist": _sanitise_nodelist(raw_node),
+                }
+        return {"status": "UNKNOWN", "runtime": None, "nodelist": None}
     except Exception as e:
         logger.error(f"sacct error for job {jobid}: {e}")
-        return {"status": "ERROR", "runtime": None}
+        return {"status": "ERROR", "runtime": None, "nodelist": None}
 
 
 def _get_slurm_status_bulk_sacct(
@@ -339,17 +880,17 @@ def _get_slurm_status_bulk_sacct(
 ) -> dict[str, dict[str, str | None]]:
     """
     Query SLURM sacct for multiple job IDs (including array tasks) in one call.
-    Returns dict: jobid[_index] -> {'status': <str>, 'runtime': <str|None>}
+    Returns dict: jobid[_index] -> {'status': ..., 'runtime': ..., 'nodelist': ...}
     """
     status_map: dict[str, dict[str, str | None]] = {
-        jid: {"status": "UNKNOWN", "runtime": None} for jid in jobids
+        jid: {"status": "UNKNOWN", "runtime": None, "nodelist": None} for jid in jobids
     }
     if not jobids:
         return status_map
 
     try:
         result = subprocess.run(
-            ["sacct", "--format=JobID,State,Elapsed", "--noheader", "--array"],
+            ["sacct", "--format=JobID,State,Elapsed,NodeList", "--noheader", "--array"],
             capture_output=True,
             text=True,
             timeout=30,
@@ -360,33 +901,45 @@ def _get_slurm_status_bulk_sacct(
                 jobid = parts[0]
                 state = parts[1]
                 runtime = parts[2] if len(parts) > 2 else None
-                status_map[jobid] = {"status": state, "runtime": runtime}
+                raw_node = parts[3] if len(parts) > 3 else None
+                status_map[jobid] = {
+                    "status": state,
+                    "runtime": runtime,
+                    "nodelist": _sanitise_nodelist(raw_node),
+                }
     except Exception as e:
         logger.error(f"sacct bulk error: {e}")
         for jid in jobids:
-            status_map[jid] = {"status": "ERROR", "runtime": None}
+            status_map[jid] = {"status": "ERROR", "runtime": None, "nodelist": None}
     return status_map
 
 
 def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]]:
     """
     Query SLURM for multiple job IDs (including array tasks) in one call.
-    Args:
-        jobids: List of job IDs.
-    Returns:
-        Dict mapping jobid[_index] to {'status':..., 'runtime':...}.
+
+    Uses ``squeue`` first (fast, live data); falls back to ``sacct`` for jobs
+    that are no longer in the scheduler queue (completed, failed, etc.).
+
+    Returns
+    -------
+    dict
+        Mapping ``jobid[_task]`` → ``{'status': str, 'runtime': str|None,
+        'nodelist': str|None}``.  ``nodelist`` is the allocated compute node
+        for running jobs, or *None* for pending / finished / inactive jobs.
     """
     if not jobids:
         return {}
 
     status_map: dict[str, dict[str, str | None]] = {
-        jid: {"status": "FINISHED_OR_NOT_FOUND", "runtime": None} for jid in jobids
+        jid: {"status": "FINISHED_OR_NOT_FOUND", "runtime": None, "nodelist": None}
+        for jid in jobids
     }
     found_in_squeue = set()
 
     try:
         result = subprocess.run(
-            ["squeue", "-h", "-o", "%A %i %T %M", "--array", "-j", ",".join(jobids)],
+            ["squeue", "-h", "-o", "%A %i %T %M %N", "--array", "-j", ",".join(jobids)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -404,13 +957,20 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
     if not squeue_failed:
         for line in result.stdout.strip().splitlines():
             try:
-                parts = line.split(maxsplit=3)
-                if len(parts) != 4:
+                # maxsplit=4: the 5th token is the nodelist (may be absent for
+                # pending jobs that squeue shows with an empty nodelist field)
+                parts = line.split(maxsplit=4)
+                if len(parts) < 4:
                     logger.warning(f"Unexpected squeue output line: '{line}'")
                     continue
-                jid, idx, state, runtime = parts
+                jid, idx, state, runtime = parts[:4]
+                raw_node = parts[4] if len(parts) > 4 else None
                 full_id = jid if idx == "N/A" else idx
-                status_map[full_id] = {"status": state, "runtime": runtime}
+                status_map[full_id] = {
+                    "status": state,
+                    "runtime": runtime,
+                    "nodelist": _sanitise_nodelist(raw_node),
+                }
                 found_in_squeue.add(full_id)
             except Exception as e:
                 logger.error(f"Error parsing squeue output line '{line}': {e}")
@@ -421,14 +981,14 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             sacct_statuses = _get_slurm_status_bulk_sacct(missing_jobids)
             for jid in missing_jobids:
                 status_map[jid] = sacct_statuses.get(
-                    jid, {"status": "UNKNOWN", "runtime": None}
+                    jid, {"status": "UNKNOWN", "runtime": None, "nodelist": None}
                 )
     else:
         # squeue failed, use sacct bulk for all jobids
         sacct_statuses = _get_slurm_status_bulk_sacct(jobids)
         for jid in jobids:
             status_map[jid] = sacct_statuses.get(
-                jid, {"status": "UNKNOWN", "runtime": None}
+                jid, {"status": "UNKNOWN", "runtime": None, "nodelist": None}
             )
 
     return status_map
