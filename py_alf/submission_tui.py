@@ -33,6 +33,7 @@ from .cluster_submission import (
     ClusterSubmitter,
     PartitionSpec,
     _format_hours,
+    _hours_to_hms,
     _parse_mem_gb,
 )
 from .simulation import Simulation
@@ -54,13 +55,6 @@ def _all_param_keys(sims: list[Simulation]) -> list[str]:
         for k in _sim_dict_of(sim):
             seen[k] = None
     return list(seen)
-
-
-def _wall_time_str(cpu_max_h: float) -> str:
-    total_s = int(cpu_max_h * 3600)
-    h, rem = divmod(total_s, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _completion_str(cpu_max_h: float) -> str:
@@ -855,7 +849,7 @@ class SubmissionReview(App):
             array_timeout_h = max(
                 0.0, float(_sim_dict_of(self._sims[0]).get("CPU_MAX", 24))
             )
-            wt_input.value = _wall_time_str(array_timeout_h)
+            wt_input.value = _hours_to_hms(array_timeout_h)
 
         self.query_one("#schedule-panel", Static).update(
             f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]\n"

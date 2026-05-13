@@ -345,6 +345,14 @@ def _format_hours(h: float) -> str:
     return f"{int(days)}d" if days == int(days) else f"{days:.1f}d"
 
 
+def _hours_to_hms(h: float) -> str:
+    """Format fractional hours as HH:MM:SS for use in SLURM --time directives."""
+    total_s = int(h * 3600)
+    hh, rem = divmod(total_s, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
 class ClusterSubmitter:
     """
     Handles job submission using submitit.
@@ -663,7 +671,7 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        timeout_hours = max(1, int(sim.sim_dict.get("CPU_MAX", 24)))
+        timeout_hours = max(1, float(sim.sim_dict.get("CPU_MAX", 24)))
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
@@ -679,7 +687,7 @@ class ClusterSubmitter:
         # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
         params: dict[str, Any] = {
             "name": self.job_name if self.job_name is not None else sim.ham_name,
-            "timeout_min": timeout_hours * 60,
+            "timeout_min": int(timeout_hours * 60),
             "nodes": 1,
             "cpus_per_task": sim.n_omp,
             "tasks_per_node": sim.n_mpi if sim.mpi else 1,
@@ -715,6 +723,11 @@ class ClusterSubmitter:
         params.update(self.slurm_kwargs)
         if job_properties:
             params.update(job_properties)
+
+        if self.executor == "slurm":
+            extra = dict(params.get("additional_parameters") or {})
+            extra.setdefault("time", _hours_to_hms(timeout_hours))
+            params["additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.
         for s in filtered_sims:
