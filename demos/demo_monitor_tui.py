@@ -170,9 +170,9 @@ def _mock_resubmit(self: ClusterSubmitter, sims, **kwargs) -> list:
     sims = list(sims) if not hasattr(sims, "sim_dir") else [sims]
     print(f"\n[MOCK] resubmit: {[str(s.sim_dir) for s in sims]}")
     jobs = []
-    for s in sims:
+    for _s in sims:
         j = MagicMock()
-        j.job_id = f"99999_resubmit"
+        j.job_id = "99999_resubmit"
         jobs.append(j)
     return jobs
 
@@ -184,14 +184,6 @@ def _mock_resubmit(self: ClusterSubmitter, sims, **kwargs) -> list:
 
 def _write_demo_session(sims: list, statuses: dict) -> Path:
     """Write a session JSON that from_session() can load."""
-    jid_by_dir = {
-        str(Path(s.sim_dir) / "jobid.txt"): (Path(s.sim_dir) / "jobid.txt")
-        .read_text()
-        .strip()
-        for s in sims
-        if (Path(s.sim_dir) / "jobid.txt").exists()
-    }
-
     entries = []
     for s in sims:
         jid_file = Path(s.sim_dir) / "jobid.txt"

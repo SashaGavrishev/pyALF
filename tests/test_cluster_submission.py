@@ -921,37 +921,42 @@ def test_detect_custom_mem_headroom():
 
 
 def test_detect_sinfo_not_found_raises():
-    with patch(
-        "py_alf.cluster_submission.subprocess.run",
-        side_effect=FileNotFoundError,
+    with (
+        patch(
+            "py_alf.cluster_submission.subprocess.run",
+            side_effect=FileNotFoundError,
+        ),
+        pytest.raises(RuntimeError, match="sinfo"),
     ):
-        with pytest.raises(RuntimeError, match="sinfo"):
-            detect_partition_rules()
+        detect_partition_rules()
 
 
 def test_detect_sinfo_timeout_raises():
     import subprocess as _sp
 
-    with patch(
-        "py_alf.cluster_submission.subprocess.run",
-        side_effect=_sp.TimeoutExpired("sinfo", 10),
+    with (
+        patch(
+            "py_alf.cluster_submission.subprocess.run",
+            side_effect=_sp.TimeoutExpired("sinfo", 10),
+        ),
+        pytest.raises(RuntimeError, match="timed out"),
     ):
-        with pytest.raises(RuntimeError, match="timed out"):
-            detect_partition_rules()
+        detect_partition_rules()
 
 
 def test_detect_no_usable_partitions_raises():
     """All UNLIMITED → RuntimeError."""
     sinfo_out = "bigmem|UNLIMITED|256|1024000\n"
-    with _mock_sinfo(sinfo_out):
-        with pytest.raises(RuntimeError, match="no usable partitions"):
-            detect_partition_rules()
+    with (
+        _mock_sinfo(sinfo_out),
+        pytest.raises(RuntimeError, match="no usable partitions"),
+    ):
+        detect_partition_rules()
 
 
 def test_detect_all_excluded_raises():
-    with _mock_sinfo(_SINFO_TYPICAL):
-        with pytest.raises(RuntimeError):
-            detect_partition_rules(exclude=["short", "medium", "long"])
+    with _mock_sinfo(_SINFO_TYPICAL), pytest.raises(RuntimeError):
+        detect_partition_rules(exclude=["short", "medium", "long"])
 
 
 def test_detect_result_is_valid_for_cluster_submitter():

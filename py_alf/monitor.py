@@ -12,6 +12,7 @@ Requires the ``textual`` package (install with ``pip install 'pyALF[tui]'``).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from pathlib import Path
@@ -370,7 +371,7 @@ class SimulationMonitor(App):
         refresh_interval: float = 30.0,
         param_keys: list[str] | None = None,
         param_headers: list[str] | None = None,
-    ) -> "SimulationMonitor":
+    ) -> SimulationMonitor:
         """Reconstruct a monitor from a session manifest written by SubmissionReview.
 
         Parameters
@@ -388,10 +389,8 @@ class SimulationMonitor(App):
         if cluster_submitter is None and "cluster_submitter" in data:
             cs_data = dict(data["cluster_submitter"])
             slurm_kwargs = cs_data.pop("slurm_kwargs", {})
-            try:
+            with contextlib.suppress(Exception):
                 cluster_submitter = ClusterSubmitter(**cs_data, **slurm_kwargs)
-            except Exception:
-                pass
         return cls(
             sims,
             cluster_submitter=cluster_submitter,
@@ -483,10 +482,7 @@ class SimulationMonitor(App):
             if isinstance(sim_dict, list):
                 sim_dict = sim_dict[0] if sim_dict else {}
 
-            if jobid and "_" in jobid:
-                array_id = jobid.split("_")[0]
-            else:
-                array_id = jobid or "-"
+            array_id = jobid.split("_")[0] if jobid and "_" in jobid else jobid or "-"
 
             if status == "RUNNING" and runtime:
                 cpu_max = (

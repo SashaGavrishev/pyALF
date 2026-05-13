@@ -75,8 +75,8 @@ def _parse_mem_gb(mem_str: str) -> float:
     suffix = s[-1].upper() if s[-1].isalpha() else ""
     try:
         num = float(s[:-1]) if suffix else float(s)
-    except ValueError:
-        raise ValueError(f"Cannot parse memory string: {mem_str!r}")
+    except ValueError as err:
+        raise ValueError(f"Cannot parse memory string: {mem_str!r}") from err
     factors: dict[str, float] = {
         "K": 1 / 1024**2,  # KB → GB
         "M": 1 / 1024,  # MB → GB
@@ -90,7 +90,7 @@ def _parse_mem_gb(mem_str: str) -> float:
 
 
 def _normalise_partition_spec(
-    name: str, value: "float | int | PartitionSpec | dict"
+    name: str, value: float | int | PartitionSpec | dict
 ) -> PartitionSpec:
     """Coerce a *partition_rules* value to a :class:`PartitionSpec` dict."""
     if isinstance(value, (int, float)):
@@ -503,7 +503,7 @@ class ClusterSubmitter:
 
     def _check_node_fit(
         self,
-        sim: "Simulation",
+        sim: Simulation,
         partition: str,
         slurm_mem: str | None = None,
     ) -> None:

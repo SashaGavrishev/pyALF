@@ -12,6 +12,7 @@ Requires the ``textual`` package (install with ``pip install 'pyALF[tui]'``).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import math
@@ -305,10 +306,8 @@ def _arch_renderable(
     cpu_over = max_cpus is not None and total_cpus > max_cpus
     mem_over = False
     if max_mem_gb is not None and mem_str:
-        try:
+        with contextlib.suppress(ValueError):
             mem_over = _parse_mem_gb(mem_str) > max_mem_gb
-        except ValueError:
-            pass
 
     info = RichText()
     info.append("\n")
@@ -413,20 +412,16 @@ class EditSimScreen(ModalScreen):
 
     def _apply_form(self) -> None:
         """Write current form values back to the sim object."""
-        try:
+        with contextlib.suppress(AttributeError):
             self._sim.sim_dir = self.query_one("#field-sim_dir", Input).value
-        except AttributeError:
-            pass
         for key in self._all_keys:
             try:
                 widget = self.query_one(f"#field-{key}", Input)
                 self._sd[key] = _coerce(widget.value, self._sd.get(key, ""))
             except Exception:
                 pass
-        try:
+        with contextlib.suppress(ValueError, AttributeError):
             self._sim.n_omp = int(self.query_one("#field-n_omp", Input).value)
-        except (ValueError, AttributeError):
-            pass
         try:
             n_mpi = int(self.query_one("#field-n_mpi", Input).value)
             self._sim.n_mpi = n_mpi
@@ -1110,15 +1105,11 @@ class SubmissionReview(App):
                     n_omp, n_mpi, mpi = sim.n_omp, sim.n_mpi, sim.mpi
                     for s in self._sims:
                         if s is not sim:
-                            try:
+                            with contextlib.suppress(AttributeError):
                                 s.n_omp = n_omp
-                            except AttributeError:
-                                pass
-                            try:
+                            with contextlib.suppress(AttributeError):
                                 s.n_mpi = n_mpi
                                 s.mpi = mpi
-                            except AttributeError:
-                                pass
                     self._repopulate_table()
                     self.notify(
                         f"Applied n_omp={n_omp}, n_mpi={n_mpi} to all {len(self._sims)} sims."
@@ -1164,10 +1155,8 @@ class SubmissionReview(App):
     @on(DataTable.RowHighlighted, "#sim-table")
     def _on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is not None:
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 self._focused_idx = int(str(event.row_key.value))
-            except (ValueError, TypeError):
-                pass
             self._refresh_right_panel()
 
     @on(Input.Changed, "#mem-input")

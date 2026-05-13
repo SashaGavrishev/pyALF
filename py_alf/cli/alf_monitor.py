@@ -167,12 +167,16 @@ def _main():
     # Discovery mode.
     search_dir = Path(args.dir)
     if not search_dir.is_dir():
-        console.print(f"[red]Error:[/red] directory [bold]{search_dir}[/bold] does not exist.")
+        console.print(
+            f"[red]Error:[/red] directory [bold]{search_dir}[/bold] does not exist."
+        )
         sys.exit(1)
 
     sessions = _find_sessions(search_dir)
     if not sessions:
-        console.print(f"[dim]No session files found in [bold]{search_dir}[/bold].[/dim]")
+        console.print(
+            f"[dim]No session files found in [bold]{search_dir}[/bold].[/dim]"
+        )
         sys.exit(1)
 
     if args.latest or len(sessions) == 1:
@@ -182,13 +186,15 @@ def _main():
         for i, p in enumerate(sessions):
             _print_session(i, p, console)
             console.print()
-        raw = input(f"Pick session [0–{len(sessions)-1}, default 0]: ").strip()
+        raw = input(f"Pick session [0–{len(sessions) - 1}, default 0]: ").strip()
         if raw == "":
             idx = 0
         elif raw.isdigit() and int(raw) < len(sessions):
             idx = int(raw)
         else:
-            console.print(f"[red]Error:[/red] {raw!r} is not a valid session index (0–{len(sessions)-1}).")
+            console.print(
+                f"[red]Error:[/red] {raw!r} is not a valid session index (0–{len(sessions) - 1})."
+            )
             sys.exit(1)
         chosen = sessions[idx]
 
