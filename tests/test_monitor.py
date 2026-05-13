@@ -71,6 +71,7 @@ def no_slurm():
         patch("py_alf.monitor.get_job_id", return_value=None),
         patch("py_alf.monitor._get_slurm_status_bulk", return_value={}),
         patch("py_alf.monitor._bin_count", return_value=0),
+        patch("py_alf.monitor._get_jobs_resources_bulk", return_value={}),
     ):
         yield
 
@@ -635,9 +636,208 @@ async def test_node_dash_when_nodelist_key_absent(tmp_path):
             return_value={"55": {"status": "RUNNING", "runtime": "00:30:00"}},
         ),
         patch("py_alf.monitor._bin_count", return_value=2),
+        patch("py_alf.monitor._get_jobs_resources_bulk", return_value={}),
     ):
         app = _monitor([sim])
         async with app.run_test() as pilot:
             await app.workers.wait_for_complete()
             await pilot.pause()
     assert app._row_data[0]["node"] == "-"
+
+
+# ---------------------------------------------------------------------------
+# _bins_cell
+# ---------------------------------------------------------------------------
+
+
+def test_bins_cell_no_target():
+    from py_alf.monitor import _bins_cell
+
+    assert _bins_cell(42, None) == "42"
+    assert _bins_cell(0, None) == "0"
+
+
+def test_bins_cell_zero_target_treated_as_no_target():
+    from py_alf.monitor import _bins_cell
+
+    assert _bins_cell(5, 0) == "5"
+
+
+def test_bins_cell_partial_progress_returns_rich_text():
+    from rich.text import Text
+
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(50, 100)
+    assert isinstance(result, Text)
+    assert "50/100" in result.plain
+    assert "░" in result.plain  # bar is not fully filled
+
+
+def test_bins_cell_complete_progress_no_empty_blocks():
+    from rich.text import Text
+
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(100, 100)
+    assert isinstance(result, Text)
+    assert "100/100" in result.plain
+    assert "░" not in result.plain  # bar is fully filled
+
+
+def test_bins_cell_complete_uses_green_style():
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(100, 100)
+    assert any("green" in str(span.style) for span in result._spans)
+
+
+def test_bins_cell_partial_uses_yellow_style():
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(50, 100)
+    assert any("yellow" in str(span.style) for span in result._spans)
+
+
+def test_bins_cell_over_target_capped_at_full_bar():
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(200, 100)
+    assert "░" not in result.plain
+
+
+# ---------------------------------------------------------------------------
+# _SessionEntry.run
+# ---------------------------------------------------------------------------
+
+
+def test_session_entry_has_run_method():
+    from py_alf.monitor import _SessionEntry
+
+    e = _SessionEntry("dir", "Ham", 4, 1, False, {})
+    assert callable(e.run)
+
+
+def test_session_entry_run_skips_only_prep():
+    from py_alf.monitor import _SessionEntry
+
+    e = _SessionEntry("/tmp/dir", "Ham", 4, 1, False, {})
+    with patch("subprocess.run") as mock_run:
+        e.run(only_prep=True)
+    mock_run.assert_not_called()
+
+
+def test_session_entry_run_calls_alf_binary(tmp_path):
+    import contextlib
+
+    from py_alf.monitor import _SessionEntry
+
+    e = _SessionEntry(str(tmp_path), "Ham", 4, 1, False, {})
+
+    @contextlib.contextmanager
+    def _fake_cd(path):
+        yield
+
+    with (
+        patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("subprocess.run") as mock_run,
+    ):
+        e.run()
+
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+    assert cmd == [str(tmp_path / "ALF.out")]
+    assert mock_run.call_args[1]["env"]["OMP_NUM_THREADS"] == "4"
+
+
+def test_session_entry_run_mpi_wraps_with_mpiexec(tmp_path):
+    import contextlib
+
+    from py_alf.monitor import _SessionEntry
+
+    e = _SessionEntry(str(tmp_path), "Ham", 4, 2, True, {})
+
+    @contextlib.contextmanager
+    def _fake_cd(path):
+        yield
+
+    with (
+        patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("subprocess.run") as mock_run,
+    ):
+        e.run()
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd == ["mpiexec", "-n", "2", str(tmp_path / "ALF.out")]
+
+
+# ---------------------------------------------------------------------------
+# Peak Mem / CPU Eff columns
+# ---------------------------------------------------------------------------
+
+
+async def test_monitor_table_has_peak_mem_and_cpu_eff_columns(tmp_path, no_slurm):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    app = _monitor([sim])
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        col_labels = [str(col.label) for col in app.query_one("DataTable").columns.values()]
+    assert "Peak Mem" in col_labels
+    assert "CPU Eff" in col_labels
+
+
+async def test_monitor_peak_resources_populated_for_completed_job(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="42"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "42": {"status": "COMPLETED", "runtime": "02:00:00", "nodelist": None}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=100),
+        patch(
+            "py_alf.monitor._get_jobs_resources_bulk",
+            return_value={"42": {"max_rss": "8M", "cpu_eff": "94%"}},
+        ),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["peak_mem"] == "8M"
+    assert app._row_data[0]["cpu_eff"] == "94%"
+
+
+async def test_monitor_peak_resources_dash_for_running_job(tmp_path):
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="43"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "43": {"status": "RUNNING", "runtime": "01:00:00", "nodelist": "node01"}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=50),
+        patch("py_alf.monitor._get_jobs_resources_bulk", return_value={}),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert app._row_data[0]["peak_mem"] == "-"
+    assert app._row_data[0]["cpu_eff"] == "-"
+
+
+async def test_monitor_nbin_target_from_sim_dict(tmp_path, no_slurm):
+    """When sim_dict contains 'NBin', the row carries a numeric nbin_target."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"U": 4.0, "NBin": 200}
+    app = _monitor([sim])
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    assert app._row_data[0]["nbin_target"] == 200

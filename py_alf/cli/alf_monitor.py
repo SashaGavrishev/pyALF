@@ -31,7 +31,7 @@ def _get_arg_parser():
     )
     parser.add_argument(
         "--dir",
-        default="submitit",
+        default="array_submission",
         metavar="DIR",
         help="Directory to search for session JSON files (default: submitit).",
     )

@@ -25,7 +25,8 @@ _RULES = {"short": 8, "long": 168}
 def test_init_defaults():
     cs = ClusterSubmitter(slurm_mem="2G", partition_rules=_RULES)
     assert cs.executor == "slurm"
-    assert cs.submit_dir == Path("submitit")
+    assert cs.submit_dir.name == "array_submission"
+    assert cs.submit_dir.is_absolute()
     assert cs.slurm_mem == "2G"
     # partition_rules is normalised to PartitionSpec dicts at construction time
     assert cs.partition_rules == {
@@ -47,7 +48,7 @@ def test_init_custom():
         partition_rules={"gpu": 24},
         slurm_extra="foo",
     )
-    assert cs.submit_dir == Path("/tmp/logs")
+    assert cs.submit_dir == Path("/tmp/logs").resolve()
     assert cs.executor == "slurm"
     assert cs.slurm_mem == "8G"
     assert cs.partition_rules == {"gpu": {"max_hours": 24.0}}
@@ -967,3 +968,155 @@ def test_detect_result_is_valid_for_cluster_submitter():
     assert cs._select_partition(1) == "short"
     assert cs._select_partition(24) == "medium"
     assert cs._select_partition(200) == "long"
+
+
+def test_detect_cpu_count_with_plus_suffix():
+    """sinfo rows like '72+' are parsed as 72, not skipped with a warning."""
+    sinfo_out = "compute|8:00:00|72+|257000\n"
+    with _mock_sinfo(sinfo_out):
+        rules = detect_partition_rules()
+    assert "compute" in rules
+    assert rules["compute"]["max_cpus"] == 72
+
+
+# --- submit_dir resolution ---
+
+
+def test_init_submit_dir_relative_is_resolved_to_absolute():
+    cs = ClusterSubmitter(
+        slurm_mem="2G", partition_rules=_RULES, submit_dir="relative/path"
+    )
+    assert cs.submit_dir.is_absolute()
+    assert cs.submit_dir.name == "path"
+
+
+def test_init_submit_dir_absolute_stays_unchanged():
+    cs = ClusterSubmitter(
+        slurm_mem="2G", partition_rules=_RULES, submit_dir="/abs/path"
+    )
+    assert cs.submit_dir == Path("/abs/path").resolve()
+    assert cs.submit_dir.is_absolute()
+
+
+# --- _get_slurm_status_bulk parent-ID queries ---
+
+
+def _mock_subprocess(stdout: str):
+    result = MagicMock()
+    result.stdout = stdout
+    result.returncode = 0
+    return patch("py_alf.cluster_submission.subprocess.run", return_value=result)
+
+
+def test_get_slurm_status_bulk_queries_parent_id_for_array_tasks():
+    """squeue is called with the array parent ID, not individual task IDs."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk
+
+    squeue_output = (
+        "99000 99000_0 COMPLETED 01:00:00 node01\n"
+        "99000 99000_1 RUNNING   00:30:00 node02\n"
+    )
+    with _mock_subprocess(squeue_output) as mock_run:
+        result = _get_slurm_status_bulk(["99000_0", "99000_1"])
+
+    first_cmd = mock_run.call_args_list[0][0][0]
+    j_arg = first_cmd[first_cmd.index("-j") + 1]
+    queried = j_arg.split(",")
+    assert "99000" in queried
+    assert "99000_0" not in queried
+    assert "99000_1" not in queried
+
+    assert result["99000_0"]["status"] == "COMPLETED"
+    assert result["99000_1"]["status"] == "RUNNING"
+
+
+def test_get_slurm_status_bulk_non_array_job_passed_through():
+    """Non-array job IDs are forwarded to squeue unchanged."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk
+
+    squeue_output = "77777 77777 PENDING 0:00 (Priority)\n"
+    with _mock_subprocess(squeue_output) as mock_run:
+        _get_slurm_status_bulk(["77777"])
+
+    first_cmd = mock_run.call_args_list[0][0][0]
+    j_arg = first_cmd[first_cmd.index("-j") + 1]
+    assert "77777" in j_arg.split(",")
+
+
+# --- _get_jobs_resources_bulk ---
+
+
+from py_alf.cluster_submission import _get_jobs_resources_bulk, _resource_cache
+
+
+def _clear_cache(*jids):
+    for jid in jids:
+        _resource_cache.pop(jid, None)
+
+
+def test_get_jobs_resources_bulk_parses_memory_and_efficiency():
+    _clear_cache("RES_BASIC")
+    sacct_out = (
+        "RES_BASIC      8192K  01:30:00  04:00:00\n"
+        "RES_BASIC.batch 8192K  01:30:00  04:00:00\n"
+    )
+    with _mock_subprocess(sacct_out):
+        result = _get_jobs_resources_bulk(["RES_BASIC"])
+    assert result["RES_BASIC"]["max_rss"] == "8M"
+    assert result["RES_BASIC"]["cpu_eff"] == "38%"  # 1.5h / 4.0h = 37.5% → 38%
+
+
+def test_get_jobs_resources_bulk_takes_max_rss_across_steps():
+    """The peak RSS is the maximum across the job step and its substeps."""
+    _clear_cache("RES_MAX")
+    sacct_out = (
+        "RES_MAX       4096K  01:00:00  04:00:00\n"
+        "RES_MAX.batch 8192K  01:00:00  04:00:00\n"
+    )
+    with _mock_subprocess(sacct_out):
+        result = _get_jobs_resources_bulk(["RES_MAX"])
+    assert result["RES_MAX"]["max_rss"] == "8M"
+
+
+def test_get_jobs_resources_bulk_large_memory_shows_gigabytes():
+    _clear_cache("RES_LARGE")
+    sacct_out = "RES_LARGE  4194304K  02:00:00  08:00:00\n"  # 4 GB
+    with _mock_subprocess(sacct_out):
+        result = _get_jobs_resources_bulk(["RES_LARGE"])
+    assert result["RES_LARGE"]["max_rss"] is not None
+    assert "G" in result["RES_LARGE"]["max_rss"]
+
+
+def test_get_jobs_resources_bulk_zero_rss_returns_none():
+    _clear_cache("RES_ZERO")
+    sacct_out = "RES_ZERO  0  01:00:00  04:00:00\n"
+    with _mock_subprocess(sacct_out):
+        result = _get_jobs_resources_bulk(["RES_ZERO"])
+    assert result["RES_ZERO"]["max_rss"] is None
+
+
+def test_get_jobs_resources_bulk_array_task_id():
+    _clear_cache("88888_3")
+    sacct_out = (
+        "88888_3       4096K  00:30:00  02:00:00\n"
+        "88888_3.batch 8192K  00:30:00  02:00:00\n"
+    )
+    with _mock_subprocess(sacct_out):
+        result = _get_jobs_resources_bulk(["88888_3"])
+    assert result["88888_3"]["max_rss"] == "8M"
+    assert result["88888_3"]["cpu_eff"] == "25%"  # 0.5h / 2.0h
+
+
+def test_get_jobs_resources_bulk_caches_result():
+    """sacct is called only once; subsequent calls for the same ID use the cache."""
+    _clear_cache("RES_CACHED")
+    sacct_out = "RES_CACHED  4096K  01:00:00  04:00:00\n"
+    with _mock_subprocess(sacct_out) as mock_run:
+        _get_jobs_resources_bulk(["RES_CACHED"])
+        _get_jobs_resources_bulk(["RES_CACHED"])
+    assert mock_run.call_count == 1
+
+
+def test_get_jobs_resources_bulk_empty_input():
+    result = _get_jobs_resources_bulk([])
+    assert result == {}
