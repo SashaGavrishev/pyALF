@@ -62,6 +62,7 @@ Issues = "https://github.com/ALF-QMC/pyALF/issues"
 "ALF Homepage" = "https://alf.physik.uni-wuerzburg.de/"
 
 [project.scripts]
+alf_monitor = 'py_alf.cli.alf_monitor:_main'
 alf_bin_count = 'py_alf.cli.alf_bin_count:_main'
 alf_del_bins = 'py_alf.cli.alf_del_bins:_main'
 alf_postprocess = 'py_alf.cli.alf_postprocess:_main'

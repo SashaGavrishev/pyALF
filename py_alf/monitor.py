@@ -12,6 +12,7 @@ Requires the ``textual`` package (install with ``pip install 'pyALF[tui]'``).
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,8 @@ try:
     from textual.binding import Binding
     from textual.containers import Container, Horizontal, ScrollableContainer
     from textual.screen import ModalScreen
-    from textual.widgets import Button, DataTable, Footer, Header, Label, Static
+    from textual.theme import Theme
+    from textual.widgets import Button, DataTable, Footer, Label, Static
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "The simulation monitor requires the 'textual' package. "
@@ -56,6 +58,69 @@ _STATUS_COLORS: dict[str, str] = {
 
 def _styled(status: str) -> Text:
     return Text(status, style=_STATUS_COLORS.get(status, ""))
+
+
+def _parse_elapsed_hours(runtime: str) -> float | None:
+    """Parse a SLURM runtime string (``[D-]HH:MM:SS``) to fractional hours."""
+    if not runtime:
+        return None
+    try:
+        days = 0
+        t = runtime
+        if "-" in runtime:
+            d, t = runtime.split("-", 1)
+            days = int(d)
+        parts = t.split(":")
+        if len(parts) == 3:
+            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, s = 0, int(parts[0]), int(parts[1])
+        else:
+            return None
+        return days * 24 + h + m / 60 + s / 3600
+    except (ValueError, IndexError):
+        return None
+
+
+def _eta_str(cpu_max_h: float, elapsed_h: float) -> str:
+    remaining_h = cpu_max_h - elapsed_h
+    if remaining_h <= 0:
+        return "overtime"
+    total_m = int(remaining_h * 60)
+    h, m = divmod(total_m, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+_MONO_THEME = Theme(
+    name="monitor-mono",
+    primary="ansi_default",
+    secondary="ansi_default",
+    warning="ansi_yellow",
+    error="ansi_red",
+    success="ansi_default",
+    accent="ansi_default",
+    foreground="ansi_default",
+    background="ansi_default",
+    surface="ansi_default",
+    panel="ansi_default",
+    boost="ansi_default",
+    dark=True,
+    ansi=True,
+    variables={
+        "ansi-background": "ansi_default",
+        "ansi-foreground": "ansi_default",
+        "border-blurred": "ansi_default",
+        "block-cursor-foreground": "ansi_default",
+        "block-cursor-background": "ansi_default",
+        "input-cursor-background": "ansi_default",
+        "input-cursor-foreground": "ansi_default",
+        "input-cursor-text-style": "reverse",
+        "input-selection-background": "ansi_default",
+        "input-selection-foreground": "ansi_default",
+        "screen-selection-background": "ansi_default",
+        "screen-selection-foreground": "ansi_default",
+    },
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +169,9 @@ class ConfirmScreen(ModalScreen[bool]):
                 yield Button("Yes", variant="error", id="confirm-yes")
                 yield Button("No", variant="default", id="confirm-no")
 
+    def on_mount(self) -> None:
+        self.query_one("#confirm-no", Button).focus()
+
     @on(Button.Pressed, "#confirm-yes")
     def _yes(self) -> None:
         self.dismiss(True)
@@ -114,6 +182,26 @@ class ConfirmScreen(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# Session manifest reconstruction
+# ---------------------------------------------------------------------------
+
+
+class _SessionEntry:
+    """Minimal sim-like object reconstructed from a session manifest JSON."""
+
+    __slots__ = ("sim_dir", "ham_name", "n_omp", "n_mpi", "mpi", "sim_dict", "config")
+
+    def __init__(self, sim_dir, ham_name, n_omp, n_mpi, mpi, sim_dict, **_extra):
+        self.sim_dir = sim_dir
+        self.ham_name = ham_name
+        self.n_omp = n_omp
+        self.n_mpi = n_mpi
+        self.mpi = mpi
+        self.sim_dict = sim_dict
+        self.config = ""
 
 
 # ---------------------------------------------------------------------------
@@ -143,52 +231,84 @@ class SimulationMonitor(App):
         Column header labels for ``param_keys``. Defaults to the key names.
     """
 
-    TITLE = "pyALF Simulation Monitor"
+    TITLE = "pyALF · Simulation Monitor"
+    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     Screen {
-        background: $background;
+        background: transparent;
+        color: ansi_default;
+        scrollbar-size: 0 0;
     }
-    DataTable {
-        height: 1fr;
+
+    ScrollableContainer { scrollbar-size: 0 0; }
+    DataTable { scrollbar-size: 0 0; }
+
+    #title-bar {
+        height: 1;
+        background: ansi_bright_black;
+        color: ansi_default;
+        text-style: bold;
+        padding: 0 1;
     }
+
+    #status-bar {
+        height: 1;
+        color: ansi_default;
+        padding: 0 1;
+    }
+
+    Horizontal, Container, ScrollableContainer, Static, Label { background: transparent; }
+    DataTable { height: 1fr; background: transparent; }
+    DataTable > .datatable--header { color: ansi_default; background: transparent; }
+    DataTable > .datatable--cursor { background: ansi_bright_black; color: ansi_default; text-style: bold; }
+    DataTable > .datatable--hover { background: ansi_bright_black; color: ansi_default; }
+    DataTable > .datatable--even-row { background: transparent; }
+    DataTable > .datatable--odd-row { background: transparent; }
+
+    Footer { background: transparent; color: ansi_default; }
+    FooterKey .footer-key--key { background: ansi_bright_black; color: ansi_default; padding: 0 1; }
+    FooterKey .footer-key--description { padding-left: 1; padding-right: 2; }
+
+    Button { border: blank; color: ansi_default; background: transparent; }
+    Button.-primary { background: ansi_bright_black; color: ansi_default; }
+    Button.-error { background: ansi_red; color: ansi_default; }
+    Button.-error.-active { background: ansi_red; color: ansi_default; text-style: bold; }
+    Button.-error:hover { background: ansi_red; color: ansi_default; text-style: bold; }
+    Button.-active { background: ansi_bright_black; color: ansi_default; text-style: bold; }
+    Button.-primary.-active { background: ansi_bright_black; color: ansi_default; text-style: bold; }
+    Button:hover { color: ansi_default; background: transparent; }
+    Button.-primary:hover { color: ansi_default; background: ansi_bright_black; text-style: bold; }
+
     /* --- Log viewer modal --- */
-    LogViewerScreen {
-        align: center middle;
-    }
+    LogViewerScreen { align: center middle; }
     #log-dialog {
-        background: $panel;
-        border: solid $primary;
+        background: ansi_default;
+        border: solid ansi_default;
         padding: 1 2;
         width: 92%;
         height: 92%;
     }
     #log-title {
-        text-align: center;
         text-style: bold;
-        background: $primary-darken-1;
-        color: $text;
+        background: ansi_bright_black;
+        color: ansi_default;
         padding: 0 1;
         margin-bottom: 1;
     }
     #log-scroll {
         height: 1fr;
-        border: solid $primary-darken-3;
+        border: solid ansi_default;
+        scrollbar-size: 0 0;
     }
-    #log-body {
-        padding: 0 1;
-    }
-    #log-close {
-        margin-top: 1;
-        width: 100%;
-    }
+    #log-body { padding: 0 1; }
+    #log-close { margin-top: 1; width: 100%; }
+
     /* --- Confirmation modal --- */
-    ConfirmScreen {
-        align: center middle;
-    }
+    ConfirmScreen { align: center middle; }
     #confirm-dialog {
-        background: $panel;
-        border: solid $warning;
+        background: ansi_default;
+        border: solid ansi_default;
         padding: 2 4;
         width: 64;
         height: auto;
@@ -196,14 +316,10 @@ class SimulationMonitor(App):
     #confirm-msg {
         text-align: center;
         margin-bottom: 2;
+        color: ansi_default;
     }
-    #confirm-buttons {
-        align: center middle;
-        height: 3;
-    }
-    #confirm-buttons Button {
-        margin: 0 2;
-    }
+    #confirm-buttons { align: center middle; height: 3; }
+    #confirm-buttons Button { margin: 0 2; }
     """
 
     BINDINGS = [
@@ -213,6 +329,8 @@ class SimulationMonitor(App):
         Binding("a", "cancel_array", "Cancel Array", show=True),
         Binding("r", "resubmit", "Resubmit", show=True),
         Binding("f5", "refresh_data", "Refresh", show=True),
+        Binding("left", "pan_left", show=False),
+        Binding("right", "pan_right", show=False),
     ]
 
     def __init__(
@@ -241,15 +359,61 @@ class SimulationMonitor(App):
         self._row_data: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
+    # Session manifest
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_session(
+        cls,
+        path: str | Path,
+        cluster_submitter: ClusterSubmitter | None = None,
+        refresh_interval: float = 30.0,
+        param_keys: list[str] | None = None,
+        param_headers: list[str] | None = None,
+    ) -> "SimulationMonitor":
+        """Reconstruct a monitor from a session manifest written by SubmissionReview.
+
+        Parameters
+        ----------
+        path:
+            Path to a ``session_YYYYMMDD_HHMMSS.json`` file produced by
+            ``SubmissionReview`` after a successful SLURM submission.
+        cluster_submitter:
+            Optional ``ClusterSubmitter`` for partition display and resubmission.
+            If omitted, the ``submit_dir`` stored in the manifest is used for
+            log discovery.
+        """
+        data = json.loads(Path(path).read_text())
+        sims = [_SessionEntry(**entry) for entry in data["entries"]]
+        if cluster_submitter is None and "cluster_submitter" in data:
+            cs_data = dict(data["cluster_submitter"])
+            slurm_kwargs = cs_data.pop("slurm_kwargs", {})
+            try:
+                cluster_submitter = ClusterSubmitter(**cs_data, **slurm_kwargs)
+            except Exception:
+                pass
+        return cls(
+            sims,
+            cluster_submitter=cluster_submitter,
+            submit_dir=data.get("cluster_submitter", {}).get("submit_dir"),
+            refresh_interval=refresh_interval,
+            param_keys=param_keys,
+            param_headers=param_headers,
+        )
+
+    # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static(f"  {self.TITLE}", id="title-bar")
+        yield Static("", id="status-bar")
         yield DataTable(id="sim-table", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.register_theme(_MONO_THEME)
+        self.theme = "monitor-mono"
         table = self.query_one("#sim-table", DataTable)
         table.add_column("#", key="idx")
         table.add_column("Hamiltonian", key="ham")
@@ -257,23 +421,34 @@ class SimulationMonitor(App):
             table.add_column(hdr, key=key)
         table.add_column("n_omp", key="n_omp")
         table.add_column("n_mpi", key="n_mpi")
-        if self._cs is not None:
+        if self._cs is not None and self._cs.executor == "slurm":
             table.add_column("partition", key="partition")
             table.add_column("mem", key="mem")
         table.add_column("N_bins", key="n_bins")
+        table.add_column("Array", key="array_id")
         table.add_column("JobID", key="jobid")
         table.add_column("Status", key="status")
+        table.add_column("Node", key="node")
         table.add_column("Elapsed", key="elapsed")
+        table.add_column("ETA", key="eta")
 
         self._trigger_refresh()
         self.set_interval(self._refresh_interval, self._trigger_refresh)
+        self.call_after_refresh(self._remove_ansi_scrollbar_class)
+
+    def watch_theme(self, _theme: str) -> None:
+        self.call_after_refresh(self._remove_ansi_scrollbar_class)
+
+    def _remove_ansi_scrollbar_class(self) -> None:
+        for widget in self.query(".-ansi-scrollbar"):
+            widget.remove_class("-ansi-scrollbar")
 
     # ------------------------------------------------------------------
     # Data fetching (background thread)
     # ------------------------------------------------------------------
 
     def _trigger_refresh(self) -> None:
-        self.sub_title = "Refreshing…"
+        self.query_one("#status-bar", Static).update("[dim]Refreshing…[/dim]")
         self._fetch_and_update()
 
     @work(thread=True)
@@ -285,9 +460,7 @@ class SimulationMonitor(App):
                 jobid_map[sim.sim_dir] = jid
 
         statuses = (
-            _get_slurm_status_bulk(list(set(jobid_map.values())))
-            if jobid_map
-            else {}
+            _get_slurm_status_bulk(list(set(jobid_map.values()))) if jobid_map else {}
         )
 
         rows: list[dict[str, Any]] = []
@@ -297,10 +470,12 @@ class SimulationMonitor(App):
                 se = statuses.get(jobid, {"status": "UNKNOWN", "runtime": None})
                 status = se.get("status", "UNKNOWN")
                 runtime = se.get("runtime")
+                nodelist = se.get("nodelist")
             else:
                 running_file = Path(sim.sim_dir) / "RUNNING"
                 status = "CRASHED" if running_file.exists() else "INACTIVE"
                 runtime = None
+                nodelist = None
 
             n_bins = _bin_count(sim, refresh=(status == "RUNNING"))
 
@@ -308,20 +483,45 @@ class SimulationMonitor(App):
             if isinstance(sim_dict, list):
                 sim_dict = sim_dict[0] if sim_dict else {}
 
+            if jobid and "_" in jobid:
+                array_id = jobid.split("_")[0]
+            else:
+                array_id = jobid or "-"
+
+            if status == "RUNNING" and runtime:
+                cpu_max = (
+                    sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
+                )
+                elapsed_h = _parse_elapsed_hours(runtime)
+                if cpu_max is not None and elapsed_h is not None:
+                    eta = _eta_str(float(cpu_max), elapsed_h)
+                else:
+                    eta = "-"
+            else:
+                eta = "-"
+
             row: dict[str, Any] = {
                 "idx": idx,
                 "ham": sim.ham_name,
                 "n_omp": sim.n_omp,
                 "n_mpi": sim.n_mpi if getattr(sim, "mpi", False) else 1,
                 "n_bins": n_bins,
+                "array_id": array_id,
                 "jobid": jobid or "-",
                 "status": status,
+                "node": nodelist or "-",
                 "elapsed": runtime or "-",
+                "eta": eta,
             }
             for key in self._param_keys:
                 row[key] = str(sim_dict.get(key, "-"))
-            if self._cs is not None:
-                row["partition"] = self._cs.slurm_partition
+            if self._cs is not None and self._cs.executor == "slurm":
+                timeout_h = max(1, int(sim_dict.get("CPU_MAX", 24)))
+                try:
+                    partition = self._cs._select_partition(timeout_h)
+                except ValueError:
+                    partition = "???"
+                row["partition"] = partition
                 row["mem"] = self._cs.slurm_mem
             rows.append(row)
 
@@ -333,23 +533,39 @@ class SimulationMonitor(App):
         saved_cursor = table.cursor_row
 
         table.clear()
+        array_ids: list[str] = list(
+            dict.fromkeys(
+                r["array_id"]
+                for r in rows
+                if r.get("array_id", "-") not in ("-", "") and "_" in r.get("jobid", "")
+            )
+        )
+
         for row in rows:
             values: list[Any] = [row["idx"], row["ham"]]
             for key in self._param_keys:
                 values.append(row.get(key, "-"))
             values.extend([row["n_omp"], row["n_mpi"]])
-            if self._cs is not None:
+            if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
-            values.extend([row["n_bins"], row["jobid"]])
+            values.extend([row["n_bins"], row["array_id"], row["jobid"]])
             values.append(_styled(row["status"]))
-            values.append(row["elapsed"])
+            values.append(row["node"])
+            values.extend([row["elapsed"], row["eta"]])
             table.add_row(*values, key=str(row["idx"]))
 
         if rows:
             table.move_cursor(row=min(saved_cursor, len(rows) - 1))
 
-        self.sub_title = (
-            f"{len(rows)} simulation(s) | auto-refresh every {self._refresh_interval:.0f}s"
+        if array_ids:
+            label = "Array" if len(array_ids) == 1 else "Arrays"
+            array_suffix = f"  ·  {label} {', '.join(array_ids)}"
+        else:
+            array_suffix = ""
+        self.query_one("#title-bar", Static).update(f"  {self.TITLE}{array_suffix}")
+
+        self.query_one("#status-bar", Static).update(
+            f"[dim]{len(rows)} simulation(s)  ·  auto-refresh every {self._refresh_interval:.0f}s[/dim]"
         )
 
     # ------------------------------------------------------------------
@@ -490,9 +706,13 @@ class SimulationMonitor(App):
                 self.notify(f"Resubmission failed: {exc}", severity="error")
             self._trigger_refresh()
 
-        self.push_screen(
-            ConfirmScreen(f"Force resubmit {sim_name}?"), _on_confirm
-        )
+        self.push_screen(ConfirmScreen(f"Force resubmit {sim_name}?"), _on_confirm)
+
+    def action_pan_left(self) -> None:
+        self.query_one("#sim-table", DataTable).scroll_left(animate=False)
+
+    def action_pan_right(self) -> None:
+        self.query_one("#sim-table", DataTable).scroll_right(animate=False)
 
     def action_refresh_data(self) -> None:
         self._trigger_refresh()
