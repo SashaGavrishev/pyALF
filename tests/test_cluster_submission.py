@@ -8,9 +8,11 @@ import pytest
 from py_alf.cluster_submission import (
     ClusterSubmitter,
     _find_job_log,
+    _get_jobs_resources_bulk,
     _normalise_partition_spec,
     _parse_mem_gb,
     _parse_slurm_time_hours,
+    _resource_cache,
     _run_alf,
     detect_partition_rules,
 )
@@ -1044,9 +1046,6 @@ def test_get_slurm_status_bulk_non_array_job_passed_through():
 
 
 # --- _get_jobs_resources_bulk ---
-
-
-from py_alf.cluster_submission import _get_jobs_resources_bulk, _resource_cache
 
 
 def _clear_cache(*jids):

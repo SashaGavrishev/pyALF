@@ -26,12 +26,12 @@ from textual.theme import Theme
 from textual.widgets import Button, DataTable, Footer, Label, Static
 
 from .cluster_submission import (
+    _TERMINAL_STATES,
     ClusterSubmitter,
     _bin_count,
     _find_job_log,
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
-    _TERMINAL_STATES,
     cancel_cluster_job,
     get_job_id,
 )
