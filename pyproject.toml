@@ -98,3 +98,6 @@ select = [
 ignore = [
   "E501"  # Line too long
 ]
+
+[tool.ruff.lint.isort]
+known-third-party = ["submitit"]

@@ -20,11 +20,10 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+import submitit
 from colorama import Fore
 from tabulate import tabulate
 from tqdm import tqdm
-
-import submitit
 
 from .simulation import Simulation
 
