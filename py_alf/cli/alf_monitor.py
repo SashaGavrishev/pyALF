@@ -6,6 +6,10 @@ import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
+from rich.console import Console
+
+from py_alf.monitor import SimulationMonitor
+
 
 def _get_arg_parser():
     parser = ArgumentParser(
@@ -140,18 +144,6 @@ def _print_session(i: int, path: Path, console) -> None:
 def _main():
     parser = _get_arg_parser()
     args = parser.parse_args()
-
-    try:
-        from rich.console import Console
-
-        from py_alf.monitor import SimulationMonitor
-    except ImportError:
-        print(
-            "The monitor requires the 'textual' package.\n"
-            "Install it with: pip install 'pyALF[tui]'",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     console = Console()
 

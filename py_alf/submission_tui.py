@@ -6,8 +6,6 @@ Usage::
     from py_alf.submission_tui import SubmissionReview
     app = SubmissionReview(cs, sims)
     submitted = app.run()   # blocks; returns submitted sim list, or None if cancelled
-
-Requires the ``textual`` package (install with ``pip install 'pyALF[tui]'``).
 """
 
 from __future__ import annotations
@@ -19,23 +17,17 @@ import math
 from datetime import datetime, timedelta
 from pathlib import Path
 
-try:
-    from rich.console import Group as RichGroup
-    from rich.panel import Panel as RichPanel
-    from rich.table import Table as RichTable
-    from rich.text import Text as RichText
-    from textual import on, work
-    from textual.app import App, ComposeResult
-    from textual.binding import Binding
-    from textual.containers import Horizontal, ScrollableContainer, Vertical
-    from textual.screen import ModalScreen
-    from textual.theme import Theme
-    from textual.widgets import Button, DataTable, Footer, Input, Label, Static
-except ImportError as exc:
-    raise ImportError(
-        "The submission review TUI requires the 'textual' package. "
-        "Install it with: pip install 'pyALF[tui]'"
-    ) from exc
+from rich.console import Group as RichGroup
+from rich.panel import Panel as RichPanel
+from rich.table import Table as RichTable
+from rich.text import Text as RichText
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.screen import ModalScreen
+from textual.theme import Theme
+from textual.widgets import Button, DataTable, Footer, Input, Label, Static
 
 from .cluster_submission import (
     ClusterSubmitter,

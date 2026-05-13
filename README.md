@@ -13,16 +13,6 @@ For documentation, installation instructions, and the full project description, 
 
 ## Fork additions
 
-### TUI extras — installation
-
-Both TUI components require the `textual` package:
-
-```bash
-pip install 'pyALF[tui]'
-# or with uv
-uv sync --extra tui
-```
-
 ---
 
 ### Submission Review (`SubmissionReview`)

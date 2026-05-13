@@ -6,8 +6,6 @@ Usage::
     from py_alf.monitor import SimulationMonitor
     monitor = SimulationMonitor(sims, cluster_submitter=cs)
     monitor.run()
-
-Requires the ``textual`` package (install with ``pip install 'pyALF[tui]'``).
 """
 
 from __future__ import annotations
@@ -18,20 +16,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-try:
-    from rich.text import Text
-    from textual import on, work
-    from textual.app import App, ComposeResult
-    from textual.binding import Binding
-    from textual.containers import Container, Horizontal, ScrollableContainer
-    from textual.screen import ModalScreen
-    from textual.theme import Theme
-    from textual.widgets import Button, DataTable, Footer, Label, Static
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "The simulation monitor requires the 'textual' package. "
-        "Install it with: pip install 'pyALF[tui]'"
-    ) from exc
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, ScrollableContainer
+from textual.screen import ModalScreen
+from textual.theme import Theme
+from textual.widgets import Button, DataTable, Footer, Label, Static
 
 from .cluster_submission import (
     ClusterSubmitter,
