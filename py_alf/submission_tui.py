@@ -783,7 +783,10 @@ class SubmissionReview(App):
                     with Horizontal(classes="sr"):
                         yield Label("Wall time", classes="sl")
                         yield Input("", id="walltime-input", placeholder="HH:MM:SS")
-                    yield Static("[dim]Sets ALF CPU_MAX for all array jobs · SLURM wall time = CPU_MAX + 10%[/dim]", id="walltime-note")
+                    yield Static(
+                        "[dim]Sets ALF CPU_MAX for all array jobs · SLURM wall time = CPU_MAX + 10%[/dim]",
+                        id="walltime-note",
+                    )
                     with Horizontal(classes="sr"):
                         yield Label("End by", classes="sl")
                         with Horizontal(id="end-by-row"):
@@ -813,7 +816,7 @@ class SubmissionReview(App):
         self.register_theme(_MONO_THEME)
         self.theme = "submission-mono"
         self._has_mpi_column: bool = any(getattr(s, "mpi", False) for s in self._sims)
-        self.query_one("#nbin-row").display = (self._end_mode == "nbin")
+        self.query_one("#nbin-row").display = self._end_mode == "nbin"
         self._setup_table()
         self._refresh_all()
         self.call_after_refresh(self._remove_ansi_scrollbar_class)
@@ -878,7 +881,9 @@ class SubmissionReview(App):
         for i, sim in enumerate(self._sims):
             sd = _sim_dict_of(sim)
             mark = (
-                RichText("✓", style="bold") if self._selected[i] else RichText("·", style="dim")
+                RichText("✓", style="bold")
+                if self._selected[i]
+                else RichText("·", style="dim")
             )
             row = [mark, str(i), sim.ham_name]
             for key in self._param_keys:
@@ -941,11 +946,10 @@ class SubmissionReview(App):
                 f"  [dim](NBin={nbin_target} may finish earlier)[/dim]"
             )
         else:
-            completes_line = (
-                f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]"
-            )
+            completes_line = f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]"
         self.query_one("#schedule-panel", Static).update(
-            completes_line + "\n"
+            completes_line
+            + "\n"
             + f"[bold]Submit dir:[/bold]  [dim]{self.query_one('#dir-input', Input).value or str(self._cs.submit_dir)}[/dim]"
         )
 
@@ -1267,9 +1271,13 @@ class SubmissionReview(App):
         nbin_val = sd.get("NBin") or sd.get("Nbin")
         mode = "nbin" if nbin_val else "cpu_max"
         self._end_mode = mode
-        self.query_one("#end-by-cpu-max", Button).label = _btn_label("CPU_MAX", mode == "cpu_max")
-        self.query_one("#end-by-nbin", Button).label = _btn_label("NBin", mode == "nbin")
-        self.query_one("#nbin-row").display = (mode == "nbin")
+        self.query_one("#end-by-cpu-max", Button).label = _btn_label(
+            "CPU_MAX", mode == "cpu_max"
+        )
+        self.query_one("#end-by-nbin", Button).label = _btn_label(
+            "NBin", mode == "nbin"
+        )
+        self.query_one("#nbin-row").display = mode == "nbin"
         if nbin_val:
             nbin_input = self.query_one("#nbin-input", Input)
             if not nbin_input.has_focus:
@@ -1363,10 +1371,14 @@ class SubmissionReview(App):
 
     def _set_end_mode(self, mode: str) -> None:
         self._end_mode = mode
-        self.query_one("#end-by-cpu-max", Button).label = _btn_label("CPU_MAX", mode == "cpu_max")
-        self.query_one("#end-by-nbin", Button).label = _btn_label("NBin", mode == "nbin")
+        self.query_one("#end-by-cpu-max", Button).label = _btn_label(
+            "CPU_MAX", mode == "cpu_max"
+        )
+        self.query_one("#end-by-nbin", Button).label = _btn_label(
+            "NBin", mode == "nbin"
+        )
         nbin_row = self.query_one("#nbin-row")
-        nbin_row.display = (mode == "nbin")
+        nbin_row.display = mode == "nbin"
         if mode == "cpu_max":
             for sim in self._sims:
                 sd = _sim_dict_of(sim)

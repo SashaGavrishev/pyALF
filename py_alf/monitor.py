@@ -202,9 +202,32 @@ class ConfirmScreen(ModalScreen[bool]):
 class _SessionEntry:
     """Minimal sim-like object reconstructed from a session manifest JSON."""
 
-    __slots__ = ("sim_dir", "ham_name", "n_omp", "n_mpi", "mpi", "sim_dict", "config", "job_id", "mpiexec", "mpiexec_args")
+    __slots__ = (
+        "sim_dir",
+        "ham_name",
+        "n_omp",
+        "n_mpi",
+        "mpi",
+        "sim_dict",
+        "config",
+        "job_id",
+        "mpiexec",
+        "mpiexec_args",
+    )
 
-    def __init__(self, sim_dir, ham_name, n_omp, n_mpi, mpi, sim_dict, job_id=None, mpiexec="mpiexec", mpiexec_args=None, **_extra):
+    def __init__(
+        self,
+        sim_dir,
+        ham_name,
+        n_omp,
+        n_mpi,
+        mpi,
+        sim_dict,
+        job_id=None,
+        mpiexec="mpiexec",
+        mpiexec_args=None,
+        **_extra,
+    ):
         self.sim_dir = sim_dir
         self.ham_name = ham_name
         self.n_omp = n_omp
@@ -225,7 +248,14 @@ class _SessionEntry:
         """Run the simulation from the already-prepared sim_dir."""
         if only_prep:
             return
-        _exec_alf_binary(self.sim_dir, self.n_omp, self.n_mpi, self.mpi, self.mpiexec, self.mpiexec_args)
+        _exec_alf_binary(
+            self.sim_dir,
+            self.n_omp,
+            self.n_mpi,
+            self.mpi,
+            self.mpiexec,
+            self.mpiexec_args,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -487,15 +517,15 @@ class SimulationMonitor(App):
         # re-submission that overwrites jobid.txt does not corrupt this session's
         # view.  Fall back to get_job_id() for live Simulation objects.
         jobid_list: list[str | None] = [
-            getattr(sim, "job_id", None) or get_job_id(sim)
-            for sim in self._sims
+            getattr(sim, "job_id", None) or get_job_id(sim) for sim in self._sims
         ]
 
         all_jids = list({jid for jid in jobid_list if jid})
         statuses = _get_slurm_status_bulk(all_jids) if all_jids else {}
 
         terminal_jids = [
-            jid for jid in all_jids
+            jid
+            for jid in all_jids
             if statuses.get(jid, {}).get("status") in _TERMINAL_STATES
         ]
         resources = _get_jobs_resources_bulk(terminal_jids) if terminal_jids else {}
@@ -557,15 +587,11 @@ class SimulationMonitor(App):
                 res = resources.get(jobid, {})
                 res_file = Path(sim.sim_dir) / "peak_resources.json"
                 if res.get("max_rss") or res.get("cpu_eff"):
-                    try:
+                    with contextlib.suppress(OSError):
                         res_file.write_text(json.dumps(res))
-                    except OSError:
-                        pass
                 elif res_file.exists():
-                    try:
+                    with contextlib.suppress(Exception):
                         res = json.loads(res_file.read_text())
-                    except Exception:
-                        pass
 
             row: dict[str, Any] = {
                 "idx": idx,
@@ -615,10 +641,23 @@ class SimulationMonitor(App):
                 values.append(row["n_mpi"])
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
-            values.extend([_bins_cell(row["n_bins"], row.get("nbin_target")), row["array_id"], row["jobid"]])
+            values.extend(
+                [
+                    _bins_cell(row["n_bins"], row.get("nbin_target")),
+                    row["array_id"],
+                    row["jobid"],
+                ]
+            )
             values.append(_styled(row["status"]))
             values.append(row["node"])
-            values.extend([row["elapsed"], row["eta"], row.get("peak_mem", "-"), row.get("cpu_eff", "-")])
+            values.extend(
+                [
+                    row["elapsed"],
+                    row["eta"],
+                    row.get("peak_mem", "-"),
+                    row.get("cpu_eff", "-"),
+                ]
+            )
             table.add_row(*values, key=str(row["idx"]))
 
         if rows:

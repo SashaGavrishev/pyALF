@@ -358,7 +358,9 @@ def _unique_slurm_job_name(base_name: str) -> str:
             text=True,
             timeout=10,
         )
-        active_names: set[str] = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        active_names: set[str] = {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
     except Exception:
         return base_name
 
@@ -565,7 +567,11 @@ class ClusterSubmitter:
                 raise ValueError(f"Invalid partition_rules: {exc}") from exc
 
         self.executor = executor
-        self.submit_dir = Path(submit_dir).resolve() if submit_dir is not None else (_project_root() / ".alfmonitor")
+        self.submit_dir = (
+            Path(submit_dir).resolve()
+            if submit_dir is not None
+            else (_project_root() / ".alfmonitor")
+        )
         self.slurm_mem = slurm_mem
         self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
         self.job_name = job_name
@@ -816,7 +822,9 @@ class ClusterSubmitter:
             slurm_time_h = timeout_hours * 1.1
             selected = params.get("slurm_partition")
             if selected and self.partition_rules and selected in self.partition_rules:
-                max_h = float(self.partition_rules[selected].get("max_hours", slurm_time_h))
+                max_h = float(
+                    self.partition_rules[selected].get("max_hours", slurm_time_h)
+                )
                 slurm_time_h = min(slurm_time_h, max_h)
             extra.setdefault("time", _hours_to_hms(slurm_time_h))
             params["additional_parameters"] = extra
@@ -1053,7 +1061,15 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             _seen_parents[_parent] = None
         parent_ids = list(_seen_parents)
         result = subprocess.run(
-            ["squeue", "-h", "-o", "%A %i %T %M %N", "--array", "-j", ",".join(parent_ids)],
+            [
+                "squeue",
+                "-h",
+                "-o",
+                "%A %i %T %M %N",
+                "--array",
+                "-j",
+                ",".join(parent_ids),
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1110,10 +1126,18 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
 
 _resource_cache: dict[str, dict[str, str | None]] = {}
 
-_TERMINAL_STATES: frozenset[str] = frozenset({
-    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
-    "OUT_OF_MEMORY", "DEADLINE", "NODE_FAIL", "PREEMPTED",
-})
+_TERMINAL_STATES: frozenset[str] = frozenset(
+    {
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+        "OUT_OF_MEMORY",
+        "DEADLINE",
+        "NODE_FAIL",
+        "PREEMPTED",
+    }
+)
 
 
 def _get_jobs_resources_bulk(
@@ -1138,11 +1162,16 @@ def _get_jobs_resources_bulk(
         try:
             proc = subprocess.run(
                 [
-                    "sacct", "-j", ",".join(parents),
+                    "sacct",
+                    "-j",
+                    ",".join(parents),
                     "--format=JobID,MaxRSS,TotalCPU,CPUTime",
-                    "--noheader", "--array",
+                    "--noheader",
+                    "--array",
                 ],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             for line in proc.stdout.strip().splitlines():
                 cols = line.split()
