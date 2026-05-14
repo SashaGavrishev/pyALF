@@ -192,7 +192,7 @@ def save_for_ssh(
         f"d=pickle.load(open('{path}','rb')); "
         f"SubmissionReview(d['cs'],d['sims']).run_with_monitor()\""
     )
-    print(f"Saved. In the terminal (VS Code Ctrl+`) run:\n{cmd}")
+    print(f"{cmd}")
     return cmd
 
 
@@ -1585,4 +1585,3 @@ class SubmissionReview(App):
     @on(Button.Pressed, "#btn-submit")
     def _on_submit_pressed(self) -> None:
         self.action_submit()
-
