@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """CLI for launching the ALF simulation monitor from a session manifest."""
 
+from __future__ import annotations
+
 import json
 import sys
 from argparse import ArgumentParser
@@ -31,9 +33,9 @@ def _get_arg_parser():
     )
     parser.add_argument(
         "--dir",
-        default="array_submission",
+        default=".alfmonitor",
         metavar="DIR",
-        help="Directory to search for session JSON files (default: submitit).",
+        help="Directory to search for session JSON files (default: .alfmonitor).",
     )
     parser.add_argument(
         "--latest",
@@ -53,6 +55,19 @@ def _get_arg_parser():
 def _find_sessions(directory: Path) -> list[Path]:
     """Return session JSON files sorted newest first."""
     return sorted(directory.glob("session_*.json"), key=lambda p: p.name, reverse=True)
+
+
+def _find_alfmonitor_dir() -> Path | None:
+    """Search upward from CWD for a .alfmonitor directory."""
+    current = Path.cwd()
+    while True:
+        candidate = current / ".alfmonitor"
+        if candidate.is_dir():
+            return candidate
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
 
 
 def _param_display(values: list) -> str:
@@ -158,6 +173,11 @@ def _main():
 
     # Discovery mode.
     search_dir = Path(args.dir)
+    if not search_dir.is_dir() and args.dir == ".alfmonitor":
+        # Auto-discover .alfmonitor by searching upward from CWD.
+        found = _find_alfmonitor_dir()
+        if found is not None:
+            search_dir = found
     if not search_dir.is_dir():
         console.print(
             f"[red]Error:[/red] directory [bold]{search_dir}[/bold] does not exist."

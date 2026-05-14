@@ -151,6 +151,8 @@ def _write_session_manifest(
             "n_omp": sim.n_omp,
             "n_mpi": getattr(sim, "n_mpi", 1),
             "mpi": getattr(sim, "mpi", False),
+            "mpiexec": getattr(sim, "mpiexec", "mpiexec"),
+            "mpiexec_args": getattr(sim, "mpiexec_args", []),
             "sim_dict": dict(_sim_dict_of(sim)),
         }
         for sim, jid in zip(submitted, job_ids)
@@ -247,6 +249,7 @@ def _arch_renderable(
     n_omp = sim.n_omp
     sim_dict = _sim_dict_of(sim)
     timeout_h = max(0.0, float(sim_dict.get("CPU_MAX", 24)))
+    nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
     try:
         partition = cs._select_partition(timeout_h)
@@ -256,31 +259,6 @@ def _arch_renderable(
         partition = "---"
         p_spec = {}
         p_note = "too long"
-
-    # Full rank grid — all workers, 4 columns, wrapping rows
-    COLS = 4
-    n_rows = math.ceil(n_ranks / COLS)
-    bar = "█" * min(n_omp, 8) + ("…" if n_omp > 8 else "")
-
-    grid = RichTable.grid(padding=(0, 1))
-    for _ in range(COLS):
-        grid.add_column(justify="center", min_width=8)
-
-    for row_i in range(n_rows):
-        start = row_i * COLS
-        end = min(start + COLS, n_ranks)
-        n_in_row = end - start
-        pad = COLS - n_in_row
-
-        labels = [RichText(f"r{i}", style="bold") for i in range(start, end)]
-        bars = [RichText(bar, style="bold")] * n_in_row
-        omps = [RichText(f"{n_omp} OMP")] * n_in_row
-
-        grid.add_row(*(labels + [RichText("")] * pad))
-        grid.add_row(*(bars + [RichText("")] * pad))
-        grid.add_row(*(omps + [RichText("")] * pad))
-        if row_i < n_rows - 1:
-            grid.add_row(*([RichText("")] * COLS))
 
     mem_str = mem_display if mem_display else (cs.slurm_mem or "—")
 
@@ -294,6 +272,12 @@ def _arch_renderable(
     if max_mem_gb is not None and mem_str:
         with contextlib.suppress(ValueError):
             mem_over = _parse_mem_gb(mem_str) > max_mem_gb
+
+    # SLURM wall time = CPU_MAX + 10% buffer, capped at partition limit.
+    slurm_h_raw = timeout_h * 1.1
+    slurm_h = slurm_h_raw
+    if partition != "---" and p_spec:
+        slurm_h = min(slurm_h_raw, float(p_spec.get("max_hours", slurm_h_raw)))
 
     info = RichText()
     info.append("\n")
@@ -309,8 +293,20 @@ def _arch_renderable(
         )
         info.append(f"{partition}", style=part_color)
         info.append(f"   {p_note}\n", style="dim")
-    info.append("Timeout:   ", style="bold")
-    info.append(f"{_format_hours(timeout_h)}\n")
+    info.append("End by:    ", style="bold")
+    if nbin_target:
+        info.append(f"NBin={nbin_target}", style="bold")
+        info.append(f"  (CPU_MAX={_format_hours(timeout_h)} fallback)", style="dim")
+    else:
+        info.append(f"CPU_MAX={_format_hours(timeout_h)}")
+    info.append("\n")
+    info.append("Wall time: ", style="bold")
+    info.append(f"{_hours_to_hms(slurm_h)}")
+    if slurm_h < slurm_h_raw - 0.0001:
+        info.append("  (partition cap)", style="dim")
+    else:
+        info.append("  (CPU_MAX +10%)", style="dim")
+    info.append("\n")
     info.append("Memory:    ", style="bold")
     if max_mem_gb is not None:
         limit_str = f"{max_mem_gb:g} GB"
@@ -334,8 +330,37 @@ def _arch_renderable(
     else:
         info.append(f"{total_cpus}")
 
-    title = f"[bold]Node[/bold]  ·  {n_ranks} rank(s) × {n_omp} OMP"
-    return RichPanel(RichGroup(grid, info), title=title, border_style="dim")
+    if sim.mpi:
+        # Full rank grid — all workers, 4 columns, wrapping rows
+        COLS = 4
+        n_rows = math.ceil(n_ranks / COLS)
+        bar = "█" * min(n_omp, 8) + ("…" if n_omp > 8 else "")
+
+        grid = RichTable.grid(padding=(0, 1))
+        for _ in range(COLS):
+            grid.add_column(justify="center", min_width=8)
+
+        for row_i in range(n_rows):
+            start = row_i * COLS
+            end = min(start + COLS, n_ranks)
+            n_in_row = end - start
+            pad = COLS - n_in_row
+
+            labels = [RichText(f"r{i}", style="bold") for i in range(start, end)]
+            bars = [RichText(bar, style="bold")] * n_in_row
+            omps = [RichText(f"{n_omp} OMP")] * n_in_row
+
+            grid.add_row(*(labels + [RichText("")] * pad))
+            grid.add_row(*(bars + [RichText("")] * pad))
+            grid.add_row(*(omps + [RichText("")] * pad))
+            if row_i < n_rows - 1:
+                grid.add_row(*([RichText("")] * COLS))
+
+        title = f"[bold]Node[/bold]  ·  {n_ranks} rank(s) × {n_omp} OMP"
+        return RichPanel(RichGroup(grid, info), title=title, border_style="dim")
+    else:
+        title = f"[bold]Node[/bold]  ·  {n_omp} OMP thread(s)"
+        return RichPanel(info, title=title, border_style="dim")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +634,8 @@ class SubmissionReview(App):
     #arch-col Input { height: 1; border: none; padding: 0 1; background: transparent; color: ansi_blue; }
     #arch-col Input:focus { border: none; background: transparent; color: ansi_blue; }
     #walltime-note { height: 1; }
+    #end-by-row Button { min-width: 9; height: 1; border: none; margin: 0 1 0 0; }
+    #nbin-row { display: none; }
 
     Button { border: blank; color: ansi_default; background: transparent; }
     Button.-primary { background: ansi_bright_black; color: ansi_default; }
@@ -665,6 +692,11 @@ class SubmissionReview(App):
         self.open_monitor: bool = False
         self.submitted_cs: ClusterSubmitter | None = None
         self.session_path: Path | None = None
+        # End criterion: read initial state from first sim's dict
+        _first_sd = _sim_dict_of(self._sims[0]) if self._sims else {}
+        _nbin_val = _first_sd.get("NBin") or _first_sd.get("Nbin")
+        self._end_mode: str = "nbin" if _nbin_val else "cpu_max"
+        self._nbin_initial: str = str(_nbin_val) if _nbin_val else "40"
 
     # ------------------------------------------------------------------
     # Layout
@@ -751,7 +783,28 @@ class SubmissionReview(App):
                     with Horizontal(classes="sr"):
                         yield Label("Wall time", classes="sl")
                         yield Input("", id="walltime-input", placeholder="HH:MM:SS")
-                    yield Static("[dim]Wall time applies to all jobs in the array[/dim]", id="walltime-note")
+                    yield Static(
+                        "[dim]Sets ALF CPU_MAX for all array jobs · SLURM wall time = CPU_MAX + 10%[/dim]",
+                        id="walltime-note",
+                    )
+                    with Horizontal(classes="sr"):
+                        yield Label("End by", classes="sl")
+                        with Horizontal(id="end-by-row"):
+                            yield Button(
+                                _btn_label("CPU_MAX", self._end_mode == "cpu_max"),
+                                id="end-by-cpu-max",
+                            )
+                            yield Button(
+                                _btn_label("NBin", self._end_mode == "nbin"),
+                                id="end-by-nbin",
+                            )
+                    with Horizontal(classes="sr", id="nbin-row"):
+                        yield Label("NBin", classes="sl")
+                        yield Input(
+                            self._nbin_initial,
+                            id="nbin-input",
+                            placeholder="target bins",
+                        )
                     yield Static("", id="schedule-panel")
         # ── footer row: key hints left, submit button right ──
         with Horizontal(id="footer-bar"):
@@ -762,6 +815,8 @@ class SubmissionReview(App):
     def on_mount(self) -> None:
         self.register_theme(_MONO_THEME)
         self.theme = "submission-mono"
+        self._has_mpi_column: bool = any(getattr(s, "mpi", False) for s in self._sims)
+        self.query_one("#nbin-row").display = self._end_mode == "nbin"
         self._setup_table()
         self._refresh_all()
         self.call_after_refresh(self._remove_ansi_scrollbar_class)
@@ -785,7 +840,8 @@ class SubmissionReview(App):
         for key, hdr in zip(self._param_keys, self._param_headers):
             table.add_column(hdr, key=key)
         table.add_column("OMP", key="omp", width=5)
-        table.add_column("MPI", key="mpi_r", width=5)
+        if self._has_mpi_column:
+            table.add_column("MPI", key="mpi_r", width=5)
         self._repopulate_table()
 
     def _repopulate_table(self) -> None:
@@ -802,7 +858,39 @@ class SubmissionReview(App):
             row = [mark, str(i), sim.ham_name]
             for key in self._param_keys:
                 row.append(str(sd.get(key, "—")))
-            row += [str(sim.n_omp), str(sim.n_mpi if sim.mpi else 1)]
+            row.append(str(sim.n_omp))
+            if self._has_mpi_column:
+                row.append(str(sim.n_mpi if sim.mpi else 1))
+            table.add_row(*row, key=str(i))
+        if self._sims:
+            table.move_cursor(row=min(saved_row, len(self._sims) - 1))
+
+    def _rebuild_table_with_columns(self) -> None:
+        """Full table rebuild including columns — use when _param_keys has changed."""
+        table = self.query_one("#sim-table", DataTable)
+        saved_row = table.cursor_row
+        table.clear(columns=True)
+        table.add_column("", key="sel", width=3)
+        table.add_column("#", key="idx", width=4)
+        table.add_column("Hamiltonian", key="ham")
+        for key, hdr in zip(self._param_keys, self._param_headers):
+            table.add_column(hdr, key=key)
+        table.add_column("OMP", key="omp", width=5)
+        if self._has_mpi_column:
+            table.add_column("MPI", key="mpi_r", width=5)
+        for i, sim in enumerate(self._sims):
+            sd = _sim_dict_of(sim)
+            mark = (
+                RichText("✓", style="bold")
+                if self._selected[i]
+                else RichText("·", style="dim")
+            )
+            row = [mark, str(i), sim.ham_name]
+            for key in self._param_keys:
+                row.append(str(sd.get(key, "—")))
+            row.append(str(sim.n_omp))
+            if self._has_mpi_column:
+                row.append(str(sim.n_mpi if sim.mpi else 1))
             table.add_row(*row, key=str(i))
         if self._sims:
             table.move_cursor(row=min(saved_row, len(self._sims) - 1))
@@ -851,9 +939,18 @@ class SubmissionReview(App):
             )
             wt_input.value = _hours_to_hms(array_timeout_h)
 
+        nbin_target = sd.get("NBin") or sd.get("Nbin")
+        if nbin_target:
+            completes_line = (
+                f"[bold]CPU_MAX end ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]"
+                f"  [dim](NBin={nbin_target} may finish earlier)[/dim]"
+            )
+        else:
+            completes_line = f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]"
         self.query_one("#schedule-panel", Static).update(
-            f"[bold]Completes ~:[/bold] [ansi_blue]{_completion_str(timeout_h)}[/ansi_blue]\n"
-            f"[bold]Submit dir:[/bold]  [dim]{self.query_one('#dir-input', Input).value or str(self._cs.submit_dir)}[/dim]"
+            completes_line
+            + "\n"
+            + f"[bold]Submit dir:[/bold]  [dim]{self.query_one('#dir-input', Input).value or str(self._cs.submit_dir)}[/dim]"
         )
 
     def _has_unfit_partition(self) -> bool:
@@ -1100,6 +1197,7 @@ class SubmissionReview(App):
                     return
                 self._repopulate_table()
                 self._refresh_right_panel()
+                self._refresh_end_mode_display()
                 if result == "all":
                     n_omp, n_mpi, mpi = sim.n_omp, sim.n_mpi, sim.mpi
                     for s in self._sims:
@@ -1165,12 +1263,33 @@ class SubmissionReview(App):
     # Events
     # ------------------------------------------------------------------
 
+    def _refresh_end_mode_display(self) -> None:
+        """Sync toggle buttons and NBin input from the focused sim — no sim_dict writes."""
+        if not self._sims or self._focused_idx >= len(self._sims):
+            return
+        sd = _sim_dict_of(self._sims[self._focused_idx])
+        nbin_val = sd.get("NBin") or sd.get("Nbin")
+        mode = "nbin" if nbin_val else "cpu_max"
+        self._end_mode = mode
+        self.query_one("#end-by-cpu-max", Button).label = _btn_label(
+            "CPU_MAX", mode == "cpu_max"
+        )
+        self.query_one("#end-by-nbin", Button).label = _btn_label(
+            "NBin", mode == "nbin"
+        )
+        self.query_one("#nbin-row").display = mode == "nbin"
+        if nbin_val:
+            nbin_input = self.query_one("#nbin-input", Input)
+            if not nbin_input.has_focus:
+                nbin_input.value = str(nbin_val)
+
     @on(DataTable.RowHighlighted, "#sim-table")
     def _on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is not None:
             with contextlib.suppress(ValueError, TypeError):
                 self._focused_idx = int(str(event.row_key.value))
             self._refresh_right_panel()
+            self._refresh_end_mode_display()
 
     @on(Input.Changed, "#mem-input")
     def _on_mem_changed(self) -> None:
@@ -1241,6 +1360,63 @@ class SubmissionReview(App):
         self.query_one("#stop-on-fail-btn", Button).label = _btn_label(
             "stop", self._stop_on_fail
         )
+
+    @on(Button.Pressed, "#end-by-cpu-max")
+    def _on_end_by_cpu_max(self) -> None:
+        self._set_end_mode("cpu_max")
+
+    @on(Button.Pressed, "#end-by-nbin")
+    def _on_end_by_nbin(self) -> None:
+        self._set_end_mode("nbin")
+
+    def _set_end_mode(self, mode: str) -> None:
+        self._end_mode = mode
+        self.query_one("#end-by-cpu-max", Button).label = _btn_label(
+            "CPU_MAX", mode == "cpu_max"
+        )
+        self.query_one("#end-by-nbin", Button).label = _btn_label(
+            "NBin", mode == "nbin"
+        )
+        nbin_row = self.query_one("#nbin-row")
+        nbin_row.display = mode == "nbin"
+        if mode == "cpu_max":
+            for sim in self._sims:
+                sd = _sim_dict_of(sim)
+                sd.pop("NBin", None)
+                sd.pop("Nbin", None)
+            self._repopulate_table()
+        else:
+            try:
+                nbin_int = int(self.query_one("#nbin-input", Input).value)
+            except ValueError:
+                nbin_int = 40
+            for sim in self._sims:
+                sd = _sim_dict_of(sim)
+                sd.pop("Nbin", None)
+                sd["NBin"] = nbin_int
+            if "NBin" not in self._param_keys:
+                self._param_keys.append("NBin")
+                self._param_headers.append("NBin")
+                self._rebuild_table_with_columns()
+            else:
+                self._repopulate_table()
+        self._refresh_right_panel()
+        self._refresh_submit_button()
+
+    @on(Input.Changed, "#nbin-input")
+    def _on_nbin_changed(self) -> None:
+        if self._end_mode != "nbin":
+            return
+        try:
+            nbin_int = int(self.query_one("#nbin-input", Input).value)
+        except ValueError:
+            return
+        for sim in self._sims:
+            sd = _sim_dict_of(sim)
+            sd.pop("Nbin", None)
+            sd["NBin"] = nbin_int
+        self._repopulate_table()
+        self._refresh_right_panel()
 
     @on(Button.Pressed, "#exec-slurm")
     def _on_exec_slurm(self) -> None:

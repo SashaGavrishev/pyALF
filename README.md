@@ -38,7 +38,6 @@ sims = [Simulation(alf_src, "Hubbard", {"U": u, "Beta": 10, "CPU_MAX": 24}) for 
 
 cs = ClusterSubmitter(
     "slurm",
-    submit_dir="submitit",
     slurm_mem="8G",
     partition_rules={"short": 2, "medium": 48, "long": 336},
 )
@@ -98,14 +97,14 @@ SimulationMonitor(
 
 ```python
 SimulationMonitor.from_session(
-    "submitit/session_20260513_102314.json",
+    ".alfmonitor/session_20260513_102314.json",
     refresh_interval=30.0,
 ).run()
 ```
 
 `from_session` reads the job IDs, Hamiltonian metadata, and `ClusterSubmitter` configuration from the manifest — no re-import of the original `Simulation` objects is needed.
 
-The monitor displays a table with one row per simulation. Columns include the Hamiltonian name, any `param_keys` you specify, `n_omp`/`n_mpi`, SLURM partition and memory (when a `ClusterSubmitter` is provided), bin count, master array ID, individual job ID, colour-coded status, elapsed runtime, and estimated time remaining (ETA).
+The monitor displays a table with one row per simulation. Columns include the Hamiltonian name, any `param_keys` you specify, `n_omp`/`n_mpi`, SLURM partition and memory (when a `ClusterSubmitter` is provided), bin count, master array ID, individual job ID, colour-coded status, elapsed runtime, estimated time remaining (ETA), peak memory usage, and CPU efficiency. Peak memory and CPU efficiency are fetched from `sacct` once a job reaches a terminal state and persisted to `peak_resources.json` in the simulation directory, so they remain visible even after the job ages out of the SLURM accounting database.
 
 The title bar updates with the SLURM array ID(s) once the first status poll completes.
 
@@ -124,28 +123,30 @@ The title bar updates with the SLURM array ID(s) once the first status poll comp
 
 ### Session manifests and `alf_monitor` CLI
 
-After a successful SLURM submission `SubmissionReview` writes a JSON manifest to `submit_dir`:
+After a successful SLURM submission `SubmissionReview` writes a JSON manifest to `.alfmonitor/` at the project root:
 
 ```
-submitit/session_20260513_102314.json
+.alfmonitor/session_20260513_102314.json
 ```
 
-The manifest records the submission timestamp, all `ClusterSubmitter` settings, and per-simulation metadata (sim directory, job ID, Hamiltonian name, parallelism, `sim_dict`). It is the link between a submission and a later monitoring session.
+The manifest records the submission timestamp, all `ClusterSubmitter` settings, and per-simulation metadata (sim directory, job ID, Hamiltonian name, parallelism, MPI launcher, `sim_dict`). It is the link between a submission and a later monitoring session.
+
+`.alfmonitor` is always created at the root of the project (the nearest ancestor directory containing `.git`, `pyproject.toml`, etc.), mirroring the convention used by `.git`. This means `alf_monitor` and `SimulationMonitor.from_session` find it consistently regardless of which subdirectory you run from.
 
 **`alf_monitor` CLI:**
 
 ```bash
-# Interactively pick from all session files in ./submitit (default)
+# Interactively pick from all session files — searches upward for .alfmonitor
 alf_monitor
 
-# Search a different directory
-alf_monitor --dir /scratch/user/my_project/submitit
+# Search a specific directory instead
+alf_monitor --dir /scratch/user/my_project/.alfmonitor
 
 # Skip selection and open the most recent session
 alf_monitor --latest
 
 # Open a specific session file directly
-alf_monitor submitit/session_20260513_102314.json
+alf_monitor .alfmonitor/session_20260513_102314.json
 
 # Change the auto-refresh interval (default: 30 s)
 alf_monitor --refresh 60
@@ -160,7 +161,7 @@ from py_alf.monitor import SimulationMonitor
 
 alf_src = ALF_source(...)
 sims    = [...]
-cs      = ClusterSubmitter("slurm", submit_dir="submitit", slurm_mem="8G",
+cs      = ClusterSubmitter("slurm", slurm_mem="8G",
                            partition_rules={"short": 2, "medium": 48, "long": 336})
 
 # 1. Review and submit
@@ -180,7 +181,7 @@ else:
         ).run()
 
 # 2b. Later — reload from the session manifest without re-running the script
-# SimulationMonitor.from_session("submitit/session_20260513_102314.json").run()
+# SimulationMonitor.from_session(".alfmonitor/session_20260513_102314.json").run()
 ```
 
 **Demos** — runnable examples that mock all SLURM calls (no cluster required):

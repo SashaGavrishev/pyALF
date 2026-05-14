@@ -50,7 +50,7 @@ from py_alf.monitor import SimulationMonitor
 _TMPDIR = Path(tempfile.mkdtemp(prefix="alf_demo_monitor_"))
 atexit.register(shutil.rmtree, _TMPDIR, ignore_errors=True)
 
-_SUBMIT_DIR = _TMPDIR / "submitit"
+_SUBMIT_DIR = _TMPDIR / ".alfmonitor"
 _SUBMIT_DIR.mkdir()
 
 # ---------------------------------------------------------------------------
@@ -129,6 +129,8 @@ def _setup_workspace() -> tuple[list, dict, dict]:
             n_omp=4,
             n_mpi=1,
             mpi=False,
+            mpiexec="mpiexec",
+            mpiexec_args=[],
             config="GNU HDF5 NOMPI",
         )
         sims.append(sim)
@@ -195,6 +197,8 @@ def _write_demo_session(sims: list, statuses: dict) -> Path:
                 "n_omp": s.n_omp,
                 "n_mpi": s.n_mpi,
                 "mpi": s.mpi,
+                "mpiexec": s.mpiexec,
+                "mpiexec_args": s.mpiexec_args,
                 "sim_dict": s.sim_dict,
             }
         )

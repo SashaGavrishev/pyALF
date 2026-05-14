@@ -325,6 +325,83 @@ def detect_partition_rules(
     return rules
 
 
+def _project_root() -> Path:
+    """Walk up from CWD to find the project root, identified by .git or common markers.
+
+    Falls back to CWD when no root is found (e.g. outside any repository).
+    This anchors .alfmonitor like .git — always at the repo root, never scattered
+    across sub-directories depending on where the script was launched from.
+    """
+    markers = {".git", "pyproject.toml", "setup.py", "setup.cfg"}
+    current = Path.cwd()
+    while True:
+        if any((current / m).exists() for m in markers):
+            return current
+        parent = current.parent
+        if parent == current:
+            return Path.cwd()
+        current = parent
+
+
+def _unique_slurm_job_name(base_name: str) -> str:
+    """Return a SLURM job name that is not currently held by any queued job.
+
+    Queries ``squeue`` for all active jobs whose name starts with *base_name*
+    and appends a numeric suffix (``_2``, ``_3``, …) until an unused name is
+    found.  If ``squeue`` is unavailable the original name is returned unchanged
+    so that submission is never blocked.
+    """
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-o", "%j"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        active_names: set[str] = {
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        }
+    except Exception:
+        return base_name
+
+    if base_name not in active_names:
+        return base_name
+
+    for suffix in range(2, 10000):
+        candidate = f"{base_name}_{suffix}"
+        if candidate not in active_names:
+            return candidate
+
+    return base_name
+
+
+def _exec_alf_binary(
+    sim_dir: str | Path,
+    n_omp: int,
+    n_mpi: int,
+    mpi: bool,
+    mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
+) -> None:
+    """Execute the ALF binary already present in *sim_dir*.
+
+    Single source of truth for how an ALF job is launched on a worker node.
+    Called by both :func:`_run_alf` (via submitit) and
+    :class:`~py_alf.monitor._SessionEntry` (for resubmissions from the TUI).
+    """
+    from .simulation import cd
+
+    executable = os.path.join(str(sim_dir), "ALF.out")
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(n_omp)
+    if mpi:
+        cmd: list[str] = [mpiexec, "-n", str(n_mpi), *(mpiexec_args or []), executable]
+    else:
+        cmd = [executable]
+    with cd(str(sim_dir)):
+        subprocess.run(cmd, check=True, env=env)
+
+
 def _run_alf(sim: Simulation) -> None:
     """
     Execute an ALF simulation on a cluster node.
@@ -332,7 +409,14 @@ def _run_alf(sim: Simulation) -> None:
     Called by submitit on the remote worker. Assumes the binary has already been copied
     into sim.sim_dir by the pre-submission preparation step.
     """
-    sim.run(bin_in_sim_dir=True)
+    _exec_alf_binary(
+        sim.sim_dir,
+        sim.n_omp,
+        sim.n_mpi,
+        getattr(sim, "mpi", False),
+        mpiexec=getattr(sim, "mpiexec", "mpiexec"),
+        mpiexec_args=getattr(sim, "mpiexec_args", []),
+    )
 
 
 def _format_hours(h: float) -> str:
@@ -437,7 +521,7 @@ class ClusterSubmitter:
         self,
         executor: Literal["slurm", "local", "debug"] = "slurm",
         *,
-        submit_dir: str | Path = "array_submission",
+        submit_dir: str | Path | None = None,
         slurm_mem: str | None = None,
         partition_rules: dict[str, Any] | None = None,
         job_name: str | None = None,
@@ -483,7 +567,11 @@ class ClusterSubmitter:
                 raise ValueError(f"Invalid partition_rules: {exc}") from exc
 
         self.executor = executor
-        self.submit_dir = Path(submit_dir).resolve()
+        self.submit_dir = (
+            Path(submit_dir).resolve()
+            if submit_dir is not None
+            else (_project_root() / ".alfmonitor")
+        )
         self.slurm_mem = slurm_mem
         self.partition_rules: dict[str, PartitionSpec] | None = partition_rules
         self.job_name = job_name
@@ -685,8 +773,11 @@ class ClusterSubmitter:
         #
         # For a pure-OpenMP (no MPI) job tasks_per_node is 1, so a single task
         # slot owns all n_omp cores and OMP_NUM_THREADS=n_omp fills them.
+        base_name = self.job_name if self.job_name is not None else sim.ham_name
+        if self.executor == "slurm" and self.job_name is None:
+            base_name = _unique_slurm_job_name(base_name)
         params: dict[str, Any] = {
-            "name": self.job_name if self.job_name is not None else sim.ham_name,
+            "name": base_name,
             "timeout_min": int(timeout_hours * 60),
             "nodes": 1,
             "cpus_per_task": sim.n_omp,
@@ -726,7 +817,16 @@ class ClusterSubmitter:
 
         if self.executor == "slurm":
             extra = dict(params.get("additional_parameters") or {})
-            extra.setdefault("time", _hours_to_hms(timeout_hours))
+            # Add 10% buffer so ALF can finish writing output after CPU_MAX;
+            # cap at the selected partition's wall-time limit.
+            slurm_time_h = timeout_hours * 1.1
+            selected = params.get("slurm_partition")
+            if selected and self.partition_rules and selected in self.partition_rules:
+                max_h = float(
+                    self.partition_rules[selected].get("max_hours", slurm_time_h)
+                )
+                slurm_time_h = min(slurm_time_h, max_h)
+            extra.setdefault("time", _hours_to_hms(slurm_time_h))
             params["additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.
@@ -961,7 +1061,15 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             _seen_parents[_parent] = None
         parent_ids = list(_seen_parents)
         result = subprocess.run(
-            ["squeue", "-h", "-o", "%A %i %T %M %N", "--array", "-j", ",".join(parent_ids)],
+            [
+                "squeue",
+                "-h",
+                "-o",
+                "%A %i %T %M %N",
+                "--array",
+                "-j",
+                ",".join(parent_ids),
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1018,10 +1126,18 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
 
 _resource_cache: dict[str, dict[str, str | None]] = {}
 
-_TERMINAL_STATES: frozenset[str] = frozenset({
-    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
-    "OUT_OF_MEMORY", "DEADLINE", "NODE_FAIL", "PREEMPTED",
-})
+_TERMINAL_STATES: frozenset[str] = frozenset(
+    {
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+        "OUT_OF_MEMORY",
+        "DEADLINE",
+        "NODE_FAIL",
+        "PREEMPTED",
+    }
+)
 
 
 def _get_jobs_resources_bulk(
@@ -1046,11 +1162,16 @@ def _get_jobs_resources_bulk(
         try:
             proc = subprocess.run(
                 [
-                    "sacct", "-j", ",".join(parents),
+                    "sacct",
+                    "-j",
+                    ",".join(parents),
                     "--format=JobID,MaxRSS,TotalCPU,CPUTime",
-                    "--noheader", "--array",
+                    "--noheader",
+                    "--array",
                 ],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             for line in proc.stdout.strip().splitlines():
                 cols = line.split()
@@ -1318,10 +1439,18 @@ def _bin_count(
             if counting_obs in f:
                 N_bins = f[counting_obs + "/obser"].shape[0]
     except FileNotFoundError:
-        N_bins = 0
+        pass
     except (OSError, KeyError) as e:
         logger.error(f"Error reading {filename}: {e}")
-        N_bins = 0
+        # File may be mid-write; keep the last known good value rather than
+        # caching a spurious 0 that would be shown briefly on the next refresh.
+        return _bin_cache.get(key, 0)
+
+    # Don't let a transient 0 overwrite a previously-seen non-zero count —
+    # ALF truncates and rewrites data.h5 between bins, so a 0 mid-write is
+    # not meaningful and would cause the progress bar to flicker.
+    if N_bins == 0 and _bin_cache.get(key, 0) > 0:
+        return _bin_cache[key]
 
     _bin_cache[key] = N_bins
     return N_bins

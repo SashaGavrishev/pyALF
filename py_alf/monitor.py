@@ -29,6 +29,7 @@ from .cluster_submission import (
     _TERMINAL_STATES,
     ClusterSubmitter,
     _bin_count,
+    _exec_alf_binary,
     _find_job_log,
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
@@ -84,7 +85,9 @@ def _bins_cell(n_bins: int, nbin_target: int | None) -> Any:
     bar_width = 8
     filled = min(bar_width, round(bar_width * n_bins / nbin_target))
     bar = "█" * filled + "░" * (bar_width - filled)
-    t = Text(f"{n_bins}/{nbin_target} ")
+    # Pad n_bins to the same digit width as nbin_target so bars stay aligned.
+    w = len(str(nbin_target))
+    t = Text(f"{n_bins:{w}d}/{nbin_target} ")
     t.append(bar, style="green" if n_bins >= nbin_target else "yellow")
     return t
 
@@ -199,9 +202,32 @@ class ConfirmScreen(ModalScreen[bool]):
 class _SessionEntry:
     """Minimal sim-like object reconstructed from a session manifest JSON."""
 
-    __slots__ = ("sim_dir", "ham_name", "n_omp", "n_mpi", "mpi", "sim_dict", "config")
+    __slots__ = (
+        "sim_dir",
+        "ham_name",
+        "n_omp",
+        "n_mpi",
+        "mpi",
+        "sim_dict",
+        "config",
+        "job_id",
+        "mpiexec",
+        "mpiexec_args",
+    )
 
-    def __init__(self, sim_dir, ham_name, n_omp, n_mpi, mpi, sim_dict, **_extra):
+    def __init__(
+        self,
+        sim_dir,
+        ham_name,
+        n_omp,
+        n_mpi,
+        mpi,
+        sim_dict,
+        job_id=None,
+        mpiexec="mpiexec",
+        mpiexec_args=None,
+        **_extra,
+    ):
         self.sim_dir = sim_dir
         self.ham_name = ham_name
         self.n_omp = n_omp
@@ -209,6 +235,9 @@ class _SessionEntry:
         self.mpi = mpi
         self.sim_dict = sim_dict
         self.config = ""
+        self.job_id = job_id
+        self.mpiexec = mpiexec
+        self.mpiexec_args = mpiexec_args or []
 
     def run(
         self,
@@ -217,23 +246,16 @@ class _SessionEntry:
         bin_in_sim_dir: bool = False,
     ) -> None:
         """Run the simulation from the already-prepared sim_dir."""
-        import os
-        import subprocess
-
-        from .simulation import cd
-
         if only_prep:
             return
-        executable = os.path.join(str(self.sim_dir), "ALF.out")
-        env = os.environ.copy()
-        env["OMP_NUM_THREADS"] = str(self.n_omp)
-        cmd = (
-            ["mpiexec", "-n", str(self.n_mpi), executable]
-            if self.mpi
-            else [executable]
+        _exec_alf_binary(
+            self.sim_dir,
+            self.n_omp,
+            self.n_mpi,
+            self.mpi,
+            self.mpiexec,
+            self.mpiexec_args,
         )
-        with cd(str(self.sim_dir)):
-            subprocess.run(cmd, check=True, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +395,7 @@ class SimulationMonitor(App):
         refresh_interval: float = 30.0,
         param_keys: list[str] | None = None,
         param_headers: list[str] | None = None,
+        submitted_at: str | None = None,
     ) -> None:
         super().__init__()
         self._sims = list(sims)
@@ -388,6 +411,7 @@ class SimulationMonitor(App):
         self._param_headers: list[str] = (
             list(param_headers) if param_headers else list(self._param_keys)
         )
+        self._submitted_at: str | None = submitted_at
         self._row_data: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -429,6 +453,7 @@ class SimulationMonitor(App):
             refresh_interval=refresh_interval,
             param_keys=param_keys,
             param_headers=param_headers,
+            submitted_at=data.get("submitted_at"),
         )
 
     # ------------------------------------------------------------------
@@ -444,13 +469,15 @@ class SimulationMonitor(App):
     def on_mount(self) -> None:
         self.register_theme(_MONO_THEME)
         self.theme = "monitor-mono"
+        self._any_mpi: bool = any(getattr(s, "mpi", False) for s in self._sims)
         table = self.query_one("#sim-table", DataTable)
         table.add_column("#", key="idx")
         table.add_column("Hamiltonian", key="ham")
         for key, hdr in zip(self._param_keys, self._param_headers):
             table.add_column(hdr, key=key)
         table.add_column("n_omp", key="n_omp")
-        table.add_column("n_mpi", key="n_mpi")
+        if self._any_mpi:
+            table.add_column("n_mpi", key="n_mpi")
         if self._cs is not None and self._cs.executor == "slurm":
             table.add_column("partition", key="partition")
             table.add_column("mem", key="mem")
@@ -485,17 +512,20 @@ class SimulationMonitor(App):
 
     @work(thread=True)
     def _fetch_and_update(self) -> None:
-        jobid_map: dict[str, str] = {}
-        for sim in self._sims:
-            jid = get_job_id(sim)
-            if jid:
-                jobid_map[sim.sim_dir] = jid
+        # Build a per-index job ID list.  Prefer the ID stored in the session
+        # manifest (sim.job_id on _SessionEntry objects) so that a later
+        # re-submission that overwrites jobid.txt does not corrupt this session's
+        # view.  Fall back to get_job_id() for live Simulation objects.
+        jobid_list: list[str | None] = [
+            getattr(sim, "job_id", None) or get_job_id(sim) for sim in self._sims
+        ]
 
-        all_jids = list(set(jobid_map.values()))
+        all_jids = list({jid for jid in jobid_list if jid})
         statuses = _get_slurm_status_bulk(all_jids) if all_jids else {}
 
         terminal_jids = [
-            jid for jid in all_jids
+            jid
+            for jid in all_jids
             if statuses.get(jid, {}).get("status") in _TERMINAL_STATES
         ]
         resources = _get_jobs_resources_bulk(terminal_jids) if terminal_jids else {}
@@ -518,7 +548,7 @@ class SimulationMonitor(App):
 
         rows: list[dict[str, Any]] = []
         for idx, sim in enumerate(self._sims):
-            jobid = jobid_map.get(sim.sim_dir)
+            jobid = jobid_list[idx]
             if jobid:
                 se = statuses.get(jobid, {"status": "UNKNOWN", "runtime": None})
                 status = se.get("status", "UNKNOWN")
@@ -552,7 +582,16 @@ class SimulationMonitor(App):
 
             nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
-            res = resources.get(jobid, {}) if (jobid and status in _TERMINAL_STATES) else {}
+            res: dict = {}
+            if jobid and status in _TERMINAL_STATES:
+                res = resources.get(jobid, {})
+                res_file = Path(sim.sim_dir) / "peak_resources.json"
+                if res.get("max_rss") or res.get("cpu_eff"):
+                    with contextlib.suppress(OSError):
+                        res_file.write_text(json.dumps(res))
+                elif res_file.exists():
+                    with contextlib.suppress(Exception):
+                        res = json.loads(res_file.read_text())
 
             row: dict[str, Any] = {
                 "idx": idx,
@@ -597,13 +636,28 @@ class SimulationMonitor(App):
             values: list[Any] = [row["idx"], row["ham"]]
             for key in self._param_keys:
                 values.append(row.get(key, "-"))
-            values.extend([row["n_omp"], row["n_mpi"]])
+            values.append(row["n_omp"])
+            if self._any_mpi:
+                values.append(row["n_mpi"])
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
-            values.extend([_bins_cell(row["n_bins"], row.get("nbin_target")), row["array_id"], row["jobid"]])
+            values.extend(
+                [
+                    _bins_cell(row["n_bins"], row.get("nbin_target")),
+                    row["array_id"],
+                    row["jobid"],
+                ]
+            )
             values.append(_styled(row["status"]))
             values.append(row["node"])
-            values.extend([row["elapsed"], row["eta"], row.get("peak_mem", "-"), row.get("cpu_eff", "-")])
+            values.extend(
+                [
+                    row["elapsed"],
+                    row["eta"],
+                    row.get("peak_mem", "-"),
+                    row.get("cpu_eff", "-"),
+                ]
+            )
             table.add_row(*values, key=str(row["idx"]))
 
         if rows:
@@ -616,8 +670,9 @@ class SimulationMonitor(App):
             array_suffix = ""
         self.query_one("#title-bar", Static).update(f"  {self.TITLE}{array_suffix}")
 
+        at_str = f"  ·  submitted {self._submitted_at}" if self._submitted_at else ""
         self.query_one("#status-bar", Static).update(
-            f"[dim]{len(rows)} simulation(s)  ·  auto-refresh every {self._refresh_interval:.0f}s[/dim]"
+            f"[dim]{len(rows)} simulation(s)  ·  auto-refresh every {self._refresh_interval:.0f}s{at_str}[/dim]"
         )
 
     # ------------------------------------------------------------------

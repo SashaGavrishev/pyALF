@@ -115,6 +115,8 @@ cython_debug/
 # Project Specific Settings
 ALF
 ALF_data
+.alfmonitor/
+TODO.md
 docs/_build
 dist/
 pyALF.egg-info/
