@@ -272,7 +272,7 @@ def _arch_renderable(
         if partition_override:
             partition = partition_override
             p_spec = (cs.partition_rules or {}).get(partition, {})
-            p_note = f"manual override"
+            p_note = "manual override"
         else:
             partition = cs._select_partition(timeout_h)
             p_spec = cs.partition_rules[partition]
@@ -1137,7 +1137,9 @@ class SubmissionReview(App):
             self.call_from_thread(self._set_progress, i, "preparing")
 
         try:
-            jobs = cs.submit(sims, job_properties=job_properties, confirm_checkpoint=False)
+            jobs = cs.submit(
+                sims, job_properties=job_properties, confirm_checkpoint=False
+            )
         except Exception as exc:
             for i in range(len(sims)):
                 self.call_from_thread(self._set_progress, i, "failed", str(exc))

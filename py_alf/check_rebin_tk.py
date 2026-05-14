@@ -60,22 +60,18 @@ class check_rebin_tk:
 
         nskip_frame = tk.Frame(frame)
         nskip_frame.pack(side=tk.LEFT)
-        nskip_label = tk.Label(nskip_frame, text='N_rebin:')
+        nskip_label = tk.Label(nskip_frame, text="N_rebin:")
         nskip_label.pack(side=tk.LEFT)
-        nskip_entry = tk.Entry(
-            nskip_frame, width=5, textvariable=self.N_rebin_str)
+        nskip_entry = tk.Entry(nskip_frame, width=5, textvariable=self.N_rebin_str)
         nskip_entry.pack()
-        nskip_button = tk.Button(
-            nskip_frame, text="Set", command=self._set_nrebin)
+        nskip_button = tk.Button(nskip_frame, text="Set", command=self._set_nrebin)
         nskip_button.pack(side=tk.RIGHT)
 
-        button_frame = tk.LabelFrame(frame, text='Quit')
+        button_frame = tk.LabelFrame(frame, text="Quit")
         button_frame.pack(side=tk.RIGHT)
-        button_next = tk.Button(
-            button_frame, text="Next", command=self._next)
+        button_next = tk.Button(button_frame, text="Next", command=self._next)
         button_next.pack(side=tk.LEFT)
-        button_quit = tk.Button(
-            button_frame, text="Finish", command=self._quit)
+        button_quit = tk.Button(button_frame, text="Finish", command=self._quit)
         button_quit.pack(side=tk.RIGHT)
 
         tk.mainloop()
@@ -100,15 +96,16 @@ class check_rebin_tk:
             return
         self.n_dir_var.set(n_dir)
         self.directory_var.set(self.directories[n_dir])
-        self.root.wm_title(
-            f'{self.directory_var.get()} N_rebin vs error')
+        self.root.wm_title(f"{self.directory_var.get()} N_rebin vs error")
         self.par = Parameters(self.directory_var.get())
 
         _plot_errors(
             self.axs,
-            _get_errors(self.directory_var.get(), self.names,
-                        self.custom_obs, self.Nmax0),
-            self.names, self.custom_obs
+            _get_errors(
+                self.directory_var.get(), self.names, self.custom_obs, self.Nmax0
+            ),
+            self.names,
+            self.custom_obs,
         )
         self.verts = []
         for ax in self.axs:

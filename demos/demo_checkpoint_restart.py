@@ -84,12 +84,12 @@ CPU_PARTITIONS: dict[str, float] = {
 
 # (ham_name, Beta, has_checkpoint)
 _SIM_SPECS = [
-    ("Hubbard_Plain_Vanilla", 1.0, True),   # checkpoint restart
-    ("Hubbard_Plain_Vanilla", 2.0, True),   # checkpoint restart
-    ("Hubbard_Plain_Vanilla", 4.0, True),   # checkpoint restart
+    ("Hubbard_Plain_Vanilla", 1.0, True),  # checkpoint restart
+    ("Hubbard_Plain_Vanilla", 2.0, True),  # checkpoint restart
+    ("Hubbard_Plain_Vanilla", 4.0, True),  # checkpoint restart
     ("Hubbard_Plain_Vanilla", 6.0, False),  # fresh run
     ("Hubbard_Plain_Vanilla", 8.0, False),  # fresh run
-    ("tV_Model",              1.0, False),  # fresh run
+    ("tV_Model", 1.0, False),  # fresh run
 ]
 
 
@@ -222,7 +222,9 @@ def main() -> None:
     sims = _setup_sims()
     ckpt_count = sum(any(Path(s.sim_dir).glob("confin_*")) for s in sims)
     fresh_count = len(sims) - ckpt_count
-    print(f"Prepared {len(sims)} simulations: {ckpt_count} checkpoint, {fresh_count} fresh\n")
+    print(
+        f"Prepared {len(sims)} simulations: {ckpt_count} checkpoint, {fresh_count} fresh\n"
+    )
 
     cs = ClusterSubmitter(
         "slurm",

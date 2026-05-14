@@ -43,7 +43,7 @@ def symmetrize(latt, syms, dat):
 
     for i in range(N):
         for sym in syms:
-            dat_sym[..., i] += dat[..., sym(latt, i)]/N_sym
+            dat_sym[..., i] += dat[..., sym(latt, i)] / N_sym
 
     return dat_sym
 
@@ -65,10 +65,10 @@ class Parameters:
 
     def __init__(self, directory, obs_name=None):
         self.directory = os.path.abspath(directory)
-        self.filename = os.path.join(directory, 'parameters')
+        self.filename = os.path.join(directory, "parameters")
         self._nml = f90nml.read(self.filename)
         if obs_name is None:
-            self.obs_name = 'var_errors'
+            self.obs_name = "var_errors"
         else:
             self.obs_name = obs_name.lower()
 
@@ -80,22 +80,22 @@ class Parameters:
 
     def write_nml(self):
         """Write namelist to file. Preseves comments."""
-        f90nml.patch(self.filename, self._nml, self.filename+'_temp')
-        shutil.move(self.filename+'_temp', self.filename)
+        f90nml.patch(self.filename, self._nml, self.filename + "_temp")
+        shutil.move(self.filename + "_temp", self.filename)
 
     def _get_parameter(self, parameter_name):
         try:
             return self._nml[self.obs_name][parameter_name]
         except KeyError:
-            return self._nml['var_errors'][parameter_name]
+            return self._nml["var_errors"][parameter_name]
 
     def N_skip(self):
         """Get N_skip."""
-        return self._get_parameter('n_skip')
+        return self._get_parameter("n_skip")
 
     def N_rebin(self):
         """Get N_rebin."""
-        return self._get_parameter('n_rebin')
+        return self._get_parameter("n_rebin")
 
     def _set_parameter(self, parameter_name, parameter):
         try:
@@ -108,15 +108,15 @@ class Parameters:
 
     def set_N_skip(self, parameter):
         """Update N_skip."""
-        self._set_parameter('n_skip', parameter)
+        self._set_parameter("n_skip", parameter)
 
     def set_N_rebin(self, parameter):
         """Update N_rebin."""
-        self._set_parameter('n_rebin', parameter)
+        self._set_parameter("n_rebin", parameter)
 
     def N_min(self):
         """Get minimal number of bins, given the parameters in this object."""
-        return self.N_skip() + 2*self.N_rebin()
+        return self.N_skip() + 2 * self.N_rebin()
 
 
 def rebin(X, N_rebin):
@@ -132,7 +132,7 @@ def rebin(X, N_rebin):
     shape = (N,) + X.shape[1:]
     Y = np.empty(shape, dtype=X.dtype)
     for i in range(N):
-        Y[i] = np.mean(X[i*N_rebin:(i+1)*N_rebin], axis=0)
+        Y[i] = np.mean(X[i * N_rebin : (i + 1) * N_rebin], axis=0)
     return Y
 
 
@@ -159,12 +159,12 @@ def jack(X, par, N_skip=None, N_rebin=None):
     if N_rebin is None:
         N_rebin = par.N_rebin()
     if N_skip is None:
-        N_skip = par.N_skip() + (len(X)-par.N_skip()) % N_rebin
+        N_skip = par.N_skip() + (len(X) - par.N_skip()) % N_rebin
     if N_skip != 0:
         X = X[N_skip:]
     X = rebin(X, N_rebin)
     N = len(X)
-    Y = (np.sum(X, axis=0) - X) / (N-1)
+    Y = (np.sum(X, axis=0) - X) / (N - 1)
     return Y
 
 
@@ -219,10 +219,10 @@ def read_scal(directory, obs_name, bare_bins=False):
         Number of observables.
 
     """
-    if 'data.h5' in os.listdir(directory):
-        filename = os.path.join(directory, 'data.h5')
+    if "data.h5" in os.listdir(directory):
+        filename = os.path.join(directory, "data.h5")
 
-        with h5py.File(filename, "r") as f:       # pylint: disable=no-member
+        with h5py.File(filename, "r") as f:  # pylint: disable=no-member
             obs = f[obs_name + "/obser"]  # Indices: bins, n_obs, re/im
             obs_c = obs[..., 0] + 1j * obs[..., 1]
             N_obs = obs_c.shape[1]
@@ -231,19 +231,20 @@ def read_scal(directory, obs_name, bare_bins=False):
     else:
         filename = os.path.join(directory, obs_name)
 
-        with open(filename, encoding='UTF-8') as f:
+        with open(filename, encoding="UTF-8") as f:
             lines = f.readlines()
 
         N_bins = len(lines)
-        N_obs = int(lines[0].split()[0])-1
+        N_obs = int(lines[0].split()[0]) - 1
 
         obs_c = np.empty([N_bins, N_obs], dtype=complex)
         sign = np.empty([N_bins], dtype=float)
 
         for i in range(N_bins):
             obs_c[i] = np.loadtxt(
-                lines[i].replace(',', '+').replace(')', 'j)').split()[1:-1],
-                dtype=complex)
+                lines[i].replace(",", "+").replace(")", "j)").split()[1:-1],
+                dtype=complex,
+            )
             sign[i] = float(lines[i].split()[-1])
 
     if bare_bins:
@@ -292,21 +293,28 @@ def read_hist(directory, obs_name, bare_bins=False):
     # pylint: disable=too-many-locals
     par = Parameters(directory, obs_name)
 
-    if 'data.h5' in os.listdir(directory):
-        filename = os.path.join(directory, 'data.h5')
+    if "data.h5" in os.listdir(directory):
+        filename = os.path.join(directory, "data.h5")
 
-        with h5py.File(filename, "r") as f:       # pylint: disable=no-member
+        with h5py.File(filename, "r") as f:  # pylint: disable=no-member
             obs = f[obs_name + "/obser"]  # Indices: bins, n_classes
             sign = f[obs_name + "/sign"]  # Indices: bins
             above = f[obs_name + "/above"]  # Indices: bins
             below = f[obs_name + "/below"]  # Indices: bins
-            N_classes = f[obs_name].attrs['N_classes']
-            upper = f[obs_name].attrs['upper']
-            lower = f[obs_name].attrs['lower']
+            N_classes = f[obs_name].attrs["N_classes"]
+            upper = f[obs_name].attrs["upper"]
+            lower = f[obs_name].attrs["lower"]
 
             if bare_bins:
-                return (np.copy(obs), np.copy(sign), np.copy(above),
-                        np.copy(below), N_classes, upper, lower)
+                return (
+                    np.copy(obs),
+                    np.copy(sign),
+                    np.copy(above),
+                    np.copy(below),
+                    N_classes,
+                    upper,
+                    lower,
+                )
 
             J_obs = jack(obs, par)
             J_sign = jack(sign, par)
@@ -315,7 +323,7 @@ def read_hist(directory, obs_name, bare_bins=False):
     else:
         filename = os.path.join(directory, obs_name)
 
-        with open(filename, encoding='UTF-8') as f:
+        with open(filename, encoding="UTF-8") as f:
             lines = f.readlines()
 
         N_bins = len(lines)
@@ -324,16 +332,17 @@ def read_hist(directory, obs_name, bare_bins=False):
         upper = float(lines[0].split()[1])
         lower = float(lines[0].split()[2])
 
-        above = np.empty([N_bins], dtype='float_')
-        below = np.empty([N_bins], dtype='float_')
-        obs = np.empty([N_bins, N_classes], dtype='float_')
-        sign = np.empty([N_bins], dtype='float_')
+        above = np.empty([N_bins], dtype="float_")
+        below = np.empty([N_bins], dtype="float_")
+        obs = np.empty([N_bins, N_classes], dtype="float_")
+        sign = np.empty([N_bins], dtype="float_")
 
         for i in range(N_bins):
             above[i] = float(lines[i].split()[3])
             below[i] = float(lines[i].split()[4])
             obs[i] = np.loadtxt(
-                lines[i].replace(',', '+').replace(')', 'j)').split()[5:-1])
+                lines[i].replace(",", "+").replace(")", "j)").split()[5:-1]
+            )
             sign[i] = float(lines[i].split()[-1])
 
         if bare_bins:
@@ -386,11 +395,11 @@ def read_latt(directory, obs_name, bare_bins=False, substract_back=True):
     # pylint: disable=too-many-statements
     # pylint: disable=too-many-nested-blocks
     par = Parameters(directory, obs_name)
-    filename = os.path.join(directory, 'data.h5')
+    filename = os.path.join(directory, "data.h5")
 
-    if 'data.h5' in os.listdir(directory):
-        filename = os.path.join(directory, 'data.h5')
-        with h5py.File(filename, "r") as f:       # pylint: disable=no-member
+    if "data.h5" in os.listdir(directory):
+        filename = os.path.join(directory, "data.h5")
+        with h5py.File(filename, "r") as f:  # pylint: disable=no-member
             latt = Lattice(f[obs_name]["lattice"].attrs)
             latt.unit_cell = UnitCell(f[obs_name]["lattice"])
 
@@ -405,32 +414,33 @@ def read_latt(directory, obs_name, bare_bins=False, substract_back=True):
 
             N_orb = obs.shape[1]
             N_tau = obs.shape[3]
-            dtau = f[obs_name].attrs['dtau']
+            dtau = f[obs_name].attrs["dtau"]
     else:
         filename = os.path.join(directory, obs_name)
-        with open(filename+'_info', encoding='UTF-8') as f:
+        with open(filename + "_info", encoding="UTF-8") as f:
             lines = f.readlines()
         # Channel = lines[1].split(':')[1].strip()
-        N_tau = int(lines[2].split(':')[1])
-        dtau = float(lines[3].split(':')[1])
-        L1_p = np.fromstring(lines[6].split(':')[1], sep=' ')
-        L2_p = np.fromstring(lines[7].split(':')[1], sep=' ')
-        a1_p = np.fromstring(lines[8].split(':')[1], sep=' ')
-        a2_p = np.fromstring(lines[9].split(':')[1], sep=' ')
-        N_orb = int(lines[12].split(':')[1])
+        N_tau = int(lines[2].split(":")[1])
+        dtau = float(lines[3].split(":")[1])
+        L1_p = np.fromstring(lines[6].split(":")[1], sep=" ")
+        L2_p = np.fromstring(lines[7].split(":")[1], sep=" ")
+        a1_p = np.fromstring(lines[8].split(":")[1], sep=" ")
+        a2_p = np.fromstring(lines[9].split(":")[1], sep=" ")
+        N_orb = int(lines[12].split(":")[1])
 
         latt = Lattice(L1_p, L2_p, a1_p, a2_p)
         N_unit = latt.N
 
-        with open(filename, encoding='UTF-8') as f:
+        with open(filename, encoding="UTF-8") as f:
             lines = f.readlines()
 
-        N_bins0 = len(lines) / (1 + N_orb + N_unit + N_unit*N_tau*N_orb**2)
+        N_bins0 = len(lines) / (1 + N_orb + N_unit + N_unit * N_tau * N_orb**2)
         N_bins = int(round(N_bins0))
         if N_bins0 - N_bins > 1e-10:
             raise RuntimeError(
                 f'Error in read_latt_plaintxt: File "{filename}" '
-                'lines number does not fit.')
+                "lines number does not fit."
+            )
 
         obs_c = np.empty((N_bins, N_orb, N_orb, N_tau, N_unit), dtype=complex)
         back_c = np.empty((N_bins, N_orb), dtype=complex)
@@ -442,18 +452,20 @@ def read_latt(directory, obs_name, bare_bins=False, substract_back=True):
             i_line += 1
             for i_orb in range(N_orb):
                 back_c[i_bin, i_orb] = complex(
-                    lines[i_line].replace(',', '+').replace(')', 'j)'))
+                    lines[i_line].replace(",", "+").replace(")", "j)")
+                )
                 i_line += 1
             for i_unit in range(N_unit):
                 i_line += 1
                 for i_tau in range(N_tau):
                     for i_orb in range(N_orb):
                         for i_orb1 in range(N_orb):
-                            obs_c[i_bin, i_orb1, i_orb, i_tau, i_unit] = \
-                                complex(lines[i_line]
-                                        .replace(',', '+')
-                                        .replace('+-', '-')
-                                        .replace(')', 'j)'))
+                            obs_c[i_bin, i_orb1, i_orb, i_tau, i_unit] = complex(
+                                lines[i_line]
+                                .replace(",", "+")
+                                .replace("+-", "-")
+                                .replace(")", "j)")
+                            )
                             i_line += 1
 
     if bare_bins:
@@ -463,8 +475,9 @@ def read_latt(directory, obs_name, bare_bins=False, substract_back=True):
             for no in range(N_orb):
                 for no1 in range(N_orb):
                     for nt in range(N_tau):
-                        obs_c[:, no1, no, nt, n] -= \
-                            latt.N*back_c[:, no1]*back_c[:, no]
+                        obs_c[:, no1, no, nt, n] -= (
+                            latt.N * back_c[:, no1] * back_c[:, no]
+                        )
         return obs_c, back_c, sign, N_orb, N_tau, dtau, latt
     J_obs = jack(obs_c, par)
     J_back = jack(back_c, par)
@@ -476,8 +489,7 @@ def read_latt(directory, obs_name, bare_bins=False, substract_back=True):
         for no in range(N_orb):
             for no1 in range(N_orb):
                 for nt in range(N_tau):
-                    J_obs[:, no1, no, nt, n] \
-                        -= latt.N*J_back[:, no1]*J_back[:, no]
+                    J_obs[:, no1, no, nt, n] -= latt.N * J_back[:, no1] * J_back[:, no]
     return J_obs, J_back, J_sign, N_orb, N_tau, dtau, latt
 
 
@@ -505,49 +517,89 @@ class ReadObs:
 
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, directory, obs_name,
-                 bare_bins=False, substract_back=True):
+    def __init__(self, directory, obs_name, bare_bins=False, substract_back=True):
         self.directory = directory
         self.obs_name = obs_name
         self.bare_bins = bare_bins
-        if obs_name.endswith('_scal'):
-            self.J_obs, self.J_sign, self.N_obs = \
-                read_scal(directory, obs_name, bare_bins)
-        elif obs_name.endswith('_eq') or obs_name.endswith('_tau'):
-            (self.J_obs, self.J_back, self.J_sign, self.N_orb, self.N_tau,
-             self.dtau, self.latt) = \
-                read_latt(directory, obs_name, bare_bins, substract_back)
-        elif obs_name.endswith('_hist'):
-            (self.J_obs, self.J_sign, self.J_above, self.J_below,
-             self.N_classes, self.upper, self.lower) = \
-                read_hist(directory, obs_name, bare_bins)
+        if obs_name.endswith("_scal"):
+            self.J_obs, self.J_sign, self.N_obs = read_scal(
+                directory, obs_name, bare_bins
+            )
+        elif obs_name.endswith("_eq") or obs_name.endswith("_tau"):
+            (
+                self.J_obs,
+                self.J_back,
+                self.J_sign,
+                self.N_orb,
+                self.N_tau,
+                self.dtau,
+                self.latt,
+            ) = read_latt(directory, obs_name, bare_bins, substract_back)
+        elif obs_name.endswith("_hist"):
+            (
+                self.J_obs,
+                self.J_sign,
+                self.J_above,
+                self.J_below,
+                self.N_classes,
+                self.upper,
+                self.lower,
+            ) = read_hist(directory, obs_name, bare_bins)
         else:
-            raise TypeError('Error in ReadObs.init: Unknow observable type.')
+            raise TypeError("Error in ReadObs.init: Unknow observable type.")
         self.N_bins = self.J_obs.shape[0]
 
     def all(self):
         """Return all bins."""
-        if self.obs_name.endswith('_scal'):
+        if self.obs_name.endswith("_scal"):
             return self.J_obs, self.J_sign, self.N_obs
-        if self.obs_name.endswith('_eq') or self.obs_name.endswith('_tau'):
-            return (self.J_obs, self.J_back, self.J_sign, self.N_orb,
-                    self.N_tau, self.dtau, self.latt)
-        if self.obs_name.endswith('_hist'):
-            return (self.J_obs, self.J_sign, self.J_above, self.J_below,
-                    self.N_classes, self.upper, self.lower)
-        raise TypeError('Error in ReadObs.all: Unknow observable type.')
+        if self.obs_name.endswith("_eq") or self.obs_name.endswith("_tau"):
+            return (
+                self.J_obs,
+                self.J_back,
+                self.J_sign,
+                self.N_orb,
+                self.N_tau,
+                self.dtau,
+                self.latt,
+            )
+        if self.obs_name.endswith("_hist"):
+            return (
+                self.J_obs,
+                self.J_sign,
+                self.J_above,
+                self.J_below,
+                self.N_classes,
+                self.upper,
+                self.lower,
+            )
+        raise TypeError("Error in ReadObs.all: Unknow observable type.")
 
     def slice(self, n):
         """Return n-th bin."""
-        if self.obs_name.endswith('_scal'):
+        if self.obs_name.endswith("_scal"):
             return self.J_obs[n], self.J_sign[n], self.N_obs
-        if self.obs_name.endswith('_eq') or self.obs_name.endswith('_tau'):
-            return (self.J_obs[n], self.J_back[n], self.J_sign[n], self.N_orb,
-                    self.N_tau, self.dtau, self.latt)
-        if self.obs_name.endswith('_hist'):
-            return (self.J_obs[n], self.J_sign[n], self.J_above[n],
-                    self.J_below[n], self.N_classes, self.upper, self.lower)
-        raise TypeError('Error in ReadObs.slice: Unknow observable type.')
+        if self.obs_name.endswith("_eq") or self.obs_name.endswith("_tau"):
+            return (
+                self.J_obs[n],
+                self.J_back[n],
+                self.J_sign[n],
+                self.N_orb,
+                self.N_tau,
+                self.dtau,
+                self.latt,
+            )
+        if self.obs_name.endswith("_hist"):
+            return (
+                self.J_obs[n],
+                self.J_sign[n],
+                self.J_above[n],
+                self.J_below[n],
+                self.N_classes,
+                self.upper,
+                self.lower,
+            )
+        raise TypeError("Error in ReadObs.slice: Unknow observable type.")
 
     def jack(self, N_rebin):
         """Return jackknife bins. Object has to be created with `bare_bins=True`.
@@ -559,27 +611,37 @@ class ReadObs:
 
         """
         if not self.bare_bins:
-            raise TypeError('Object has to be created with `bare_bins=True`.')
+            raise TypeError("Object has to be created with `bare_bins=True`.")
         par = Parameters(self.directory)
         J_obs_temp = jack(self.J_obs, par, N_rebin=N_rebin)
         N = len(J_obs_temp)
-        if self.obs_name.endswith('_scal'):
-            return (J_obs_temp,
-                    jack(self.J_sign, par, N_rebin=N_rebin),
-                    N*[self.N_obs])
-        if self.obs_name.endswith('_eq') or self.obs_name.endswith('_tau'):
-            return (J_obs_temp,
-                    jack(self.J_back, par, N_rebin=N_rebin),
-                    jack(self.J_sign, par, N_rebin=N_rebin),
-                    N*[self.N_orb], N*[self.N_tau], N*[self.dtau],
-                    N*[self.latt])
-        if self.obs_name.endswith('_hist'):
-            return (J_obs_temp,
-                    jack(self.J_sign, par, N_rebin=N_rebin),
-                    jack(self.J_above, par, N_rebin=N_rebin),
-                    jack(self.J_below, par, N_rebin=N_rebin),
-                    N*[self.N_classes], N*[self.upper], N*[self.lower])
-        raise TypeError('Error in ReadObs.jack: Unknow observable type.')
+        if self.obs_name.endswith("_scal"):
+            return (
+                J_obs_temp,
+                jack(self.J_sign, par, N_rebin=N_rebin),
+                N * [self.N_obs],
+            )
+        if self.obs_name.endswith("_eq") or self.obs_name.endswith("_tau"):
+            return (
+                J_obs_temp,
+                jack(self.J_back, par, N_rebin=N_rebin),
+                jack(self.J_sign, par, N_rebin=N_rebin),
+                N * [self.N_orb],
+                N * [self.N_tau],
+                N * [self.dtau],
+                N * [self.latt],
+            )
+        if self.obs_name.endswith("_hist"):
+            return (
+                J_obs_temp,
+                jack(self.J_sign, par, N_rebin=N_rebin),
+                jack(self.J_above, par, N_rebin=N_rebin),
+                jack(self.J_below, par, N_rebin=N_rebin),
+                N * [self.N_classes],
+                N * [self.upper],
+                N * [self.lower],
+            )
+        raise TypeError("Error in ReadObs.jack: Unknow observable type.")
 
 
 def ana_scal(directory, obs_name):
@@ -610,8 +672,9 @@ def ana_scal(directory, obs_name):
 def ana_hist(directory, obs_name):
     """Analyze given histogram observables."""
     # pylint: disable=too-many-locals
-    J_obs, J_sign, J_above, J_below, N_classes, upper, lower = \
-        ReadObs(directory, obs_name).all()
+    J_obs, J_sign, J_above, J_below, N_classes, upper, lower = ReadObs(
+        directory, obs_name
+    ).all()
     if len(J_obs) < 2:
         raise TooFewBinsError()
 
@@ -619,11 +682,11 @@ def ana_hist(directory, obs_name):
     above = error(J_above)
     below = error(J_below)
 
-    d_class = (upper-lower)/N_classes
+    d_class = (upper - lower) / N_classes
     dat = np.empty((N_classes, 3))
     for n in range(N_classes):
         J = J_obs[:, n] / J_sign
-        dat[n, :] = [lower+d_class*(0.5+n), *error(J)]
+        dat[n, :] = [lower + d_class * (0.5 + n), *error(J)]
 
     return sign, above, below, dat, upper, lower
 
@@ -635,8 +698,7 @@ def ana_eq(directory, obs_name, sym=None):
     Cf. :func:`symmetrize`.
     """
     # pylint: disable=too-many-locals
-    J_obs, J_back, J_sign, N_orb, N_tau, dtau, latt = \
-        ReadObs(directory, obs_name).all()
+    J_obs, J_back, J_sign, N_orb, N_tau, dtau, latt = ReadObs(directory, obs_name).all()
     del J_back, N_tau, dtau
     N_bins = len(J_sign)
     if N_bins < 2:
@@ -673,8 +735,7 @@ def ana_tau(directory, obs_name, sym=None):
     Cf. :func:`symmetrize`.
     """
     # pylint: disable=too-many-locals
-    J_obs, J_back, J_sign, N_orb, N_tau, dtau, latt = \
-        ReadObs(directory, obs_name).all()
+    J_obs, J_back, J_sign, N_orb, N_tau, dtau, latt = ReadObs(directory, obs_name).all()
     if len(J_obs) < 2:
         raise TooFewBinsError()
     del J_back, N_orb, N_tau
@@ -683,8 +744,7 @@ def ana_tau(directory, obs_name, sym=None):
     m, e = error(J_sign)
     sign = (m, e)
 
-    J = np.array(
-        [J_obs[n].trace(axis1=0, axis2=1) / J_sign[n] for n in range(N_bins)])
+    J = np.array([J_obs[n].trace(axis1=0, axis2=1) / J_sign[n] for n in range(N_bins)])
 
     if sym is not None:
         J = symmetrize(latt, sym, J)
@@ -698,98 +758,101 @@ def ana_tau(directory, obs_name, sym=None):
     return sign, m_K, e_K, m_R, e_R, dtau, latt
 
 
-def write_res_eq(directory, obs_name,
-                 m_k, e_k, m_k_sum, e_k_sum,
-                 m_r, e_r, m_r_sum, e_r_sum, latt):
+def write_res_eq(
+    directory, obs_name, m_k, e_k, m_k_sum, e_k_sum, m_r, e_r, m_r_sum, e_r_sum, latt
+):
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-arguments
     # pylint: disable=too-many-positional-arguments
     N_orb = m_k.shape[0]
-    header = ['kx', 'ky']
+    header = ["kx", "ky"]
     out = latt.k
-    fmt = '\t'.join(['%8.5f %8.5f'] + ['% 13.10e % 13.10e']*(N_orb**2+1))
-    fmth = '\t'.join(['{:^8s} {:^8s}'] + [' {:^33s}']*(N_orb**2+1))
+    fmt = "\t".join(["%8.5f %8.5f"] + ["% 13.10e % 13.10e"] * (N_orb**2 + 1))
+    fmth = "\t".join(["{:^8s} {:^8s}"] + [" {:^33s}"] * (N_orb**2 + 1))
     for no in range(N_orb):
         for no1 in range(N_orb):
             header = header + [str((no, no1))]
             out = np.column_stack([out, m_k[no1, no], e_k[no1, no]])
     out = np.column_stack([out, m_k_sum, e_k_sum])
-    header = header + ['trace over n_orb']
+    header = header + ["trace over n_orb"]
 
     np.savetxt(
-        os.path.join(directory, 'res', obs_name + '_K'),
+        os.path.join(directory, "res", obs_name + "_K"),
         out,
         fmt=fmt,
-        header=fmth.format(*header)
-        )
+        header=fmth.format(*header),
+    )
 
-    header = ['kx', 'ky']
+    header = ["kx", "ky"]
     out = latt.k
-    fmt = '\t'.join(['%8.5f %8.5f'] + ['% 13.10e % 13.10e']*(1))
-    fmth = '\t'.join(['{:^8s} {:^8s}'] + [' {:^33s}']*(1))
+    fmt = "\t".join(["%8.5f %8.5f"] + ["% 13.10e % 13.10e"] * (1))
+    fmth = "\t".join(["{:^8s} {:^8s}"] + [" {:^33s}"] * (1))
     out = np.column_stack([out, m_k_sum, e_k_sum])
-    header = header + ['trace over n_orb']
+    header = header + ["trace over n_orb"]
     np.savetxt(
-        os.path.join(directory, 'res', obs_name + '_K_sum'),
+        os.path.join(directory, "res", obs_name + "_K_sum"),
         out,
         fmt=fmt,
-        header=fmth.format(*header)
-        )
+        header=fmth.format(*header),
+    )
 
-    header = ['rx', 'ry']
+    header = ["rx", "ry"]
     out = latt.r
-    fmt = '\t'.join(['%9.5f %9.5f'] + ['% 13.10e % 13.10e']*(N_orb**2+1))
-    fmth = '\t'.join(['{:^8s} {:^8s}'] + [' {:^33s}']*(N_orb**2+1))
+    fmt = "\t".join(["%9.5f %9.5f"] + ["% 13.10e % 13.10e"] * (N_orb**2 + 1))
+    fmth = "\t".join(["{:^8s} {:^8s}"] + [" {:^33s}"] * (N_orb**2 + 1))
     for no in range(N_orb):
         for no1 in range(N_orb):
             header = header + [str((no, no1))]
             out = np.column_stack([out, m_r[no1, no], e_r[no1, no]])
     out = np.column_stack([out, m_r_sum, e_r_sum])
-    header = header + ['trace over n_orb']
+    header = header + ["trace over n_orb"]
 
     np.savetxt(
-        os.path.join(directory, 'res', obs_name + '_R'),
+        os.path.join(directory, "res", obs_name + "_R"),
         out,
         fmt=fmt,
-        header=fmth.format(*header)
-        )
+        header=fmth.format(*header),
+    )
 
-    header = ['rx', 'ry']
+    header = ["rx", "ry"]
     out = latt.r
-    fmt = '\t'.join(['%9.5f %9.5f'] + ['% 13.10e % 13.10e']*(1))
-    fmth = '\t'.join(['{:^8s} {:^8s}'] + [' {:^33s}']*(1))
+    fmt = "\t".join(["%9.5f %9.5f"] + ["% 13.10e % 13.10e"] * (1))
+    fmth = "\t".join(["{:^8s} {:^8s}"] + [" {:^33s}"] * (1))
     out = np.column_stack([out, m_r_sum, e_r_sum])
-    header = header + ['trace over n_orb']
+    header = header + ["trace over n_orb"]
     np.savetxt(
-        os.path.join(directory, 'res', obs_name + '_R_sum'),
+        os.path.join(directory, "res", obs_name + "_R_sum"),
         out,
         fmt=fmt,
-        header=fmth.format(*header)
-        )
+        header=fmth.format(*header),
+    )
 
 
 def write_res_tau(directory, obs_name, m_k, e_k, m_r, e_r, dtau, latt):
     # pylint: disable=too-many-arguments
     # pylint: disable=too-many-positional-arguments
     N_tau = m_k.shape[0]
-    taus = np.linspace(0., (N_tau-1)*dtau, num=N_tau)
+    taus = np.linspace(0.0, (N_tau - 1) * dtau, num=N_tau)
 
     for n in range(latt.N):
         directory2 = os.path.join(
-            directory, 'res', obs_name, '{:.2f}_{:.2f}'.format(*latt.k[n]))
+            directory, "res", obs_name, "{:.2f}_{:.2f}".format(*latt.k[n])
+        )
         if not os.path.exists(directory2):
             os.makedirs(directory2)
 
-        np.savetxt(os.path.join(directory2, 'dat'),
-                   np.column_stack([taus, m_k[:, n], e_k[:, n]]),
-                   fmt=['%14.7f', '%16.8f', '%16.8f']
-                   )
+        np.savetxt(
+            os.path.join(directory2, "dat"),
+            np.column_stack([taus, m_k[:, n], e_k[:, n]]),
+            fmt=["%14.7f", "%16.8f", "%16.8f"],
+        )
 
     n = latt.invlistr[0, 0]
-    np.savetxt(os.path.join(directory, 'res', obs_name, 'R0'),
-               np.column_stack([taus, m_r[:, n], e_r[:, n]]),
-               fmt=['%14.7f', '%16.8f', '%16.8f']
-               )
+    np.savetxt(
+        os.path.join(directory, "res", obs_name, "R0"),
+        np.column_stack([taus, m_r[:, n], e_r[:, n]]),
+        fmt=["%14.7f", "%16.8f", "%16.8f"],
+    )
 
 
 def load_res(directories):
@@ -817,21 +880,21 @@ def load_res(directories):
     for directory in directories:
         print(directory)
         try:
-            with open(os.path.join(directory, 'res.pkl'), 'rb') as f:
+            with open(os.path.join(directory, "res.pkl"), "rb") as f:
                 dictionary = pickle.load(f)
         except FileNotFoundError:
             print(f"No file named 'res.pkl' in {directory}, skipping.")
             continue
         directories_in.append(directory)
-        with h5py.File(os.path.join(directory, 'data.h5'), "r") as f:
-            dictionary.update(f['parameters'].attrs)
+        with h5py.File(os.path.join(directory, "data.h5"), "r") as f:
+            dictionary.update(f["parameters"].attrs)
 
-            dictionary['lattice'] = {}
-            dictionary['lattice'].update(f["lattice"].attrs)
+            dictionary["lattice"] = {}
+            dictionary["lattice"].update(f["lattice"].attrs)
             try:
-                dictionary['lattice']['orbitals'] = np.copy(f["lattice/orbitals"])
+                dictionary["lattice"]["orbitals"] = np.copy(f["lattice/orbitals"])
             except KeyError:
-                print('No orbital locations saved.')
+                print("No orbital locations saved.")
         li.append(dictionary)
 
     df = pd.DataFrame(li, index=directories_in)
@@ -839,8 +902,8 @@ def load_res(directories):
 
 
 def custom_obs_get_dtype_shape(obs_spec, bins):
-    sample = obs_spec['function'](
-                    *[x for b in bins for x in b.slice(0)],
-                    **obs_spec['kwargs'])
+    sample = obs_spec["function"](
+        *[x for b in bins for x in b.slice(0)], **obs_spec["kwargs"]
+    )
     sample = np.array(sample)
     return sample.dtype, sample.shape

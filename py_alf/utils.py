@@ -12,7 +12,7 @@ import h5py
 import numpy as np
 
 
-def find_sim_dirs(root_in='.'):
+def find_sim_dirs(root_in="."):
     """Find directories containing a file named 'data.h5'.
 
     Parameters
@@ -28,7 +28,7 @@ def find_sim_dirs(root_in='.'):
     dirs = []
     for root, folders, files in os.walk(root_in):
         del folders
-        if 'data.h5' in files:
+        if "data.h5" in files:
             dirs.append(root)
     dirs.sort()
     return dirs
@@ -47,25 +47,30 @@ def del_bins(filename, N0, N):
         Number of bins to remove after first N0 bins.
 
     """
+
     def reshape(fileobj, dset_name, N0, N):
         dset = fileobj[dset_name]
-        dat = np.copy(np.concatenate([dset[:N0], dset[N0+N:]]))
+        dat = np.copy(np.concatenate([dset[:N0], dset[N0 + N :]]))
         fileobj[dset_name].resize(dat.shape)
         fileobj[dset_name][:] = dat
 
-    with h5py.File(filename, 'r+') as f:          # pylint: disable=no-member
+    with h5py.File(filename, "r+") as f:  # pylint: disable=no-member
         for o in f:
-            if o.endswith('_scal') or o.endswith('_eq') \
-               or o.endswith('_tau') or o.endswith('_hist'):
-                reshape(f, o+"/obser", N0, N)
-                reshape(f, o+"/sign", N0, N)
+            if (
+                o.endswith("_scal")
+                or o.endswith("_eq")
+                or o.endswith("_tau")
+                or o.endswith("_hist")
+            ):
+                reshape(f, o + "/obser", N0, N)
+                reshape(f, o + "/sign", N0, N)
 
-            if o.endswith('_eq') or o.endswith('_tau'):
-                reshape(f, o+"/back", N0, N)
+            if o.endswith("_eq") or o.endswith("_tau"):
+                reshape(f, o + "/back", N0, N)
 
-            if o.endswith('_hist'):
-                reshape(f, o+"/above", N0, N)
-                reshape(f, o+"/below", N0, N)
+            if o.endswith("_hist"):
+                reshape(f, o + "/above", N0, N)
+                reshape(f, o + "/below", N0, N)
 
 
 def show_obs(filename):
@@ -77,29 +82,29 @@ def show_obs(filename):
         Name of HDF5 file.
 
     """
-    with h5py.File(filename, 'r') as f:           # pylint: disable=no-member
+    with h5py.File(filename, "r") as f:  # pylint: disable=no-member
         print("Scalar observables:")
         for o in f:
-            if o.endswith('_scal'):
-                N_bins = f[o+"/obser"].shape[0]
+            if o.endswith("_scal"):
+                N_bins = f[o + "/obser"].shape[0]
                 print(f"{o}; Bins: {N_bins}")
 
         print("Histogram observables:")
         for o in f:
-            if o.endswith('_hist'):
-                N_bins = f[o+"/obser"].shape[0]
+            if o.endswith("_hist"):
+                N_bins = f[o + "/obser"].shape[0]
                 print(f"{o}; Bins: {N_bins}")
 
         print("Equal time observables:")
         for o in f:
-            if o.endswith('_eq'):
-                N_bins = f[o+"/obser"].shape[0]
+            if o.endswith("_eq"):
+                N_bins = f[o + "/obser"].shape[0]
                 print(f"{o}; Bins: {N_bins}")
 
         print("Time displaced observables:")
         for o in f:
-            if o.endswith('_tau'):
-                N_bins = f[o+"/obser"].shape[0]
+            if o.endswith("_tau"):
+                N_bins = f[o + "/obser"].shape[0]
                 print(f"{o}; Bins: {N_bins}")
 
 
@@ -114,11 +119,15 @@ def bin_count(filename):
         Name of HDF5 file.
 
     """
-    with h5py.File(filename, 'r') as f:           # pylint: disable=no-member
+    with h5py.File(filename, "r") as f:  # pylint: disable=no-member
         N_bins = 0
         for o in f:
-            if o.endswith('_scal') or o.endswith('_eq') \
-               or o.endswith('_tau') or o.endswith('_hist'):
-                N_bins = f[o+"/obser"].shape[0]
+            if (
+                o.endswith("_scal")
+                or o.endswith("_eq")
+                or o.endswith("_tau")
+                or o.endswith("_hist")
+            ):
+                N_bins = f[o + "/obser"].shape[0]
                 break
         print(filename, N_bins)

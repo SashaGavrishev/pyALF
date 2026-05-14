@@ -28,7 +28,8 @@ def check_rebin_ipy(directories, names, custom_obs=None, Nmax0=100, ncols=3):
 
     """
     return CheckRebinIpy(
-        directories, names, custom_obs=custom_obs, Nmax0=Nmax0, ncols=ncols).gui
+        directories, names, custom_obs=custom_obs, Nmax0=Nmax0, ncols=ncols
+    ).gui
 
 
 class CheckRebinIpy:
@@ -58,9 +59,9 @@ class CheckRebinIpy:
     # pylint: disable=too-many-positional-arguments
     # pylint: disable=too-few-public-methods
     def __init__(self, directories, names, custom_obs=None, Nmax0=100, ncols=3):
-        self.gui, self.log, self.axs, self.nrebin, self.select = \
-            init_layout(directories, n_plots=len(names), ncols=ncols,
-                        int_names=('N_rebin:',))
+        self.gui, self.log, self.axs, self.nrebin, self.select = init_layout(
+            directories, n_plots=len(names), ncols=ncols, int_names=("N_rebin:",)
+        )
         self.nrebin.min = 1
         self.names = names
         if custom_obs is None:
@@ -71,14 +72,15 @@ class CheckRebinIpy:
         self.ncols = ncols
 
         self._init_dir()
-        self.select.observe(self._update_select, 'value')
-        self.nrebin.observe(self._update_nrebin, 'value')
+        self.select.observe(self._update_select, "value")
+        self.nrebin.observe(self._update_nrebin, "value")
 
     def _init_dir(self):
         with self.log:
             self.par = Parameters(self.select.value)
             errors = _get_errors(
-                self.select.value, self.names, self.custom_obs, self.Nmax0)
+                self.select.value, self.names, self.custom_obs, self.Nmax0
+            )
             _plot_errors(self.axs, errors, self.names, self.custom_obs)
             self.nrebin.max = len(errors[0])
             self.nrebin.value = self.par.N_rebin()
@@ -86,8 +88,8 @@ class CheckRebinIpy:
             self.verts = []
             for ax in self.axs:
                 self.verts.append(ax.axvline(x=self.nrebin.value, color="red"))
-            for ax in self.axs[-self.ncols:]:
-                ax.set_xlabel('N_rebin')
+            for ax in self.axs[-self.ncols :]:
+                ax.set_xlabel("N_rebin")
 
     def _update_select(self, change):
         del change
@@ -100,7 +102,7 @@ class CheckRebinIpy:
         with self.log:
             if self.nrebin.value == self.par.N_rebin():
                 return
-            print(f'Change N_rebin to {self.nrebin.value}')
+            print(f"Change N_rebin to {self.nrebin.value}")
             self.par.set_N_rebin(self.nrebin.value)
             self.par.write_nml()
             for vert in self.verts:

@@ -18,18 +18,18 @@ from py_alf.utils import del_bins
 
 def _get_arg_parser():
     parser = ArgumentParser(
-        description='Delete N bins in all observables of '
-                    'the specified HDF5-file.',
-        )
+        description="Delete N bins in all observables of the specified HDF5-file.",
+    )
     parser.add_argument(
-        '--N', type=int, required=True,
-        help='Number of bins to remove after first N0 bins.')
+        "--N",
+        type=int,
+        required=True,
+        help="Number of bins to remove after first N0 bins.",
+    )
     parser.add_argument(
-        '--N0', type=int, default=0,
-        help='Number of first N0 bins to keep. (default=0)')
-    parser.add_argument(
-        'filename', nargs=1,
-        help='Name of HDF5 file.')
+        "--N0", type=int, default=0, help="Number of first N0 bins to keep. (default=0)"
+    )
+    parser.add_argument("filename", nargs=1, help="Name of HDF5 file.")
     return parser
 
 
@@ -39,5 +39,5 @@ def _main():
     del_bins(args.filename[0], args.N0, args.N)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     _main()

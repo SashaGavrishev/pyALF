@@ -1058,8 +1058,7 @@ def test_get_jobs_resources_bulk_parses_memory_and_efficiency():
     _clear_cache("RES_BASIC")
     # --parsable2 uses "|" as delimiter
     sacct_out = (
-        "RES_BASIC|8192K|01:30:00|04:00:00\n"
-        "RES_BASIC.batch|8192K|01:30:00|04:00:00\n"
+        "RES_BASIC|8192K|01:30:00|04:00:00\nRES_BASIC.batch|8192K|01:30:00|04:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_BASIC"])
@@ -1071,8 +1070,7 @@ def test_get_jobs_resources_bulk_takes_max_rss_across_steps():
     """The peak RSS is the maximum across the job step and its substeps."""
     _clear_cache("RES_MAX")
     sacct_out = (
-        "RES_MAX|4096K|01:00:00|04:00:00\n"
-        "RES_MAX.batch|8192K|01:00:00|04:00:00\n"
+        "RES_MAX|4096K|01:00:00|04:00:00\nRES_MAX.batch|8192K|01:00:00|04:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_MAX"])
@@ -1099,8 +1097,7 @@ def test_get_jobs_resources_bulk_zero_rss_returns_none():
 def test_get_jobs_resources_bulk_array_task_id():
     _clear_cache("88888_3")
     sacct_out = (
-        "88888_3|4096K|00:30:00|02:00:00\n"
-        "88888_3.batch|8192K|00:30:00|02:00:00\n"
+        "88888_3|4096K|00:30:00|02:00:00\n88888_3.batch|8192K|00:30:00|02:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["88888_3"])

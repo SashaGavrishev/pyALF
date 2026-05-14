@@ -59,38 +59,32 @@ class check_warmup_tk:  # pylint: disable=too-few-public-methods
 
         nmax_frame = tk.Frame(frame)
         nmax_frame.pack(side=tk.LEFT)
-        nmax_label = tk.Label(nmax_frame, text='N_max:')
+        nmax_label = tk.Label(nmax_frame, text="N_max:")
         nmax_label.pack(side=tk.LEFT)
-        nmax_entry = tk.Entry(
-            nmax_frame, width=5, textvariable=self.Nmax_str)
+        nmax_entry = tk.Entry(nmax_frame, width=5, textvariable=self.Nmax_str)
         nmax_entry.pack()
-        nmax_button = tk.Button(
-            nmax_frame, text="Set", command=self._set_nmax)
+        nmax_button = tk.Button(nmax_frame, text="Set", command=self._set_nmax)
         nmax_button.pack(side=tk.RIGHT)
 
         nskip_frame = tk.Frame(frame)
         nskip_frame.pack(side=tk.LEFT)
-        nskip_label = tk.Label(nskip_frame, text='N_skip:')
+        nskip_label = tk.Label(nskip_frame, text="N_skip:")
         nskip_label.pack(side=tk.LEFT)
-        nskip_entry = tk.Entry(
-            nskip_frame, width=5, textvariable=self.N_skip_str)
+        nskip_entry = tk.Entry(nskip_frame, width=5, textvariable=self.N_skip_str)
         nskip_entry.pack()
-        nskip_button = tk.Button(
-            nskip_frame, text="Set", command=self._set_nskip)
+        nskip_button = tk.Button(nskip_frame, text="Set", command=self._set_nskip)
         nskip_button.pack(side=tk.RIGHT)
 
-        button_frame = tk.LabelFrame(frame, text='Quit')
+        button_frame = tk.LabelFrame(frame, text="Quit")
         button_frame.pack(side=tk.RIGHT)
-        button_next = tk.Button(
-            button_frame, text="Next", command=self._next)
+        button_next = tk.Button(button_frame, text="Next", command=self._next)
         button_next.pack(side=tk.LEFT)
-        button_quit = tk.Button(
-            button_frame, text="Finish",command=self._quit)
+        button_quit = tk.Button(button_frame, text="Finish", command=self._quit)
         button_quit.pack(side=tk.RIGHT)
         tk.mainloop()
 
     def _set_nmax(self):
-        self.axes[0].set_xlim(0.5, int(self.Nmax_str.get())+0.5)
+        self.axes[0].set_xlim(0.5, int(self.Nmax_str.get()) + 0.5)
         self.canvas.draw()
 
     def _set_nskip(self):
@@ -114,10 +108,9 @@ class check_warmup_tk:  # pylint: disable=too-few-public-methods
             return
         self.n_dir_var.set(n_dir)
         self.directory_var.set(self.directories[n_dir])
-        self.root.wm_title(f'{self.directory_var.get()} warmup')
+        self.root.wm_title(f"{self.directory_var.get()} warmup")
         self.par = Parameters(self.directory_var.get())
-        self.res = _get_bins(
-            self.directory_var.get(), self.names, self.custom_obs)
+        self.res = _get_bins(self.directory_var.get(), self.names, self.custom_obs)
 
         Nmax = np.inf
         for ax, name, bins in zip(self.axes, self.names, self.res):

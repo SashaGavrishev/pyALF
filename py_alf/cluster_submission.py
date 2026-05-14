@@ -411,9 +411,9 @@ def _exec_alf_binary(
         data_file = sim_dir_path / "data.h5"
         if data_file.exists():
             import time as _time
-            job_id = (
-                os.environ.get("SLURM_ARRAY_JOB_ID")
-                or os.environ.get("SLURM_JOB_ID")
+
+            job_id = os.environ.get("SLURM_ARRAY_JOB_ID") or os.environ.get(
+                "SLURM_JOB_ID"
             )
             suffix = job_id if job_id else str(int(_time.time()))
             data_file.rename(sim_dir_path / f"data_{suffix}.h5")
@@ -772,14 +772,10 @@ class ClusterSubmitter:
 
         if confirm_checkpoint:
             checkpoint_sims = [
-                s
-                for s in filtered_sims
-                if any(Path(s.sim_dir).glob("confin_*"))
+                s for s in filtered_sims if any(Path(s.sim_dir).glob("confin_*"))
             ]
             if checkpoint_sims:
-                names = ", ".join(
-                    Path(s.sim_dir).name for s in checkpoint_sims[:3]
-                )
+                names = ", ".join(Path(s.sim_dir).name for s in checkpoint_sims[:3])
                 if len(checkpoint_sims) > 3:
                     names += f" … ({len(checkpoint_sims)} total)"
                 print(
@@ -870,7 +866,11 @@ class ClusterSubmitter:
             if "slurm_time" not in params and "time" not in extra:
                 slurm_time_h = timeout_hours * 1.1
                 selected = params.get("slurm_partition")
-                if selected and self.partition_rules and selected in self.partition_rules:
+                if (
+                    selected
+                    and self.partition_rules
+                    and selected in self.partition_rules
+                ):
                     max_h = float(
                         self.partition_rules[selected].get("max_hours", slurm_time_h)
                     )
