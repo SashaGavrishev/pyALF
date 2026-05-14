@@ -804,7 +804,7 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        timeout_hours = max(1, float(sim.sim_dict.get("CPU_MAX", 24)))
+        timeout_hours = max(0.0, float(sim.sim_dict.get("CPU_MAX", 24)))
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
