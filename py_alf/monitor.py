@@ -134,6 +134,64 @@ _MONO_THEME = Theme(
 
 
 # ---------------------------------------------------------------------------
+# Session utilities (usable from Jupyter without launching the TUI)
+# ---------------------------------------------------------------------------
+
+
+def list_sessions(submit_dir: str | Path) -> list[Path]:
+    """Return session manifest paths inside *submit_dir*, newest first.
+
+    Parameters
+    ----------
+    submit_dir : str or Path
+        Directory that contains ``session_YYYYMMDD_HHMMSS.json`` files
+        (the ``.alfmonitor`` or custom submit directory passed to
+        ``ClusterSubmitter``).
+
+    Returns
+    -------
+    list of Path
+        Matching session files sorted by modification time, most recent first.
+    """
+    return sorted(
+        Path(submit_dir).glob("session_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def load_session_sims(session_path: str | Path) -> list[_SessionEntry]:
+    """Load simulation objects from a session manifest written by SubmissionReview.
+
+    Reconstructed objects expose the same attributes used by analysis
+    workflows: ``sim_dir``, ``ham_name``, ``sim_dict``, ``n_omp``,
+    ``n_mpi``, ``mpi``, and ``job_id``.
+
+    Parameters
+    ----------
+    session_path : str or Path
+        Path to a ``session_YYYYMMDD_HHMMSS.json`` file.
+
+    Returns
+    -------
+    list of _SessionEntry
+
+    Example
+    -------
+    In a Jupyter notebook::
+
+        from py_alf.monitor import list_sessions, load_session_sims
+
+        sessions = list_sessions("/scratch/user/.alfmonitor")
+        print(sessions)            # newest first
+        sims = load_session_sims(sessions[0])
+        # use sim.sim_dir with py_alf.analysis() etc.
+    """
+    data = json.loads(Path(session_path).read_text())
+    return [_SessionEntry(**entry) for entry in data["entries"]]
+
+
+# ---------------------------------------------------------------------------
 # Modal screens
 # ---------------------------------------------------------------------------
 

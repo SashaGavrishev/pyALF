@@ -56,6 +56,24 @@ All selected simulations are submitted as a single SLURM array job.
 | `app.session_path` | `Path \| None` | Path to the session manifest written after a successful SLURM submission; `None` for local/debug runs or if writing failed |
 | `app.open_monitor` | `bool` | `True` when the user pressed `m` to hand off to the monitor before quitting |
 
+**`run_with_monitor()`** — recommended entry point when running from a script or an SSH terminal. It calls `run()` and, if the user pressed `m`, automatically launches the monitor in a fresh subprocess (which resets the terminal cleanly between the two Textual apps):
+
+```python
+SubmissionReview(cs, sims).run_with_monitor()
+```
+
+**`save_for_ssh()`** — for use inside a Jupyter notebook over SSH, where the TUI cannot run in the kernel's output cell. Call this after building `cs` and `sims`; it pickles the state and prints the one-liner to paste into VS Code's integrated terminal (or any SSH shell):
+
+```python
+from py_alf.submission_tui import save_for_ssh
+
+save_for_ssh(cs, sims)
+# Saved. In the terminal (VS Code Ctrl+`) run:
+# python -c "import pickle; from py_alf.submission_tui import SubmissionReview; ..."
+```
+
+An optional `path` argument overrides the default `/tmp/alf_tui_state.pkl`.
+
 **Keybindings:**
 
 | Key | Action |
@@ -103,6 +121,24 @@ SimulationMonitor.from_session(
 ```
 
 `from_session` reads the job IDs, Hamiltonian metadata, and `ClusterSubmitter` configuration from the manifest — no re-import of the original `Simulation` objects is needed.
+
+**Load simulation objects for post-run analysis** — useful in a fresh Jupyter notebook when you want to use the session data with `py_alf.analysis`:
+
+```python
+from py_alf.monitor import list_sessions, load_session_sims
+
+# List all sessions in the submit directory, newest first
+sessions = list_sessions(".alfmonitor")
+print(sessions)
+
+# Reconstruct simulation-like objects from any session
+sims = load_session_sims(sessions[0])
+for sim in sims:
+    print(sim.sim_dir, sim.ham_name, sim.sim_dict)
+    # pass sim.sim_dir to py_alf.analysis() etc.
+```
+
+Both helpers are also importable from the top-level package: `py_alf.list_sessions`, `py_alf.load_session_sims`.
 
 The monitor displays a table with one row per simulation. Columns include the Hamiltonian name, any `param_keys` you specify, `n_omp`/`n_mpi`, SLURM partition and memory (when a `ClusterSubmitter` is provided), bin count, master array ID, individual job ID, colour-coded status, elapsed runtime, estimated time remaining (ETA), peak memory usage, and CPU efficiency. Peak memory and CPU efficiency are fetched from `sacct` once a job reaches a terminal state and persisted to `peak_resources.json` in the simulation directory, so they remain visible even after the job ages out of the SLURM accounting database.
 
@@ -157,31 +193,38 @@ alf_monitor --refresh 60
 ```python
 from py_alf import ALF_source, Simulation, ClusterSubmitter
 from py_alf.submission_tui import SubmissionReview
-from py_alf.monitor import SimulationMonitor
 
 alf_src = ALF_source(...)
 sims    = [...]
 cs      = ClusterSubmitter("slurm", slurm_mem="8G",
                            partition_rules={"short": 2, "medium": 48, "long": 336})
 
-# 1. Review and submit
-app       = SubmissionReview(cs, sims)
-submitted = app.run()
+# Review, submit, and seamlessly hand off to the monitor if the user presses 'm'.
+# The monitor launches in a fresh subprocess, which resets the terminal cleanly
+# in SSH environments.
+SubmissionReview(cs, sims).run_with_monitor()
+```
 
-if not submitted:
-    print("Cancelled.")
-else:
-    print(f"Submitted {len(submitted)} sim(s). Session: {app.session_path}")
+**Jupyter / SSH workflow** — when the TUI must run in an SSH terminal rather than the notebook kernel:
 
-    # 2a. Seamless handover — user pressed 'm' inside the TUI
-    if app.open_monitor:
-        SimulationMonitor.from_session(
-            app.session_path,
-            cluster_submitter=app.submitted_cs,
-        ).run()
+```python
+# In the Jupyter notebook cell:
+from py_alf.submission_tui import save_for_ssh
 
-# 2b. Later — reload from the session manifest without re-running the script
-# SimulationMonitor.from_session(".alfmonitor/session_20260513_102314.json").run()
+save_for_ssh(cs, sims)
+# Output:
+#   Saved. In the terminal (VS Code Ctrl+`) run:
+#   python -c "import pickle; from py_alf.submission_tui import SubmissionReview; ..."
+
+# Then paste the printed command into VS Code's integrated terminal (Ctrl+`).
+# The command restores cs and sims from the pickle and calls run_with_monitor().
+```
+
+**Later — reload from the session manifest without re-running the script:**
+
+```python
+from py_alf.monitor import SimulationMonitor
+SimulationMonitor.from_session(".alfmonitor/session_20260513_102314.json").run()
 ```
 
 **Demos** — runnable examples that mock all SLURM calls (no cluster required):
@@ -196,7 +239,6 @@ python demos/demo_monitor_tui.py      # SimulationMonitor standalone
 Functionality exists to be able automatically detect the required partition rules on a SLURM cluster, using `detect_partition_rules`.
 
 ```python
-/dev/null/run_project.py#L1-8
 from py_alf import detect_partition_rules, ClusterSubmitter
 
 rules = detect_partition_rules(exclude=["gpu", "debug"])

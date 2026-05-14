@@ -1,5 +1,7 @@
 """Tests for SimulationMonitor TUI (py_alf.monitor)."""
 
+import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -845,3 +847,104 @@ async def test_monitor_nbin_target_from_sim_dict(tmp_path, no_slurm):
         await app.workers.wait_for_complete()
         await pilot.pause()
     assert app._row_data[0]["nbin_target"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Session utilities: list_sessions / load_session_sims
+# ---------------------------------------------------------------------------
+
+
+def _write_session_file(path: Path, entries: list[dict]) -> None:
+    manifest = {
+        "version": 1,
+        "submitted_at": "2026-05-14T12:00:00",
+        "cluster_submitter": {"executor": "slurm", "submit_dir": str(path.parent)},
+        "entries": entries,
+    }
+    path.write_text(json.dumps(manifest))
+
+
+def _entry(idx: int = 0) -> dict:
+    return {
+        "sim_dir": f"/tmp/sim{idx}",
+        "ham_name": "Hubbard",
+        "n_omp": 4,
+        "n_mpi": 1,
+        "mpi": False,
+        "sim_dict": {"U": float(idx)},
+        "job_id": f"99_{idx}",
+    }
+
+
+def test_list_sessions_empty_dir(tmp_path):
+    from py_alf.monitor import list_sessions
+
+    assert list_sessions(tmp_path) == []
+
+
+def test_list_sessions_returns_session_files(tmp_path):
+    from py_alf.monitor import list_sessions
+
+    _write_session_file(tmp_path / "session_20260514_120000.json", [_entry()])
+    _write_session_file(tmp_path / "session_20260514_130000.json", [_entry()])
+    assert len(list_sessions(tmp_path)) == 2
+
+
+def test_list_sessions_newest_first(tmp_path):
+    from py_alf.monitor import list_sessions
+
+    p1 = tmp_path / "session_20260514_120000.json"
+    p2 = tmp_path / "session_20260514_130000.json"
+    _write_session_file(p1, [_entry()])
+    _write_session_file(p2, [_entry()])
+    # Force distinct modification times so ordering is deterministic.
+    os.utime(p1, (1_000_000, 1_000_000))
+    os.utime(p2, (2_000_000, 2_000_000))
+    sessions = list_sessions(tmp_path)
+    assert sessions[0] == p2  # newer mtime first
+
+
+def test_list_sessions_ignores_non_session_files(tmp_path):
+    from py_alf.monitor import list_sessions
+
+    (tmp_path / "other_file.json").write_text("{}")
+    (tmp_path / "session_notes.txt").write_text("notes")
+    _write_session_file(tmp_path / "session_20260514_120000.json", [_entry()])
+    assert len(list_sessions(tmp_path)) == 1
+
+
+def test_load_session_sims_reconstructs_fields(tmp_path):
+    from py_alf.monitor import load_session_sims
+
+    session = tmp_path / "session_20260514_120000.json"
+    _write_session_file(session, [_entry(0)])
+    sims = load_session_sims(session)
+    assert len(sims) == 1
+    s = sims[0]
+    assert s.sim_dir == "/tmp/sim0"
+    assert s.ham_name == "Hubbard"
+    assert s.n_omp == 4
+    assert s.n_mpi == 1
+    assert s.mpi is False
+    assert s.sim_dict == {"U": 0.0}
+    assert s.job_id == "99_0"
+
+
+def test_load_session_sims_multiple_entries(tmp_path):
+    from py_alf.monitor import load_session_sims
+
+    session = tmp_path / "session_20260514_120000.json"
+    _write_session_file(session, [_entry(i) for i in range(4)])
+    sims = load_session_sims(session)
+    assert len(sims) == 4
+    assert [s.sim_dir for s in sims] == [f"/tmp/sim{i}" for i in range(4)]
+
+
+def test_load_session_sims_missing_job_id_defaults_to_none(tmp_path):
+    from py_alf.monitor import load_session_sims
+
+    entry = {k: v for k, v in _entry(0).items() if k != "job_id"}
+    session = tmp_path / "session_20260514_120000.json"
+    _write_session_file(session, [entry])
+    sims = load_session_sims(session)
+    assert sims[0].job_id is None
