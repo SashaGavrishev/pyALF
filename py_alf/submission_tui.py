@@ -136,6 +136,49 @@ def _status_label(status: str, detail: str = "") -> RichText:
     return t
 
 
+def save_for_ssh(
+    cs: ClusterSubmitter,
+    sims: list,
+    path: str | Path | None = None,
+) -> str:
+    """Pickle submission state and print the command to launch the TUI over SSH.
+
+    Call this from a Jupyter notebook cell after building ``cs`` and ``sims``.
+    It saves the objects to a temporary file and prints a one-liner to paste
+    into the VS Code integrated terminal (or any SSH shell) to open the
+    submission review followed by the monitor.
+
+    Parameters
+    ----------
+    cs : ClusterSubmitter
+        Configured submitter.
+    sims : list of Simulation
+        Simulation objects to submit.
+    path : str or Path, optional
+        Pickle destination. Defaults to ``/tmp/alf_tui_state.pkl``.
+
+    Returns
+    -------
+    str
+        The shell command that was printed.
+    """
+    import pickle
+
+    path = Path("/tmp/alf_tui_state.pkl") if path is None else Path(path)
+
+    with open(path, "wb") as f:
+        pickle.dump({"sims": sims, "cs": cs}, f)
+
+    cmd = (
+        f'python -c "'
+        f"import pickle; from py_alf.submission_tui import SubmissionReview; "
+        f"d=pickle.load(open('{path}','rb')); "
+        f"SubmissionReview(d['cs'],d['sims']).run_with_monitor()\""
+    )
+    print(f"Saved. In the terminal (VS Code Ctrl+`) run:\n{cmd}")
+    return cmd
+
+
 def _write_session_manifest(
     submitted: list[Simulation],
     job_ids: list[str],
@@ -1241,14 +1284,28 @@ class SubmissionReview(App):
 
         Replaces the ``app.run()`` / ``if app.open_monitor`` pattern that the
         caller would otherwise have to write manually.
+
+        The monitor is launched in a fresh subprocess so that the terminal is
+        fully reset between the two Textual apps — this fixes the blank-screen
+        issue that occurs when running sequentially in SSH environments.
         """
+        import subprocess
+        import sys
+
         self.run()
         if self.open_monitor and self.session_path:
-            from .monitor import SimulationMonitor
-
-            SimulationMonitor.from_session(
-                self.session_path, refresh_interval=refresh_interval
-            ).run()
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from py_alf.monitor import SimulationMonitor; "
+                        f"SimulationMonitor.from_session({str(self.session_path)!r},"
+                        f" refresh_interval={refresh_interval}).run()"
+                    ),
+                ],
+                check=False,
+            )
 
     def action_quit_cancel(self) -> None:
         self.exit(self._submitted_result)
