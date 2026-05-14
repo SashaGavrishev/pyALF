@@ -115,6 +115,8 @@ def make_mock_sim(
     sim.n_omp = n_omp
     sim.n_mpi = n_mpi
     sim.mpi = mpi
+    sim.mpiexec = "mpiexec"
+    sim.mpiexec_args = []
     sim.config = f"{machine} HDF5 {'MPI' if mpi else 'NOMPI'}"
     return sim
 
@@ -127,7 +129,7 @@ def make_mock_sim(
 def _cs(mem: str) -> ClusterSubmitter:
     return ClusterSubmitter(
         "slurm",
-        submit_dir=str(_TMPDIR / "submitit"),
+        submit_dir=str(_TMPDIR / ".alfmonitor"),
         slurm_mem=mem,
         partition_rules=CPU_PARTITIONS,
     )
@@ -293,7 +295,7 @@ def _launch_monitor(sims: list, app: SubmissionReview) -> None:
 
     # Create a fake log file per job ID so the log viewer works.
     submit_dir = (
-        app.submitted_cs.submit_dir if app.submitted_cs else _TMPDIR / "submitit"
+        app.submitted_cs.submit_dir if app.submitted_cs else _TMPDIR / ".alfmonitor"
     )
     submit_dir.mkdir(parents=True, exist_ok=True)
     for jid in statuses:
