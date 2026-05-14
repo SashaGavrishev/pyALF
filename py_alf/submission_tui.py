@@ -36,6 +36,7 @@ from .cluster_submission import (
     _hours_to_hms,
     _parse_mem_gb,
     _parse_slurm_time_hours,
+    _slurm_time_to_minutes,
 )
 from .simulation import Simulation
 
@@ -311,22 +312,41 @@ def _arch_renderable(
     n_ranks = sim.n_mpi if sim.mpi else 1
     n_omp = sim.n_omp
     sim_dict = _sim_dict_of(sim)
-    timeout_h = max(0.0, float(sim_dict.get("CPU_MAX", 24)))
+    _cpu_max = float(sim_dict.get("CPU_MAX", 24))
     nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
-    try:
-        if partition_override:
-            partition = partition_override
-            p_spec = (cs.partition_rules or {}).get(partition, {})
-            p_note = "manual override"
-        else:
-            partition = cs._select_partition(timeout_h)
-            p_spec = cs.partition_rules[partition]
-            p_note = f"CPU_MAX={_format_hours(timeout_h)}  ≤  {_format_hours(p_spec['max_hours'])} limit"
-    except ValueError:
+    # Resolve fixed_slurm_h before partition selection — it drives both.
+    fixed_slurm_time: str | int | None = (cs.slurm_kwargs or {}).get("slurm_time")
+    if isinstance(fixed_slurm_time, int):
+        fixed_slurm_h: float | None = fixed_slurm_time / 60
+    elif fixed_slurm_time:
+        fixed_slurm_h = _parse_slurm_time_hours(fixed_slurm_time)
+    else:
+        fixed_slurm_h = None
+
+    if fixed_slurm_h is None and _cpu_max <= 0:
+        # CPU_MAX=0: ALF stops after Nbin with no time limit — wall time unknown.
         partition = "---"
         p_spec = {}
-        p_note = "too long"
+        p_note = "slurm_time required (CPU_MAX=0)"
+    else:
+        try:
+            if partition_override:
+                partition = partition_override
+                p_spec = (cs.partition_rules or {}).get(partition, {})
+                p_note = "manual override"
+            elif fixed_slurm_h is not None:
+                partition = cs._select_partition(fixed_slurm_h)
+                p_spec = cs.partition_rules[partition]
+                p_note = f"slurm_time={_format_hours(fixed_slurm_h)}  ≤  {_format_hours(p_spec['max_hours'])} limit"
+            else:
+                partition = cs._select_partition(_cpu_max)
+                p_spec = cs.partition_rules[partition]
+                p_note = f"CPU_MAX={_format_hours(_cpu_max)}  ≤  {_format_hours(p_spec['max_hours'])} limit"
+        except ValueError:
+            partition = "---"
+            p_spec = {}
+            p_note = "too long"
 
     mem_str = mem_display if mem_display else (cs.slurm_mem or "—")
 
@@ -343,17 +363,10 @@ def _arch_renderable(
 
     # SLURM wall time: use user-supplied slurm_time if present, otherwise
     # compute as CPU_MAX + 10% buffer capped at the partition limit.
-    fixed_slurm_time: str | int | None = (cs.slurm_kwargs or {}).get("slurm_time")
-    if isinstance(fixed_slurm_time, int):
-        fixed_slurm_h: float | None = fixed_slurm_time / 60
-    elif fixed_slurm_time:
-        fixed_slurm_h = _parse_slurm_time_hours(fixed_slurm_time)
-    else:
-        fixed_slurm_h = None
     if fixed_slurm_h is not None:
         slurm_h = fixed_slurm_h
     else:
-        slurm_h_raw = timeout_h * 1.1
+        slurm_h_raw = _cpu_max * 1.1
         slurm_h = slurm_h_raw
         if partition != "---" and p_spec:
             slurm_h = min(slurm_h_raw, float(p_spec.get("max_hours", slurm_h_raw)))
@@ -1044,6 +1057,17 @@ class SubmissionReview(App):
             + f"[bold]Submit dir:[/bold]  [dim]{self.query_one('#dir-input', Input).value or str(self._cs.submit_dir)}[/dim]"
         )
 
+    def _needs_slurm_time(self) -> bool:
+        """True when any selected sim has CPU_MAX=0 and no slurm_time is configured."""
+        if self._executor_state != "slurm":
+            return False
+        if (self._cs.slurm_kwargs or {}).get("slurm_time") is not None:
+            return False
+        return any(
+            sel and float(_sim_dict_of(sim).get("CPU_MAX", 1)) <= 0
+            for sim, sel in zip(self._sims, self._selected)
+        )
+
     def _has_unfit_partition(self) -> bool:
         """True when any selected sim exceeds a partition wall-time or node resource limit."""
         if self._executor_state != "slurm" or not self._cs.partition_rules:
@@ -1051,10 +1075,22 @@ class SubmissionReview(App):
         mem_str = self.query_one("#mem-input", Input).value or (
             self._cs.slurm_mem or ""
         )
+        _raw_st = (self._cs.slurm_kwargs or {}).get("slurm_time")
+        try:
+            _slurm_time_h: float | None = (
+                _slurm_time_to_minutes(_raw_st) / 60 if _raw_st is not None else None
+            )
+        except ValueError:
+            _slurm_time_h = None
         for sim, sel in zip(self._sims, self._selected):
             if not sel:
                 continue
-            timeout_h = max(0.0, float(_sim_dict_of(sim).get("CPU_MAX", 24)))
+            _c = float(_sim_dict_of(sim).get("CPU_MAX", 0))
+            timeout_h = (
+                _slurm_time_h
+                if _slurm_time_h is not None
+                else (_c if _c > 0 else 24.0)
+            )
             if self._manual_partition:
                 partition = self._manual_partition
                 # Manual partition may not be in partition_rules — skip limit check
@@ -1083,6 +1119,9 @@ class SubmissionReview(App):
             btn.disabled = True
         elif n_sel == 0:
             btn.label = f"Submit  ({n_sel} / {len(self._sims)})  [s]"
+            btn.disabled = True
+        elif self._needs_slurm_time():
+            btn.label = "Cannot submit — set slurm_time (CPU_MAX=0)  [s]"
             btn.disabled = True
         elif self._has_unfit_partition():
             btn.label = "Cannot submit — partition unfit  [s]"

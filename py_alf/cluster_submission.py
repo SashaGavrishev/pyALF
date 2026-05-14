@@ -465,6 +465,23 @@ def _hours_to_hms(h: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
+def _slurm_time_to_minutes(value: int | str) -> int:
+    """Normalise a slurm_time value to integer minutes.
+
+    Accepts an integer (already in minutes) or an HH:MM:SS / D-HH:MM:SS string.
+    Raises ValueError for unrecognised strings.
+    """
+    if isinstance(value, int):
+        return value
+    hours = _parse_slurm_time_hours(value)
+    if hours is None:
+        raise ValueError(
+            f"Cannot parse slurm_time {value!r} — expected an integer (minutes) "
+            "or a string in HH:MM:SS / D-HH:MM:SS format."
+        )
+    return int(hours * 60)
+
+
 class ClusterSubmitter:
     """
     Handles job submission using submitit.
@@ -804,7 +821,21 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        timeout_hours = max(0.0, float(sim.sim_dict.get("CPU_MAX", 24)))
+        _raw_slurm_time = (self.slurm_kwargs or {}).get("slurm_time")
+        if _raw_slurm_time is None:
+            _raw_slurm_time = (job_properties or {}).get("slurm_time")
+        if _raw_slurm_time is not None:
+            timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
+        else:
+            cpu_max = float(sim.sim_dict.get("CPU_MAX", 0))
+            if cpu_max <= 0 and self.executor == "slurm":
+                raise ValueError(
+                    "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
+                    "time limit, so a SLURM wall time cannot be derived automatically. "
+                    "Pass slurm_time (int minutes or HH:MM:SS) to ClusterSubmitter "
+                    "or job_properties."
+                )
+            timeout_hours = cpu_max if cpu_max > 0 else 0.0
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
@@ -859,6 +890,8 @@ class ClusterSubmitter:
         params.update(self.slurm_kwargs)
         if job_properties:
             params.update(job_properties)
+        if "slurm_time" in params:
+            params["slurm_time"] = _slurm_time_to_minutes(params["slurm_time"])
 
         if self.executor == "slurm":
             extra = dict(params.get("additional_parameters") or {})
