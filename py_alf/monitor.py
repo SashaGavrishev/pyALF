@@ -113,7 +113,7 @@ def _eta_cell(cpu_max_h: float, elapsed_h: float | None) -> Any:
         h, m = divmod(total_m, 60)
         eta_str = f"{h}h{m:02d}m" if h else f"{m}m"
         t = Text(f"{eta_str} ")
-        t.append(bar, style="green" if fraction < 0.9 else "yellow")
+        t.append(bar, style="yellow")
     return t
 
 
@@ -655,15 +655,15 @@ class SimulationMonitor(App):
 
             array_id = jobid.split("_")[0] if jobid and "_" in jobid else jobid or "-"
 
-            if status == "RUNNING" and runtime:
-                _cpu_max_raw = (
-                    sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
-                )
-                _cpu_max = float(_cpu_max_raw) if _cpu_max_raw is not None else None
-                _elapsed_h = _parse_elapsed_hours(runtime)
-            else:
-                _cpu_max = None
-                _elapsed_h = None
+            _cpu_max_raw = (
+                sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
+            )
+            _cpu_max = float(_cpu_max_raw) if _cpu_max_raw is not None else None
+            _elapsed_h = (
+                _parse_elapsed_hours(runtime)
+                if status == "RUNNING" and runtime
+                else None
+            )
 
             nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
@@ -731,7 +731,10 @@ class SimulationMonitor(App):
             _cpu_max = row.get("cpu_max")
             if _cpu_max is not None and _cpu_max > 0:
                 _bins_val = _bins_cell(row["n_bins"], None)
-                _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
+                if row["status"] == "COMPLETED":
+                    _eta_val = Text("█" * 8, style="green")
+                else:
+                    _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
             else:
                 _nbin_target = (
                     None if row.get("has_checkpoint") else row.get("nbin_target")
