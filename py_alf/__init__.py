@@ -16,14 +16,26 @@ __all__ = [
     "PartitionSpec",
     "detect_partition_rules",
     "SubmissionReview",
+    "save_for_ssh",
+    "list_sessions",
+    "load_session_sims",
 ]
+
+_LAZY: dict[str, tuple[str, str]] = {
+    "SubmissionReview": (".submission_tui", "SubmissionReview"),
+    "save_for_ssh": (".submission_tui", "save_for_ssh"),
+    "list_sessions": (".monitor", "list_sessions"),
+    "load_session_sims": (".monitor", "load_session_sims"),
+}
 
 
 def __getattr__(name: str):
-    if name == "SubmissionReview":
-        from .submission_tui import SubmissionReview  # noqa: PLC0415
+    if name in _LAZY:
+        module_path, attr = _LAZY[name]
+        import importlib  # noqa: PLC0415
 
-        return SubmissionReview
+        mod = importlib.import_module(module_path, package=__name__)
+        return getattr(mod, attr)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
