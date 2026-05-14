@@ -85,5 +85,5 @@ def test_save_for_ssh_prints_confirmation(tmp_path, capsys):
     pkl = tmp_path / "state.pkl"
     save_for_ssh(_DummyCS(), [_DummySim(tmp_path / "sim0")], path=pkl)
     out = capsys.readouterr().out
-    assert "Saved" in out
     assert str(pkl) in out
+    assert "SubmissionReview" in out

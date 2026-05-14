@@ -879,7 +879,7 @@ class ClusterSubmitter:
                         self.partition_rules[selected].get("max_hours", slurm_time_h)
                     )
                     slurm_time_h = min(slurm_time_h, max_h)
-                extra["time"] = _hours_to_hms(slurm_time_h)
+                extra["time"] = int(slurm_time_h * 60)
             params["additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.

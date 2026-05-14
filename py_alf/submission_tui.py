@@ -343,10 +343,13 @@ def _arch_renderable(
 
     # SLURM wall time: use user-supplied slurm_time if present, otherwise
     # compute as CPU_MAX + 10% buffer capped at the partition limit.
-    fixed_slurm_time: str | None = (cs.slurm_kwargs or {}).get("slurm_time")
-    fixed_slurm_h: float | None = (
-        _parse_slurm_time_hours(fixed_slurm_time) if fixed_slurm_time else None
-    )
+    fixed_slurm_time: str | int | None = (cs.slurm_kwargs or {}).get("slurm_time")
+    if isinstance(fixed_slurm_time, int):
+        fixed_slurm_h: float | None = fixed_slurm_time / 60
+    elif fixed_slurm_time:
+        fixed_slurm_h = _parse_slurm_time_hours(fixed_slurm_time)
+    else:
+        fixed_slurm_h = None
     if fixed_slurm_h is not None:
         slurm_h = fixed_slurm_h
     else:
@@ -1013,7 +1016,11 @@ class SubmissionReview(App):
         if not wt_input.has_focus:
             fixed_slurm_time = (self._cs.slurm_kwargs or {}).get("slurm_time")
             if fixed_slurm_time:
-                wt_input.value = fixed_slurm_time
+                wt_input.value = (
+                    _hours_to_hms(fixed_slurm_time / 60)
+                    if isinstance(fixed_slurm_time, int)
+                    else fixed_slurm_time
+                )
             else:
                 # Use the first sim's CPU_MAX — SLURM arrays share a single --time
                 # derived from filtered_sims[0], so the display should not jump when
@@ -1431,7 +1438,7 @@ class SubmissionReview(App):
         hours = _parse_wall_time(val)
         if hours is not None and self._sims:
             if "slurm_time" in (self._cs.slurm_kwargs or {}):
-                self._cs.slurm_kwargs["slurm_time"] = _hours_to_hms(hours)
+                self._cs.slurm_kwargs["slurm_time"] = int(hours * 60)
             else:
                 for sim in self._sims:
                     _sim_dict_of(sim)["CPU_MAX"] = hours
