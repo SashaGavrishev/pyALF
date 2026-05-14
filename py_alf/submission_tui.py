@@ -388,9 +388,9 @@ def _arch_renderable(
     info.append("End by:    ", style="bold")
     if nbin_target:
         info.append(f"NBin={nbin_target}", style="bold")
-        info.append(f"  (CPU_MAX={_format_hours(timeout_h)} fallback)", style="dim")
+        info.append(f"  (CPU_MAX={_format_hours(_cpu_max)} fallback)", style="dim")
     else:
-        info.append(f"CPU_MAX={_format_hours(timeout_h)}")
+        info.append(f"CPU_MAX={_format_hours(_cpu_max)}")
     info.append("\n")
     info.append("Wall time: ", style="bold")
     info.append(f"{_hours_to_hms(slurm_h)}")
