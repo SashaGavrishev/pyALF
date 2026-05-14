@@ -24,6 +24,8 @@ def _make_mock_sim(sim_dir: Path, ham="Hubbard", n_omp=4, n_mpi=1, mpi=False):
     sim.n_mpi = n_mpi
     sim.mpi = mpi
     sim.sim_dict = {"U": 4.0, "beta": 10.0}
+    sim.job_id = None  # MagicMock auto-creates truthy attributes; pin to None so the
+    # monitor falls back to get_job_id() as it would for real Simulation objects.
     return sim
 
 
@@ -782,7 +784,9 @@ async def test_monitor_table_has_peak_mem_and_cpu_eff_columns(tmp_path, no_slurm
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        col_labels = [str(col.label) for col in app.query_one("DataTable").columns.values()]
+        col_labels = [
+            str(col.label) for col in app.query_one("DataTable").columns.values()
+        ]
     assert "Peak Mem" in col_labels
     assert "CPU Eff" in col_labels
 
