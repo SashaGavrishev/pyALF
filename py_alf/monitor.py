@@ -268,6 +268,7 @@ class _SessionEntry:
         "mpi",
         "sim_dict",
         "config",
+        "alf_dir",
         "job_id",
         "mpiexec",
         "mpiexec_args",
@@ -284,6 +285,8 @@ class _SessionEntry:
         job_id=None,
         mpiexec="mpiexec",
         mpiexec_args=None,
+        config="",
+        alf_dir=".",
         **_extra,
     ):
         self.sim_dir = sim_dir
@@ -292,7 +295,8 @@ class _SessionEntry:
         self.n_mpi = n_mpi
         self.mpi = mpi
         self.sim_dict = sim_dict
-        self.config = ""
+        self.config = config
+        self.alf_dir = alf_dir
         self.job_id = job_id
         self.mpiexec = mpiexec
         self.mpiexec_args = mpiexec_args or []
@@ -313,6 +317,8 @@ class _SessionEntry:
             self.mpi,
             self.mpiexec,
             self.mpiexec_args,
+            config=self.config,
+            alf_dir=self.alf_dir,
         )
 
 

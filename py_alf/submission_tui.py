@@ -35,6 +35,7 @@ from .cluster_submission import (
     _format_hours,
     _hours_to_hms,
     _parse_mem_gb,
+    _parse_slurm_time_hours,
 )
 from .simulation import Simulation
 
@@ -213,6 +214,8 @@ def _write_session_manifest(
             "mpiexec": getattr(sim, "mpiexec", "mpiexec"),
             "mpiexec_args": getattr(sim, "mpiexec_args", []),
             "sim_dict": dict(_sim_dict_of(sim)),
+            "config": getattr(sim, "config", ""),
+            "alf_dir": str(getattr(getattr(sim, "alf_src", None), "alf_dir", ".")),
         }
         for sim, jid in zip(submitted, job_ids)
     ]
@@ -338,11 +341,19 @@ def _arch_renderable(
         with contextlib.suppress(ValueError):
             mem_over = _parse_mem_gb(mem_str) > max_mem_gb
 
-    # SLURM wall time = CPU_MAX + 10% buffer, capped at partition limit.
-    slurm_h_raw = timeout_h * 1.1
-    slurm_h = slurm_h_raw
-    if partition != "---" and p_spec:
-        slurm_h = min(slurm_h_raw, float(p_spec.get("max_hours", slurm_h_raw)))
+    # SLURM wall time: use user-supplied slurm_time if present, otherwise
+    # compute as CPU_MAX + 10% buffer capped at the partition limit.
+    fixed_slurm_time: str | None = (cs.slurm_kwargs or {}).get("slurm_time")
+    fixed_slurm_h: float | None = (
+        _parse_slurm_time_hours(fixed_slurm_time) if fixed_slurm_time else None
+    )
+    if fixed_slurm_h is not None:
+        slurm_h = fixed_slurm_h
+    else:
+        slurm_h_raw = timeout_h * 1.1
+        slurm_h = slurm_h_raw
+        if partition != "---" and p_spec:
+            slurm_h = min(slurm_h_raw, float(p_spec.get("max_hours", slurm_h_raw)))
 
     info = RichText()
     info.append("\n")
@@ -367,7 +378,9 @@ def _arch_renderable(
     info.append("\n")
     info.append("Wall time: ", style="bold")
     info.append(f"{_hours_to_hms(slurm_h)}")
-    if slurm_h < slurm_h_raw - 0.0001:
+    if fixed_slurm_h is not None:
+        info.append("  (slurm_time)", style="dim")
+    elif slurm_h < slurm_h_raw - 0.0001:
         info.append("  (partition cap)", style="dim")
     else:
         info.append("  (CPU_MAX +10%)", style="dim")
@@ -883,6 +896,10 @@ class SubmissionReview(App):
         _slurm = self._executor_state == "slurm"
         self.query_one("#partition-row").display = _slurm
         self.query_one("#walltime-note").display = _slurm
+        if _slurm and (self._cs.slurm_kwargs or {}).get("slurm_time"):
+            self.query_one("#walltime-note", Static).update(
+                "[dim]Overrides SLURM --time directly (slurm_time)[/dim]"
+            )
         self._setup_table()
         self._refresh_all()
         self.call_after_refresh(self._remove_ansi_scrollbar_class)
@@ -994,13 +1011,17 @@ class SubmissionReview(App):
 
         wt_input = self.query_one("#walltime-input", Input)
         if not wt_input.has_focus:
-            # Use the first sim's CPU_MAX — SLURM arrays share a single --time
-            # derived from filtered_sims[0], so the display should not jump when
-            # the cursor moves between rows.
-            array_timeout_h = max(
-                0.0, float(_sim_dict_of(self._sims[0]).get("CPU_MAX", 24))
-            )
-            wt_input.value = _hours_to_hms(array_timeout_h)
+            fixed_slurm_time = (self._cs.slurm_kwargs or {}).get("slurm_time")
+            if fixed_slurm_time:
+                wt_input.value = fixed_slurm_time
+            else:
+                # Use the first sim's CPU_MAX — SLURM arrays share a single --time
+                # derived from filtered_sims[0], so the display should not jump when
+                # the cursor moves between rows.
+                array_timeout_h = max(
+                    0.0, float(_sim_dict_of(self._sims[0]).get("CPU_MAX", 24))
+                )
+                wt_input.value = _hours_to_hms(array_timeout_h)
 
         nbin_target = sd.get("NBin") or sd.get("Nbin")
         if nbin_target:
@@ -1409,8 +1430,11 @@ class SubmissionReview(App):
         val = self.query_one("#walltime-input", Input).value
         hours = _parse_wall_time(val)
         if hours is not None and self._sims:
-            for sim in self._sims:
-                _sim_dict_of(sim)["CPU_MAX"] = hours
+            if "slurm_time" in (self._cs.slurm_kwargs or {}):
+                self._cs.slurm_kwargs["slurm_time"] = _hours_to_hms(hours)
+            else:
+                for sim in self._sims:
+                    _sim_dict_of(sim)["CPU_MAX"] = hours
             self._refresh_right_panel()
             self._refresh_submit_button()
 

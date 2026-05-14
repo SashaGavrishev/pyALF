@@ -25,7 +25,7 @@ from colorama import Fore
 from tabulate import tabulate
 from tqdm import tqdm
 
-from .simulation import Simulation
+from .simulation import Simulation, getenv
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +382,8 @@ def _exec_alf_binary(
     mpi: bool,
     mpiexec: str = "mpiexec",
     mpiexec_args: list[str] | None = None,
+    config: str = "",
+    alf_dir: str = ".",
 ) -> None:
     """Execute the ALF binary already present in *sim_dir*.
 
@@ -393,7 +395,7 @@ def _exec_alf_binary(
 
     sim_dir_path = Path(sim_dir)
     executable = os.path.join(str(sim_dir), "ALF.out")
-    env = os.environ.copy()
+    env = getenv(config, alf_dir)
     # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
     # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
     env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
@@ -440,6 +442,8 @@ def _run_alf(sim: Simulation) -> None:
         getattr(sim, "mpi", False),
         mpiexec=getattr(sim, "mpiexec", "mpiexec"),
         mpiexec_args=getattr(sim, "mpiexec_args", []),
+        config=getattr(sim, "config", ""),
+        alf_dir=getattr(sim.alf_src, "alf_dir", "."),
     )
 
 
