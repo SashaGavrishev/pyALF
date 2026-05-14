@@ -48,12 +48,20 @@ def _sim_dict_of(sim: Simulation) -> dict:
     return d[0] if isinstance(d, list) else d
 
 
+_EXCLUDED_PARAM_KEYS_LOWER = frozenset({"model", "cpu_max"})
+
+
 def _all_param_keys(sims: list[Simulation]) -> list[str]:
-    """Union of all sim_dict keys across all sims, preserving first-seen order."""
+    """Union of all sim_dict keys across all sims, preserving first-seen order.
+
+    Keys in _EXCLUDED_PARAM_KEYS_LOWER are omitted: Model is implementation
+    detail noise; CPU_MAX is surfaced globally via the wall-time input.
+    """
     seen: dict[str, None] = {}
     for sim in sims:
         for k in _sim_dict_of(sim):
-            seen[k] = None
+            if k.lower() not in _EXCLUDED_PARAM_KEYS_LOWER:
+                seen[k] = None
     return list(seen)
 
 
@@ -76,6 +84,14 @@ def _coerce(raw: str, original: object) -> object:
         except ValueError:
             return original
     return raw
+
+
+def _relative_or_abs(p: Path) -> str:
+    """Return p relative to cwd, falling back to absolute if outside cwd."""
+    try:
+        return str(p.relative_to(Path.cwd()))
+    except ValueError:
+        return str(p)
 
 
 def _parse_wall_time(s: str) -> float | None:
@@ -228,6 +244,7 @@ def _arch_renderable(
     executor: str,
     cs: ClusterSubmitter,
     mem_display: str | None = None,
+    partition_override: str | None = None,
 ) -> object:
     """Return a Rich renderable describing the job's resource layout."""
     if executor in ("local", "debug"):
@@ -252,9 +269,14 @@ def _arch_renderable(
     nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
     try:
-        partition = cs._select_partition(timeout_h)
-        p_spec = cs.partition_rules[partition]
-        p_note = f"CPU_MAX={_format_hours(timeout_h)}  ≤  {_format_hours(p_spec['max_hours'])} limit"
+        if partition_override:
+            partition = partition_override
+            p_spec = (cs.partition_rules or {}).get(partition, {})
+            p_note = f"manual override"
+        else:
+            partition = cs._select_partition(timeout_h)
+            p_spec = cs.partition_rules[partition]
+            p_note = f"CPU_MAX={_format_hours(timeout_h)}  ≤  {_format_hours(p_spec['max_hours'])} limit"
     except ValueError:
         partition = "---"
         p_spec = {}
@@ -410,12 +432,6 @@ class EditSimScreen(ModalScreen):
                 yield Input(
                     str(self._sd.get(key, "")), id=f"field-{key}", placeholder=key
                 )
-            yield Label("n_omp")
-            yield Input(
-                str(self._sim.n_omp), id="field-n_omp", placeholder="OMP threads"
-            )
-            yield Label("n_mpi")
-            yield Input(str(self._sim.n_mpi), id="field-n_mpi", placeholder="MPI ranks")
             with Horizontal(id="edit-buttons"):
                 yield Button("Save", id="btn-save", variant="primary")
                 yield Button("Save to All", id="btn-save-all", variant="warning")
@@ -431,14 +447,6 @@ class EditSimScreen(ModalScreen):
                 self._sd[key] = _coerce(widget.value, self._sd.get(key, ""))
             except Exception:
                 pass
-        with contextlib.suppress(ValueError, AttributeError):
-            self._sim.n_omp = int(self.query_one("#field-n_omp", Input).value)
-        try:
-            n_mpi = int(self.query_one("#field-n_mpi", Input).value)
-            self._sim.n_mpi = n_mpi
-            self._sim.mpi = n_mpi > 1
-        except (ValueError, AttributeError):
-            pass
 
     @on(Button.Pressed, "#btn-save")
     def _save(self) -> None:
@@ -697,6 +705,9 @@ class SubmissionReview(App):
         _nbin_val = _first_sd.get("NBin") or _first_sd.get("Nbin")
         self._end_mode: str = "nbin" if _nbin_val else "cpu_max"
         self._nbin_initial: str = str(_nbin_val) if _nbin_val else "40"
+        # Manual overrides for partition and OMP (arch-col inputs)
+        self._manual_partition: str | None = None
+        self._manual_omp: int | None = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -726,16 +737,11 @@ class SubmissionReview(App):
                             )
                     yield Label("Settings", classes="hd")
                     with Horizontal(classes="sr"):
-                        yield Label("Memory", classes="sl")
-                        yield Input(
-                            self._cs.slurm_mem or "", id="mem-input", placeholder="4G"
-                        )
-                    with Horizontal(classes="sr"):
                         yield Label("Submit dir", classes="sl")
                         yield Input(
-                            str(self._cs.submit_dir),
+                            _relative_or_abs(self._cs.submit_dir),
                             id="dir-input",
-                            placeholder="submitit",
+                            placeholder=".alfmonitor",
                         )
                     with Horizontal(classes="sr"):
                         yield Label("Job name", classes="sl")
@@ -777,6 +783,21 @@ class SubmissionReview(App):
                 with ScrollableContainer(id="arch-col"):
                     yield Label("Architecture", classes="hd")
                     yield Static("", id="arch-panel")
+                    with Horizontal(classes="sr"):
+                        yield Label("OMP", classes="sl")
+                        yield Input(
+                            str(self._sims[0].n_omp) if self._sims else "1",
+                            id="omp-input",
+                            placeholder="threads",
+                        )
+                    with Horizontal(classes="sr"):
+                        yield Label("Memory", classes="sl")
+                        yield Input(
+                            self._cs.slurm_mem or "", id="mem-input", placeholder="4G"
+                        )
+                    with Horizontal(classes="sr", id="partition-row"):
+                        yield Label("Partition", classes="sl")
+                        yield Input("", id="partition-input", placeholder="(auto)")
                     yield Label("Machine", classes="hd")
                     yield Static("", id="machine-panel")
                     yield Label("Schedule", classes="hd")
@@ -815,8 +836,10 @@ class SubmissionReview(App):
     def on_mount(self) -> None:
         self.register_theme(_MONO_THEME)
         self.theme = "submission-mono"
-        self._has_mpi_column: bool = any(getattr(s, "mpi", False) for s in self._sims)
         self.query_one("#nbin-row").display = self._end_mode == "nbin"
+        _slurm = self._executor_state == "slurm"
+        self.query_one("#partition-row").display = _slurm
+        self.query_one("#walltime-note").display = _slurm
         self._setup_table()
         self._refresh_all()
         self.call_after_refresh(self._remove_ansi_scrollbar_class)
@@ -839,9 +862,6 @@ class SubmissionReview(App):
         table.add_column("Hamiltonian", key="ham")
         for key, hdr in zip(self._param_keys, self._param_headers):
             table.add_column(hdr, key=key)
-        table.add_column("OMP", key="omp", width=5)
-        if self._has_mpi_column:
-            table.add_column("MPI", key="mpi_r", width=5)
         self._repopulate_table()
 
     def _repopulate_table(self) -> None:
@@ -858,9 +878,6 @@ class SubmissionReview(App):
             row = [mark, str(i), sim.ham_name]
             for key in self._param_keys:
                 row.append(str(sd.get(key, "—")))
-            row.append(str(sim.n_omp))
-            if self._has_mpi_column:
-                row.append(str(sim.n_mpi if sim.mpi else 1))
             table.add_row(*row, key=str(i))
         if self._sims:
             table.move_cursor(row=min(saved_row, len(self._sims) - 1))
@@ -875,9 +892,6 @@ class SubmissionReview(App):
         table.add_column("Hamiltonian", key="ham")
         for key, hdr in zip(self._param_keys, self._param_headers):
             table.add_column(hdr, key=key)
-        table.add_column("OMP", key="omp", width=5)
-        if self._has_mpi_column:
-            table.add_column("MPI", key="mpi_r", width=5)
         for i, sim in enumerate(self._sims):
             sd = _sim_dict_of(sim)
             mark = (
@@ -888,9 +902,6 @@ class SubmissionReview(App):
             row = [mark, str(i), sim.ham_name]
             for key in self._param_keys:
                 row.append(str(sd.get(key, "—")))
-            row.append(str(sim.n_omp))
-            if self._has_mpi_column:
-                row.append(str(sim.n_mpi if sim.mpi else 1))
             table.add_row(*row, key=str(i))
         if self._sims:
             table.move_cursor(row=min(saved_row, len(self._sims) - 1))
@@ -922,8 +933,17 @@ class SubmissionReview(App):
         timeout_h = max(0.0, float(sd.get("CPU_MAX", 24)))
         mem = self.query_one("#mem-input", Input).value or (self._cs.slurm_mem or "")
 
+        omp_input = self.query_one("#omp-input", Input)
+        if not omp_input.has_focus:
+            omp_input.value = str(sim.n_omp)
         self.query_one("#arch-panel", Static).update(
-            _arch_renderable(sim, self._executor_state, self._cs, mem_display=mem)
+            _arch_renderable(
+                sim,
+                self._executor_state,
+                self._cs,
+                mem_display=mem,
+                partition_override=self._manual_partition,
+            )
         )
 
         config_str = getattr(sim, "config", "") or "—"
@@ -964,10 +984,17 @@ class SubmissionReview(App):
             if not sel:
                 continue
             timeout_h = max(0.0, float(_sim_dict_of(sim).get("CPU_MAX", 24)))
-            try:
-                partition = self._cs._select_partition(timeout_h)
-            except ValueError:
-                return True
+            if self._manual_partition:
+                partition = self._manual_partition
+                # Manual partition may not be in partition_rules — skip limit check
+                # (limits are unknown; ClusterSubmitter will enforce at submit time).
+                if partition not in self._cs.partition_rules:
+                    continue
+            else:
+                try:
+                    partition = self._cs._select_partition(timeout_h)
+                except ValueError:
+                    return True
             try:
                 self._cs._check_node_fit(sim, partition, slurm_mem=mem_str or None)
             except ValueError:
@@ -997,6 +1024,9 @@ class SubmissionReview(App):
         self._executor_state = executor
         for ex in ("slurm", "local", "debug"):
             self.query_one(f"#exec-{ex}", Button).label = _btn_label(ex, ex == executor)
+        _slurm = executor == "slurm"
+        self.query_one("#partition-row").display = _slurm
+        self.query_one("#walltime-note").display = _slurm
         self._refresh_right_panel()
         self._refresh_submit_button()
 
@@ -1018,7 +1048,10 @@ class SubmissionReview(App):
         self._is_submitting = True
         self._refresh_submit_button()
         self._show_progress_view(selected_sims)
-        self._run_submission(cs, selected_sims)
+        job_properties: dict = {}
+        if self._manual_partition:
+            job_properties["slurm_partition"] = self._manual_partition
+        self._run_submission(cs, selected_sims, job_properties or None)
 
     def _show_progress_view(self, sims: list[Simulation]) -> None:
         self.query_one("#sim-table").display = False
@@ -1086,7 +1119,12 @@ class SubmissionReview(App):
         done.update(label)
 
     @work(thread=True)
-    def _run_submission(self, cs: ClusterSubmitter, sims: list[Simulation]) -> None:
+    def _run_submission(
+        self,
+        cs: ClusterSubmitter,
+        sims: list[Simulation],
+        job_properties: dict | None = None,
+    ) -> None:
         # Snapshot existing job IDs so we can identify which sims are newly submitted.
         old_jids: dict[str, str | None] = {}
         for sim in sims:
@@ -1099,7 +1137,7 @@ class SubmissionReview(App):
             self.call_from_thread(self._set_progress, i, "preparing")
 
         try:
-            jobs = cs.submit(sims)
+            jobs = cs.submit(sims, job_properties=job_properties, confirm_checkpoint=False)
         except Exception as exc:
             for i in range(len(sims)):
                 self.call_from_thread(self._set_progress, i, "failed", str(exc))
@@ -1169,7 +1207,17 @@ class SubmissionReview(App):
                 severity="error",
             )
             return
+        checkpoint_count = sum(
+            1
+            for s, sel in zip(self._sims, self._selected)
+            if sel and any(Path(str(s.sim_dir)).glob("confin_*"))
+        )
         msg = f"Submit {n_sel} simulation(s)?"
+        if checkpoint_count:
+            msg += (
+                f"\n\n⚠  {checkpoint_count} checkpoint restart(s) detected."
+                "\nALF will append to existing data.h5."
+            )
 
         def _confirmed(result: bool | None) -> None:
             if result:
@@ -1191,29 +1239,26 @@ class SubmissionReview(App):
         row = table.cursor_row
         if 0 <= row < len(self._sims):
             sim = self._sims[row]
+            edit_keys = _all_param_keys([sim])
 
             def on_done(result: object) -> None:
                 if result is None:
                     return
+                if result == "all":
+                    sd_src = _sim_dict_of(sim)
+                    for s in self._sims:
+                        if s is not sim:
+                            sd_dst = _sim_dict_of(s)
+                            for k in edit_keys:
+                                if k in sd_src:
+                                    sd_dst[k] = sd_src[k]
+                    self.notify(f"Applied parameters to all {len(self._sims)} sims.")
                 self._repopulate_table()
                 self._refresh_right_panel()
                 self._refresh_end_mode_display()
-                if result == "all":
-                    n_omp, n_mpi, mpi = sim.n_omp, sim.n_mpi, sim.mpi
-                    for s in self._sims:
-                        if s is not sim:
-                            with contextlib.suppress(AttributeError):
-                                s.n_omp = n_omp
-                            with contextlib.suppress(AttributeError):
-                                s.n_mpi = n_mpi
-                                s.mpi = mpi
-                    self._repopulate_table()
-                    self.notify(
-                        f"Applied n_omp={n_omp}, n_mpi={n_mpi} to all {len(self._sims)} sims."
-                    )
 
             self.push_screen(
-                EditSimScreen(sim, _all_param_keys([sim])),
+                EditSimScreen(sim, edit_keys),
                 callback=on_done,
             )
 
@@ -1294,6 +1339,7 @@ class SubmissionReview(App):
     @on(Input.Changed, "#mem-input")
     def _on_mem_changed(self) -> None:
         self._refresh_right_panel()
+        self._refresh_submit_button()
 
     @on(Input.Changed, "#dir-input")
     def _on_dir_changed(self) -> None:
@@ -1308,6 +1354,29 @@ class SubmissionReview(App):
                 _sim_dict_of(sim)["CPU_MAX"] = hours
             self._refresh_right_panel()
             self._refresh_submit_button()
+
+    @on(Input.Changed, "#omp-input")
+    def _on_omp_changed(self) -> None:
+        try:
+            n_omp = int(self.query_one("#omp-input", Input).value)
+        except ValueError:
+            return
+        if n_omp < 1:
+            return
+        self._manual_omp = n_omp
+        for sim in self._sims:
+            with contextlib.suppress(AttributeError):
+                sim.n_omp = n_omp
+        self._repopulate_table()
+        self._refresh_right_panel()
+        self._refresh_submit_button()
+
+    @on(Input.Changed, "#partition-input")
+    def _on_partition_changed(self) -> None:
+        val = self.query_one("#partition-input", Input).value.strip()
+        self._manual_partition = val or None
+        self._refresh_right_panel()
+        self._refresh_submit_button()
 
     @on(Button.Pressed, "#mail-end")
     def _on_mail_end(self) -> None:
@@ -1433,3 +1502,45 @@ class SubmissionReview(App):
     @on(Button.Pressed, "#btn-submit")
     def _on_submit_pressed(self) -> None:
         self.action_submit()
+
+
+# ---------------------------------------------------------------------------
+# SSH helper
+# ---------------------------------------------------------------------------
+
+
+def save_for_ssh(
+    cs: ClusterSubmitter,
+    sims: list,
+    path: str | Path | None = None,
+) -> None:
+    """Pickle submission state and print the command to launch the TUI over SSH.
+
+    Call this from a Jupyter notebook cell after building ``cs`` and ``sims``.
+    It saves the objects to a temporary file and prints a one-liner to paste
+    into the VS Code integrated terminal (or any SSH shell) to open the
+    submission review followed by the monitor.
+
+    Parameters
+    ----------
+    cs : ClusterSubmitter
+        Configured submitter.
+    sims : list of Simulation
+        Simulation objects to submit.
+    path : str or Path, optional
+        Pickle destination. Defaults to ``/tmp/alf_tui_state.pkl``.
+    """
+    import pickle
+
+    path = Path("/tmp/alf_tui_state.pkl") if path is None else Path(path)
+
+    with open(path, "wb") as f:
+        pickle.dump({"sims": sims, "cs": cs}, f)
+
+    cmd = (
+        f'python -c "'
+        f"import pickle; from py_alf.submission_tui import SubmissionReview; "
+        f"d=pickle.load(open('{path}','rb')); "
+        f"SubmissionReview(d['cs'],d['sims']).run_with_monitor()\""
+    )
+    print(cmd)

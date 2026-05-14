@@ -65,7 +65,7 @@ class Simulation:
     parallel_params : bool, default=False
         Run independent parameter sets in parallel.
         Based on parallel tempering, but without exchange steps.
-    n_mpi : int, default=2
+    n_mpi : int, default=1
         Number of MPI processes if mpi is true.
     n_omp : int, default=1
         Number of OpenMP threads per process.
@@ -113,7 +113,7 @@ class Simulation:
             sim_root, dir_component)))
         self.mpi = kwargs.pop("mpi", False)
         self.parallel_params = kwargs.pop("parallel_params", False)
-        self.n_mpi = kwargs.pop("n_mpi", 2)
+        self.n_mpi = kwargs.pop("n_mpi", 1)
         self.n_omp = kwargs.pop('n_omp', 1)
         self.mpiexec = kwargs.pop('mpiexec', 'mpiexec')
         self.mpiexec_args = kwargs.pop('mpiexec_args', [])

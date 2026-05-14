@@ -7,6 +7,7 @@ import pytest
 
 from py_alf.cluster_submission import (
     ClusterSubmitter,
+    _exec_alf_binary,
     _find_job_log,
     _get_jobs_resources_bulk,
     _normalise_partition_spec,
@@ -1055,9 +1056,10 @@ def _clear_cache(*jids):
 
 def test_get_jobs_resources_bulk_parses_memory_and_efficiency():
     _clear_cache("RES_BASIC")
+    # --parsable2 uses "|" as delimiter
     sacct_out = (
-        "RES_BASIC      8192K  01:30:00  04:00:00\n"
-        "RES_BASIC.batch 8192K  01:30:00  04:00:00\n"
+        "RES_BASIC|8192K|01:30:00|04:00:00\n"
+        "RES_BASIC.batch|8192K|01:30:00|04:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_BASIC"])
@@ -1069,8 +1071,8 @@ def test_get_jobs_resources_bulk_takes_max_rss_across_steps():
     """The peak RSS is the maximum across the job step and its substeps."""
     _clear_cache("RES_MAX")
     sacct_out = (
-        "RES_MAX       4096K  01:00:00  04:00:00\n"
-        "RES_MAX.batch 8192K  01:00:00  04:00:00\n"
+        "RES_MAX|4096K|01:00:00|04:00:00\n"
+        "RES_MAX.batch|8192K|01:00:00|04:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_MAX"])
@@ -1079,7 +1081,7 @@ def test_get_jobs_resources_bulk_takes_max_rss_across_steps():
 
 def test_get_jobs_resources_bulk_large_memory_shows_gigabytes():
     _clear_cache("RES_LARGE")
-    sacct_out = "RES_LARGE  4194304K  02:00:00  08:00:00\n"  # 4 GB
+    sacct_out = "RES_LARGE|4194304K|02:00:00|08:00:00\n"  # 4 GB
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_LARGE"])
     assert result["RES_LARGE"]["max_rss"] is not None
@@ -1088,7 +1090,7 @@ def test_get_jobs_resources_bulk_large_memory_shows_gigabytes():
 
 def test_get_jobs_resources_bulk_zero_rss_returns_none():
     _clear_cache("RES_ZERO")
-    sacct_out = "RES_ZERO  0  01:00:00  04:00:00\n"
+    sacct_out = "RES_ZERO|0|01:00:00|04:00:00\n"
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["RES_ZERO"])
     assert result["RES_ZERO"]["max_rss"] is None
@@ -1097,8 +1099,8 @@ def test_get_jobs_resources_bulk_zero_rss_returns_none():
 def test_get_jobs_resources_bulk_array_task_id():
     _clear_cache("88888_3")
     sacct_out = (
-        "88888_3       4096K  00:30:00  02:00:00\n"
-        "88888_3.batch 8192K  00:30:00  02:00:00\n"
+        "88888_3|4096K|00:30:00|02:00:00\n"
+        "88888_3.batch|8192K|00:30:00|02:00:00\n"
     )
     with _mock_subprocess(sacct_out):
         result = _get_jobs_resources_bulk(["88888_3"])
@@ -1109,7 +1111,7 @@ def test_get_jobs_resources_bulk_array_task_id():
 def test_get_jobs_resources_bulk_caches_result():
     """sacct is called only once; subsequent calls for the same ID use the cache."""
     _clear_cache("RES_CACHED")
-    sacct_out = "RES_CACHED  4096K  01:00:00  04:00:00\n"
+    sacct_out = "RES_CACHED|4096K|01:00:00|04:00:00\n"
     with _mock_subprocess(sacct_out) as mock_run:
         _get_jobs_resources_bulk(["RES_CACHED"])
         _get_jobs_resources_bulk(["RES_CACHED"])
@@ -1119,3 +1121,50 @@ def test_get_jobs_resources_bulk_caches_result():
 def test_get_jobs_resources_bulk_empty_input():
     result = _get_jobs_resources_bulk([])
     assert result == {}
+
+
+# --- _exec_alf_binary data.h5 backup ---
+
+
+def test_exec_alf_binary_backs_up_data_on_fresh_run(tmp_path):
+    """data.h5 is renamed before a fresh run (no confin_* present)."""
+    data = tmp_path / "data.h5"
+    data.write_bytes(b"old")
+    binary = tmp_path / "ALF.out"
+    binary.touch()
+
+    with (
+        patch("subprocess.run"),
+        patch.dict("os.environ", {"SLURM_JOB_ID": "99999"}, clear=False),
+    ):
+        _exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
+
+    assert not data.exists(), "data.h5 should have been renamed"
+    assert (tmp_path / "data_99999.h5").exists(), "backup file should exist"
+
+
+def test_exec_alf_binary_preserves_data_on_checkpoint_restart(tmp_path):
+    """data.h5 is left untouched when confin_* files are present."""
+    data = tmp_path / "data.h5"
+    data.write_bytes(b"accumulated")
+    (tmp_path / "confin_0").touch()
+    binary = tmp_path / "ALF.out"
+    binary.touch()
+
+    with patch("subprocess.run"):
+        _exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
+
+    assert data.exists(), "data.h5 must not be touched during checkpoint restart"
+    assert data.read_bytes() == b"accumulated"
+
+
+def test_exec_alf_binary_no_backup_when_no_data(tmp_path):
+    """No error and no backup file when data.h5 does not exist."""
+    binary = tmp_path / "ALF.out"
+    binary.touch()
+
+    with patch("subprocess.run"):
+        _exec_alf_binary(tmp_path, n_omp=1, n_mpi=1, mpi=False)
+
+    backups = list(tmp_path.glob("data_*.h5"))
+    assert backups == []

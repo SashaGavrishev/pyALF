@@ -16,6 +16,7 @@ __all__ = [
     "PartitionSpec",
     "detect_partition_rules",
     "SubmissionReview",
+    "save_for_ssh",
 ]
 
 
@@ -24,6 +25,10 @@ def __getattr__(name: str):
         from .submission_tui import SubmissionReview  # noqa: PLC0415
 
         return SubmissionReview
+    if name == "save_for_ssh":
+        from .submission_tui import save_for_ssh  # noqa: PLC0415
+
+        return save_for_ssh
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

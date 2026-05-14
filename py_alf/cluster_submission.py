@@ -280,7 +280,7 @@ def detect_partition_rules(
             continue
 
         try:
-            mem_mb = int(mem_raw.strip())
+            mem_mb = int(mem_raw.strip().rstrip("+"))
         except ValueError:
             logger.warning(
                 "detect_partition_rules: cannot parse memory %r for %r — skipping row",
@@ -391,9 +391,33 @@ def _exec_alf_binary(
     """
     from .simulation import cd
 
+    sim_dir_path = Path(sim_dir)
     executable = os.path.join(str(sim_dir), "ALF.out")
     env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = str(n_omp)
+    # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
+    # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
+    env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
+
+    # Guard against overwriting data from a previous independent run.
+    # When confin_* files are present ALF will checkpoint-restart and
+    # accumulate bins into the existing data.h5 — the intended behaviour.
+    # When no confin_* exist ALF starts fresh and would overwrite data.h5.
+    # In that case we archive the old file under the current SLURM job ID
+    # so it is not lost.
+    has_checkpoint = any(
+        name.startswith("confin_") for name in os.listdir(sim_dir_path)
+    )
+    if not has_checkpoint:
+        data_file = sim_dir_path / "data.h5"
+        if data_file.exists():
+            import time as _time
+            job_id = (
+                os.environ.get("SLURM_ARRAY_JOB_ID")
+                or os.environ.get("SLURM_JOB_ID")
+            )
+            suffix = job_id if job_id else str(int(_time.time()))
+            data_file.rename(sim_dir_path / f"data_{suffix}.h5")
+
     if mpi:
         cmd: list[str] = [mpiexec, "-n", str(n_mpi), *(mpiexec_args or []), executable]
     else:
@@ -657,6 +681,7 @@ class ClusterSubmitter:
         sims: Simulation | Iterable[Simulation],
         job_properties: dict[str, Any] | None = None,
         submit_dir: str | Path | None = None,
+        confirm_checkpoint: bool = True,
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -745,6 +770,26 @@ class ClusterSubmitter:
             logger.info("No inactive simulations to submit.")
             return []
 
+        if confirm_checkpoint:
+            checkpoint_sims = [
+                s
+                for s in filtered_sims
+                if any(Path(s.sim_dir).glob("confin_*"))
+            ]
+            if checkpoint_sims:
+                names = ", ".join(
+                    Path(s.sim_dir).name for s in checkpoint_sims[:3]
+                )
+                if len(checkpoint_sims) > 3:
+                    names += f" … ({len(checkpoint_sims)} total)"
+                print(
+                    f"Checkpoint restart detected: {names}\n"
+                    "ALF will append to existing data.h5 instead of starting fresh."
+                )
+                choice = input("Continue? [Y/n]: ").strip().lower()
+                if choice in ("n", "no"):
+                    return []
+
         sim = filtered_sims[0]
 
         # Guard: all sims in an array job must share the same resource shape,
@@ -819,14 +864,18 @@ class ClusterSubmitter:
             extra = dict(params.get("additional_parameters") or {})
             # Add 10% buffer so ALF can finish writing output after CPU_MAX;
             # cap at the selected partition's wall-time limit.
-            slurm_time_h = timeout_hours * 1.1
-            selected = params.get("slurm_partition")
-            if selected and self.partition_rules and selected in self.partition_rules:
-                max_h = float(
-                    self.partition_rules[selected].get("max_hours", slurm_time_h)
-                )
-                slurm_time_h = min(slurm_time_h, max_h)
-            extra.setdefault("time", _hours_to_hms(slurm_time_h))
+            # Skip auto-computation when the caller already supplied slurm_time
+            # (a submitit-style kwarg) or an explicit "time" in additional_parameters,
+            # so user-set wall times are never silently overwritten.
+            if "slurm_time" not in params and "time" not in extra:
+                slurm_time_h = timeout_hours * 1.1
+                selected = params.get("slurm_partition")
+                if selected and self.partition_rules and selected in self.partition_rules:
+                    max_h = float(
+                        self.partition_rules[selected].get("max_hours", slurm_time_h)
+                    )
+                    slurm_time_h = min(slurm_time_h, max_h)
+                extra["time"] = _hours_to_hms(slurm_time_h)
             params["additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.
@@ -1168,13 +1217,16 @@ def _get_jobs_resources_bulk(
                     "--format=JobID,MaxRSS,TotalCPU,CPUTime",
                     "--noheader",
                     "--array",
+                    "--parsable2",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             for line in proc.stdout.strip().splitlines():
-                cols = line.split()
+                # --parsable2 uses "|" as delimiter; empty fields stay as empty
+                # strings (no column misalignment when MaxRSS is unset)
+                cols = line.split("|")
                 if len(cols) < 4:
                     continue
                 raw_jid, rss_str, total_cpu_str, cpu_time_str = cols[:4]
