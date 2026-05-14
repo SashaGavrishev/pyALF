@@ -27,7 +27,7 @@ _RULES = {"short": 8, "long": 168}
 def test_init_defaults():
     cs = ClusterSubmitter(slurm_mem="2G", partition_rules=_RULES)
     assert cs.executor == "slurm"
-    assert cs.submit_dir.name == "array_submission"
+    assert cs.submit_dir.name == ".alfmonitor"
     assert cs.submit_dir.is_absolute()
     assert cs.slurm_mem == "2G"
     # partition_rules is normalised to PartitionSpec dicts at construction time
