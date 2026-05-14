@@ -33,6 +33,7 @@ from .cluster_submission import (
     _find_job_log,
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
+    _is_submitit_timeout,
     cancel_cluster_job,
     get_job_id,
 )
@@ -41,9 +42,13 @@ from .simulation import Simulation
 _STATUS_COLORS: dict[str, str] = {
     "RUNNING": "bold green",
     "PENDING": "bold yellow",
+    "COMPLETING": "bold yellow",
     "FAILED": "bold red",
     "CANCELLED": "bold red",
     "TIMEOUT": "bold red",
+    "OUT_OF_MEMORY": "bold red",
+    "NODE_FAIL": "bold red",
+    "PREEMPTED": "bold yellow",
     "CRASHED": "bold red",
     "COMPLETED": "blue",
     "INACTIVE": "dim",
@@ -629,6 +634,12 @@ class SimulationMonitor(App):
                 status = se.get("status", "UNKNOWN")
                 runtime = se.get("runtime")
                 nodelist = se.get("nodelist")
+                if (
+                    status in {"FAILED", "COMPLETED"}
+                    and self._submit_dir is not None
+                    and _is_submitit_timeout(jobid, self._submit_dir, status=status)
+                ):
+                    status = "TIMEOUT"
             else:
                 running_file = Path(sim.sim_dir) / "RUNNING"
                 status = "CRASHED" if running_file.exists() else "INACTIVE"

@@ -1036,6 +1036,19 @@ def get_job_id(sim: Simulation) -> str | None:
         return jobid_file.read_text().strip()
 
 
+def _normalize_slurm_state(raw: str) -> str:
+    """Return a canonical SLURM state from a raw sacct or squeue value.
+
+    sacct truncates state strings to its column width and appends ``+``, e.g.
+    ``CANCELLED+`` (cancelled by uid) or ``OUT_OF_ME+`` (out of memory).
+    This strips the truncation marker and restores full names.
+    """
+    state = raw.split()[0].rstrip("+")
+    if state == "OUT_OF_ME":
+        return "OUT_OF_MEMORY"
+    return state
+
+
 def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
     """
     Query SLURM sacct for job status, elapsed time, and allocated node.
@@ -1060,7 +1073,7 @@ def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
         for line in lines:
             parts = line.split()
             if len(parts) >= 1:
-                state = parts[0]
+                state = _normalize_slurm_state(parts[0])
                 runtime = parts[1] if len(parts) > 1 else None
                 raw_node = parts[2] if len(parts) > 2 else None
                 return {
@@ -1098,7 +1111,7 @@ def _get_slurm_status_bulk_sacct(
             parts = line.split()
             if len(parts) >= 2:
                 jobid = parts[0]
-                state = parts[1]
+                state = _normalize_slurm_state(parts[1])
                 runtime = parts[2] if len(parts) > 2 else None
                 raw_node = parts[3] if len(parts) > 3 else None
                 status_map[jobid] = {
@@ -1179,11 +1192,11 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
                 if len(parts) < 4:
                     logger.warning(f"Unexpected squeue output line: '{line}'")
                     continue
-                jid, idx, state, runtime = parts[:4]
+                jid, idx, raw_state, runtime = parts[:4]
                 raw_node = parts[4] if len(parts) > 4 else None
                 full_id = jid if idx == "N/A" else idx
                 status_map[full_id] = {
-                    "status": state,
+                    "status": _normalize_slurm_state(raw_state),
                     "runtime": runtime,
                     "nodelist": _sanitise_nodelist(raw_node),
                 }
@@ -1191,14 +1204,27 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             except Exception as e:
                 logger.error(f"Error parsing squeue output line '{line}': {e}")
                 continue
-        # For jobs not found in squeue output, fallback to sacct bulk
+        # For jobs not found in squeue, fall back to sacct.
+        # Also include COMPLETING jobs: that state means the job has finished
+        # executing and SLURM is cleaning up — sacct may already have the true
+        # terminal state (TIMEOUT, COMPLETED, FAILED, …).
         missing_jobids = [jid for jid in jobids if jid not in found_in_squeue]
-        if missing_jobids:
-            sacct_statuses = _get_slurm_status_bulk_sacct(missing_jobids)
+        completing_ids = [
+            jid for jid in found_in_squeue
+            if status_map[jid].get("status") == "COMPLETING"
+        ]
+        need_sacct = missing_jobids + completing_ids
+        if need_sacct:
+            sacct_statuses = _get_slurm_status_bulk_sacct(need_sacct)
             for jid in missing_jobids:
                 status_map[jid] = sacct_statuses.get(
                     jid, {"status": "UNKNOWN", "runtime": None, "nodelist": None}
                 )
+            for jid in completing_ids:
+                entry = sacct_statuses.get(jid, {})
+                if entry.get("status") not in (None, "UNKNOWN"):
+                    status_map[jid] = entry
+                # else: sacct hasn't caught up yet — keep COMPLETING
     else:
         # squeue failed, use sacct bulk for all jobids
         sacct_statuses = _get_slurm_status_bulk_sacct(jobids)
@@ -1211,6 +1237,37 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
 
 
 _resource_cache: dict[str, dict[str, str | None]] = {}
+
+_submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
+
+
+def _is_submitit_timeout(jobid: str, submit_dir: str | Path, status: str = "FAILED") -> bool:
+    """Return True if a FAILED or COMPLETED job was actually a wall-time timeout.
+
+    submitit can cause SLURM to misreport the terminal state in two ways:
+
+    - FAILED: submitit's SIGUSR1 handler fires before SLURM's kill, decides the
+      job timed out, and exits non-zero.  Indicator: "this job is timed-out".
+    - COMPLETED: SLURM sends SIGTERM at the wall time; submitit bypasses it, ALF
+      exits cleanly before SIGKILL, so SLURM records COMPLETED.  Indicator:
+      "Bypassing signal SIGTERM".  Not applied to FAILED to avoid
+      misclassifying preempted-then-requeued jobs, which also log the SIGTERM
+      bypass but correctly stay FAILED.
+    """
+    if jobid not in _submitit_timeout_cache:
+        text = ""
+        log_path = Path(submit_dir) / f"{jobid}_0_log.out"
+        if log_path.exists():
+            try:
+                text = log_path.read_text(errors="replace")
+            except OSError:
+                pass
+        _submitit_timeout_cache[jobid] = (
+            "this job is timed-out" in text,
+            "Bypassing signal SIGTERM" in text,
+        )
+    timed_out, sigterm_bypassed = _submitit_timeout_cache[jobid]
+    return timed_out or (status == "COMPLETED" and sigterm_bypassed)
 
 _TERMINAL_STATES: frozenset[str] = frozenset(
     {
