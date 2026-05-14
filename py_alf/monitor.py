@@ -92,13 +92,24 @@ def _bins_cell(n_bins: int, nbin_target: int | None) -> Any:
     return t
 
 
-def _eta_str(cpu_max_h: float, elapsed_h: float) -> str:
+def _eta_cell(cpu_max_h: float, elapsed_h: float | None) -> Any:
+    bar_width = 8
+    if elapsed_h is None:
+        return Text("-")
+    fraction = min(1.0, elapsed_h / cpu_max_h) if cpu_max_h > 0 else 1.0
+    filled = round(bar_width * fraction)
+    bar = "█" * filled + "░" * (bar_width - filled)
     remaining_h = cpu_max_h - elapsed_h
     if remaining_h <= 0:
-        return "overtime"
-    total_m = int(remaining_h * 60)
-    h, m = divmod(total_m, 60)
-    return f"{h}h{m:02d}m" if h else f"{m}m"
+        t = Text("overtime ")
+        t.append(bar, style="red")
+    else:
+        total_m = int(remaining_h * 60)
+        h, m = divmod(total_m, 60)
+        eta_str = f"{h}h{m:02d}m" if h else f"{m}m"
+        t = Text(f"{eta_str} ")
+        t.append(bar, style="green" if fraction < 0.9 else "yellow")
+    return t
 
 
 _MONO_THEME = Theme(
@@ -624,7 +635,7 @@ class SimulationMonitor(App):
                 runtime = None
                 nodelist = None
 
-            n_bins = _bin_count(sim, refresh=(status == "RUNNING"))
+            n_bins = _bin_count(sim, refresh=(status in {"RUNNING"} | _TERMINAL_STATES))
             has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
 
             sim_dict = sim.sim_dict
@@ -634,16 +645,14 @@ class SimulationMonitor(App):
             array_id = jobid.split("_")[0] if jobid and "_" in jobid else jobid or "-"
 
             if status == "RUNNING" and runtime:
-                cpu_max = (
+                _cpu_max_raw = (
                     sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
                 )
-                elapsed_h = _parse_elapsed_hours(runtime)
-                if cpu_max is not None and elapsed_h is not None:
-                    eta = _eta_str(float(cpu_max), elapsed_h)
-                else:
-                    eta = "-"
+                _cpu_max = float(_cpu_max_raw) if _cpu_max_raw is not None else None
+                _elapsed_h = _parse_elapsed_hours(runtime)
             else:
-                eta = "-"
+                _cpu_max = None
+                _elapsed_h = None
 
             nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
@@ -671,7 +680,8 @@ class SimulationMonitor(App):
                 "has_checkpoint": has_checkpoint,
                 "node": nodelist or "-",
                 "elapsed": runtime or "-",
-                "eta": eta,
+                "cpu_max": _cpu_max,
+                "elapsed_h": _elapsed_h,
                 "peak_mem": res.get("max_rss") or "-",
                 "cpu_eff": res.get("cpu_eff") or "-",
             }
@@ -707,12 +717,19 @@ class SimulationMonitor(App):
                 values.append(row["n_mpi"])
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
+            _cpu_max = row.get("cpu_max")
+            if _cpu_max is not None and _cpu_max > 0:
+                _bins_val = _bins_cell(row["n_bins"], None)
+                _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
+            else:
+                _nbin_target = (
+                    None if row.get("has_checkpoint") else row.get("nbin_target")
+                )
+                _bins_val = _bins_cell(row["n_bins"], _nbin_target)
+                _eta_val = Text("-")
             values.extend(
                 [
-                    _bins_cell(
-                        row["n_bins"],
-                        None if row.get("has_checkpoint") else row.get("nbin_target"),
-                    ),
+                    _bins_val,
                     row["array_id"],
                     row["jobid"],
                 ]
@@ -728,7 +745,7 @@ class SimulationMonitor(App):
             values.extend(
                 [
                     row["elapsed"],
-                    row["eta"],
+                    _eta_val,
                     row.get("peak_mem", "-"),
                     row.get("cpu_eff", "-"),
                 ]

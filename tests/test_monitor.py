@@ -744,6 +744,7 @@ def test_session_entry_run_calls_alf_binary(tmp_path):
 
     with (
         patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("py_alf.cluster_submission.getenv", return_value={}),
         patch("subprocess.run") as mock_run,
     ):
         e.run()
@@ -767,6 +768,7 @@ def test_session_entry_run_mpi_wraps_with_mpiexec(tmp_path):
 
     with (
         patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("py_alf.cluster_submission.getenv", return_value={}),
         patch("subprocess.run") as mock_run,
     ):
         e.run()
