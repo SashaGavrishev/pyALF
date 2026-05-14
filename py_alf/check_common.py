@@ -16,11 +16,12 @@ def _create_fig(N):
         fig, axes0 = plt.subplots(1, 1, constrained_layout=True)
         return fig, [axes0]
     ncols = math.ceil(math.sqrt(N))
-    nrows = ncols-1 if ncols**2 - ncols >= N else ncols
+    nrows = ncols - 1 if ncols**2 - ncols >= N else ncols
 
     fig, axes0 = plt.subplots(
-        nrows, ncols,
-        sharex='all',
+        nrows,
+        ncols,
+        sharex="all",
         constrained_layout=True,
     )
     return fig, list(axes0.flat)
@@ -30,11 +31,12 @@ def _get_bins(directory, names, custom_obs):
     res = []
     for obs_name in names:
         if obs_name in custom_obs:
-            print('custom', obs_name)
+            print("custom", obs_name)
             obs_spec = custom_obs[obs_name]
 
-            bins_raw = [ReadObs(directory, o, bare_bins=True)
-                    for o in obs_spec['needs']]
+            bins_raw = [
+                ReadObs(directory, o, bare_bins=True) for o in obs_spec["needs"]
+            ]
             N_bins = bins_raw[0].N_bins
 
             dtype, shape = custom_obs_get_dtype_shape(obs_spec, bins_raw)
@@ -43,13 +45,12 @@ def _get_bins(directory, names, custom_obs):
             bins = np.empty((N_bins, size))
 
             for i in range(N_bins):
-                bins[i] = obs_spec['function'](
-                    *[x for b in bins_raw for x in b.slice(i)],
-                    **obs_spec['kwargs']).real.flatten()
+                bins[i] = obs_spec["function"](
+                    *[x for b in bins_raw for x in b.slice(i)], **obs_spec["kwargs"]
+                ).real.flatten()
         else:
             print(obs_name)
-            bins_c, sign, N_obs = read_scal(directory, obs_name,
-                                            bare_bins=True)
+            bins_c, sign, N_obs = read_scal(directory, obs_name, bare_bins=True)
             del N_obs
 
             bins = bins_c[:, 0].real / sign[:]
@@ -62,14 +63,14 @@ def _replot(ax, obs_name, bins, N_skip, nmax=None):
     if nmax is None:
         nmax = N_bins
 
-    x = np.arange(1, N_bins+1)
+    x = np.arange(1, N_bins + 1)
     bins1 = bins[N_skip:]
     x1 = x[N_skip:]
 
     ax.clear()
     ax.set_title(obs_name)
     ax.grid(True)
-    ax.set_xlim(0.5, nmax+0.5)
+    ax.set_xlim(0.5, nmax + 0.5)
 
     try:
         N_obs = bins1.shape[1]
@@ -78,31 +79,32 @@ def _replot(ax, obs_name, bins, N_skip, nmax=None):
     for i in range(N_obs):
         bins2 = bins1.reshape((len(x1),)) if N_obs == 1 else bins1[:, i]
 
-        p = ax.plot(range(1, N_bins+1), bins)
+        p = ax.plot(range(1, N_bins + 1), bins)
         color = None if N_obs == 1 else p[0].get_color()
-        ax.plot(x1, bins2, '.', c=color)
+        ax.plot(x1, bins2, ".", c=color)
 
         m = np.mean(bins2)
-        ax.plot([1, N_bins], [m, m], c=color, ls='-.')
-        ax.plot([N_skip+1], [m], 'o', c="red")
+        ax.plot([1, N_bins], [m, m], c=color, ls="-.")
+        ax.plot([N_skip + 1], [m], "o", c="red")
 
         def func(x, y0, a):
-            return y0 + a*x
+            return y0 + a * x
+
         popt, pcov, *_ = curve_fit(func, x1, bins2)
         del pcov
         ax.plot(x1, func(x1, *popt), c=color)
-        print(m, popt[1]/m)
-    ax.axvline(x=N_skip+0.5, color="red")
+        print(m, popt[1] / m)
+    ax.axvline(x=N_skip + 0.5, color="red")
 
 
 def _rebin_err(bins, N_skip, Nmax):
     N_obs = bins.shape[1]
     res = np.empty((Nmax, N_obs, 2))
-    for N in range(1, Nmax+1):
+    for N in range(1, Nmax + 1):
         J = jack(bins, par=None, N_skip=N_skip, N_rebin=N)
         m, e = error(J[:, :])  # pylint: disable=unbalanced-tuple-unpacking
-        res[N-1, :, 0] = m
-        res[N-1, :, 1] = e
+        res[N - 1, :, 0] = m
+        res[N - 1, :, 1] = e
     return res
 
 
@@ -110,13 +112,13 @@ def _plot_errors(axs, errs, obs_names, custom_obs):
     for ax, err, obs_name in zip(axs, errs, obs_names):
         ax.clear()
         ax.grid(True)
-        ax.set_title(f'{obs_name}_err')
+        ax.set_title(f"{obs_name}_err")
         if obs_name in custom_obs:
-            ax.plot(range(1, len(err)+1), err)
+            ax.plot(range(1, len(err) + 1), err)
             ax.set_ylim(err.min(), err.max())
         else:
             for i in range(err.shape[1]):
-                ax.plot(range(1, len(err)+1), err[:, i, 1])
+                ax.plot(range(1, len(err) + 1), err[:, i, 1])
             ax.set_ylim(err[:, :, 1].min(), err[:, :, 1].max())
 
 
@@ -125,10 +127,9 @@ def _get_errors(directory, names, custom_obs, Nmax0):
     N_skip = Parameters(directory).N_skip()
     for obs_name in names:
         if obs_name in custom_obs:
-            print('custom', obs_name)
+            print("custom", obs_name)
             obs_spec = custom_obs[obs_name]
-            bins = [ReadObs(directory, o, bare_bins=True)
-                    for o in obs_spec['needs']]
+            bins = [ReadObs(directory, o, bare_bins=True) for o in obs_spec["needs"]]
 
             N_bins1 = bins[0].N_bins - N_skip
             Nmax = min(N_bins1 // 3, Nmax0)
@@ -137,28 +138,28 @@ def _get_errors(directory, names, custom_obs, Nmax0):
             size = np.prod(shape)
             err = np.empty((Nmax, size))
 
-            for N_rebin in range(1, Nmax+1):
+            for N_rebin in range(1, Nmax + 1):
                 jacks = [x for b in bins for x in b.jack(N_rebin)]
 
                 N_bins = len(jacks[0])
                 J = np.empty((N_bins, size), dtype=dtype)
-                print(f'{N_rebin}*{N_bins}={N_rebin*N_bins}')
+                print(f"{N_rebin}*{N_bins}={N_rebin * N_bins}")
                 for i in range(N_bins):
-                    J[i] = obs_spec['function'](*[x[i] for x in jacks],
-                                                **obs_spec['kwargs'])
+                    J[i] = obs_spec["function"](
+                        *[x[i] for x in jacks], **obs_spec["kwargs"]
+                    )
                 m, e = error(J)  # pylint: disable=unbalanced-tuple-unpacking
                 del m
-                err[N_rebin-1] = e
-        elif obs_name.endswith('_scal'):
+                err[N_rebin - 1] = e
+        elif obs_name.endswith("_scal"):
             print(obs_name)
-            bins_c, sign, N_obs = read_scal(directory, obs_name,
-                                            bare_bins=True)
+            bins_c, sign, N_obs = read_scal(directory, obs_name, bare_bins=True)
             del sign, N_obs
             N_bins = bins_c.shape[0] - N_skip
             Nmax = min(N_bins // 3, Nmax0)
             err = _rebin_err(bins_c, N_skip, Nmax)
         else:
-            raise TypeError(f'Illegal observable {obs_name}')
+            raise TypeError(f"Illegal observable {obs_name}")
         # print(err)
         res.append(err)
     return res

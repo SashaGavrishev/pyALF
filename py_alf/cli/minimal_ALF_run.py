@@ -23,11 +23,11 @@ def _main():
     # Create instance of `Simulation`, overwriting default parameters as desired.
     sim = Simulation(
         alf_src,
-        "Hubbard",                    # Name of Hamiltonian
-        {                             # Dictionary overwriting default parameters
+        "Hubbard",  # Name of Hamiltonian
+        {  # Dictionary overwriting default parameters
             "Lattice_type": "Square"
         },
-        machine='GNU'  # Change to "intel", or "PGI" if gfortran is not installed
+        machine="GNU",  # Change to "intel", or "PGI" if gfortran is not installed
     )
 
     # Compile ALF. The first time it will also download and compile HDF5,
@@ -43,22 +43,28 @@ def _main():
     # Read analysis results into a Pandas Dataframe with one row per simulation,
     # containing parameters and observables.
     obs = sim.get_obs()
-    print('Analysis results:')
+    print("Analysis results:")
     print(obs)
 
-    print('Internal energy:')
-    print(obs.iloc[0][['Ener_scal0', 'Ener_scal0_err',
-                    'Ener_scal_sign', 'Ener_scal_sign_err']])
+    print("Internal energy:")
+    print(
+        obs.iloc[0][
+            ["Ener_scal0", "Ener_scal0_err", "Ener_scal_sign", "Ener_scal_sign_err"]
+        ]
+    )
 
     # The simulation can be resumed by calling sim.run() again, increasing the
     # precision of results.
     sim.run()
     sim.analysis()
     obs = sim.get_obs()
-    print('Internal energy:')
-    print(obs.iloc[0][['Ener_scal0', 'Ener_scal0_err',
-                    'Ener_scal_sign', 'Ener_scal_sign_err']])
+    print("Internal energy:")
+    print(
+        obs.iloc[0][
+            ["Ener_scal0", "Ener_scal0_err", "Ener_scal_sign", "Ener_scal_sign_err"]
+        ]
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     _main()

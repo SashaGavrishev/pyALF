@@ -213,7 +213,7 @@ class LogViewerScreen(ModalScreen):
         with Container(id="log-dialog"):
             yield Label(self._log_title, id="log-title")
             with ScrollableContainer(id="log-scroll"):
-                yield Static(self._content, id="log-body")
+                yield Static(self._content, id="log-body", markup=False)
             yield Button("Close  [esc]", variant="primary", id="log-close")
 
     @on(Button.Pressed, "#log-close")
@@ -619,6 +619,7 @@ class SimulationMonitor(App):
                 nodelist = None
 
             n_bins = _bin_count(sim, refresh=(status == "RUNNING"))
+            has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
 
             sim_dict = sim.sim_dict
             if isinstance(sim_dict, list):
@@ -661,6 +662,7 @@ class SimulationMonitor(App):
                 "array_id": array_id,
                 "jobid": jobid or "-",
                 "status": status,
+                "has_checkpoint": has_checkpoint,
                 "node": nodelist or "-",
                 "elapsed": runtime or "-",
                 "eta": eta,
@@ -701,12 +703,21 @@ class SimulationMonitor(App):
                 values.extend([row["partition"], row["mem"]])
             values.extend(
                 [
-                    _bins_cell(row["n_bins"], row.get("nbin_target")),
+                    _bins_cell(
+                        row["n_bins"],
+                        None if row.get("has_checkpoint") else row.get("nbin_target"),
+                    ),
                     row["array_id"],
                     row["jobid"],
                 ]
             )
-            values.append(_styled(row["status"]))
+            status_cell = _styled(row["status"])
+            if row.get("has_checkpoint"):
+                if row["status"] in ("RUNNING", "PENDING"):
+                    status_cell.append(" ↺", style="bold green")
+                else:
+                    status_cell.append(" ↺", style="yellow")
+            values.append(status_cell)
             values.append(row["node"])
             values.extend(
                 [
@@ -861,17 +872,22 @@ class SimulationMonitor(App):
             return
         sim_name = Path(sim.sim_dir).name
 
+        has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
+        msg = f"Force resubmit {sim_name}?"
+        if has_checkpoint:
+            msg += "\n\n⚠  Checkpoint restart detected.\nALF will append to existing data.h5."
+
         def _on_confirm(confirmed: bool | None) -> None:
             if not confirmed:
                 return
             try:
-                self._cs.submit(sim)
+                self._cs.submit(sim, confirm_checkpoint=False)
                 self.notify(f"Resubmitted {sim_name}.")
             except Exception as exc:
                 self.notify(f"Resubmission failed: {exc}", severity="error")
             self._trigger_refresh()
 
-        self.push_screen(ConfirmScreen(f"Force resubmit {sim_name}?"), _on_confirm)
+        self.push_screen(ConfirmScreen(msg), _on_confirm)
 
     def action_pan_left(self) -> None:
         self.query_one("#sim-table", DataTable).scroll_left(animate=False)

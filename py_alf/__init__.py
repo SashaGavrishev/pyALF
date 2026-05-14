@@ -17,8 +17,6 @@ __all__ = [
     "detect_partition_rules",
     "SubmissionReview",
     "save_for_ssh",
-    "list_sessions",
-    "load_session_sims",
 ]
 
 _LAZY: dict[str, tuple[str, str]] = {
@@ -32,10 +30,10 @@ _LAZY: dict[str, tuple[str, str]] = {
 def __getattr__(name: str):
     if name in _LAZY:
         module_path, attr = _LAZY[name]
-        import importlib  # noqa: PLC0415
+        from importlib import import_module  # noqa: PLC0415
 
-        mod = importlib.import_module(module_path, package=__name__)
-        return getattr(mod, attr)
+        module = import_module(module_path, package=__package__)
+        return getattr(module, attr)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

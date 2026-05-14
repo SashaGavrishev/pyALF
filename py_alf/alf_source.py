@@ -45,10 +45,11 @@ class ALF_source:
 
     """
 
-    def __init__(self, alf_dir=None, branch=None,
-                 url='https://github.com/ALF-QMC/ALF.git'):
+    def __init__(
+        self, alf_dir=None, branch=None, url="https://github.com/ALF-QMC/ALF.git"
+    ):
         if alf_dir is None:
-            alf_dir = os.getenv('ALF_DIR', './ALF')
+            alf_dir = os.getenv("ALF_DIR", "./ALF")
         self.alf_dir = os.path.abspath(os.path.expanduser(alf_dir))
         self.branch = branch
 
@@ -57,17 +58,18 @@ class ALF_source:
             try:
                 subprocess.run(["git", "clone", url, self.alf_dir], check=True)
             except subprocess.CalledProcessError as git_clone_failed:
-                raise RuntimeError('Error while cloning repository') \
-                    from git_clone_failed
+                raise RuntimeError(
+                    "Error while cloning repository"
+                ) from git_clone_failed
         if branch is not None:
             with cd(self.alf_dir):
-                print(f'Checking out branch {branch}')
+                print(f"Checking out branch {branch}")
                 try:
-                    subprocess.run(['git', 'checkout', branch], check=True)
+                    subprocess.run(["git", "checkout", branch], check=True)
                 except subprocess.CalledProcessError as git_checkout_failed:
                     raise RuntimeError(
-                        f'Error while checking out {branch}') \
-                        from git_checkout_failed
+                        f"Error while checking out {branch}"
+                    ) from git_checkout_failed
 
         def import_module(module_name, path):
             """Dynamically import module from given path."""
@@ -78,25 +80,23 @@ class ALF_source:
 
         try:
             parse_ham_mod = import_module(
-                'parse_ham',
-                os.path.join(self.alf_dir, 'Prog', 'parse_ham_mod.py'))
+                "parse_ham", os.path.join(self.alf_dir, "Prog", "parse_ham_mod.py")
+            )
         except FileNotFoundError as parse_ham_not_found:
             raise FileNotFoundError(
                 "parse_ham_mod.py not found. "
-                f"Directory {self.alf_dir} " +
-                "does not contain a supported ALF code.") \
-                    from parse_ham_not_found
+                f"Directory {self.alf_dir} " + "does not contain a supported ALF code."
+            ) from parse_ham_not_found
         try:
             default_parameters_generic = import_module(
-                'default_parameters_generic',
-                os.path.join(self.alf_dir, 'Prog',
-                             'default_parameters_generic.py'))
+                "default_parameters_generic",
+                os.path.join(self.alf_dir, "Prog", "default_parameters_generic.py"),
+            )
         except FileNotFoundError as default_parameters_generic_not_found:
             raise FileNotFoundError(
                 "default_parameters_generic.py not found. "
-                f"Directory {self.alf_dir} " +
-                "does not contain a supported ALF code.") \
-                    from default_parameters_generic_not_found
+                f"Directory {self.alf_dir} " + "does not contain a supported ALF code."
+            ) from default_parameters_generic_not_found
 
         self._PARAMS_GENERIC = default_parameters_generic._PARAMS_GENERIC
 
@@ -130,25 +130,28 @@ class ALF_source:
 
         return [i.upper() for i in p_list]
 
+
 def get_default_parameters(parse_ham_mod, alf_dir):
     """Return dictionary of all default parameters of Hamiltonians.
     By parsing Hamiltonians.
     """
     try:
         ham_names, ham_files = parse_ham_mod.get_ham_names_ham_files(
-            os.path.join(alf_dir, 'Prog', 'Hamiltonians.list')
-            )
-        ham_files = [os.path.join(alf_dir, 'Prog', ham_file) for
-                    ham_file in ham_files]
+            os.path.join(alf_dir, "Prog", "Hamiltonians.list")
+        )
+        ham_files = [os.path.join(alf_dir, "Prog", ham_file) for ham_file in ham_files]
     except AttributeError:
         # Backwards compatibility fallback
-        with open(os.path.join(alf_dir, 'Prog', 'Hamiltonians.list'),
-                  encoding='UTF-8') as f:
+        with open(
+            os.path.join(alf_dir, "Prog", "Hamiltonians.list"), encoding="UTF-8"
+        ) as f:
             ham_names = f.read().splitlines()
-        ham_files = [os.path.join(
-            alf_dir, 'Prog', 'Hamiltonians',
-            f'Hamiltonian_{ham_name}_smod.F90') for
-            ham_name in ham_names]
+        ham_files = [
+            os.path.join(
+                alf_dir, "Prog", "Hamiltonians", f"Hamiltonian_{ham_name}_smod.F90"
+            )
+            for ham_name in ham_names
+        ]
 
     default_parameters = {}
     for ham_name, ham_file in zip(ham_names, ham_files):

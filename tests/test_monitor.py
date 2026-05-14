@@ -443,7 +443,7 @@ async def test_action_resubmit_confirmed(tmp_path):
             await pilot.pause()
             await pilot.click("#confirm-yes")
             await pilot.pause()
-    cs.submit.assert_called_once_with(sim)
+    cs.submit.assert_called_once_with(sim, confirm_checkpoint=False)
 
 
 async def test_action_resubmit_declined(tmp_path):
