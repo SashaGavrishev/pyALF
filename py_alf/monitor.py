@@ -729,16 +729,16 @@ class SimulationMonitor(App):
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
             _cpu_max = row.get("cpu_max")
-            if _cpu_max is not None and _cpu_max > 0:
+            _nbin_target = (
+                None if row.get("has_checkpoint") else row.get("nbin_target")
+            )
+            if _cpu_max is not None and _cpu_max > 0 and not _nbin_target:
                 _bins_val = _bins_cell(row["n_bins"], None)
                 if row["status"] == "COMPLETED":
                     _eta_val = Text("█" * 8, style="green")
                 else:
                     _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
             else:
-                _nbin_target = (
-                    None if row.get("has_checkpoint") else row.get("nbin_target")
-                )
                 _bins_val = _bins_cell(row["n_bins"], _nbin_target)
                 _eta_val = Text("-")
             values.extend(
