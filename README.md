@@ -140,7 +140,14 @@ for sim in sims:
 
 Both helpers are also importable from the top-level package: `py_alf.list_sessions`, `py_alf.load_session_sims`.
 
-The monitor displays a table with one row per simulation. Columns include the Hamiltonian name, any `param_keys` you specify, `n_omp`/`n_mpi`, SLURM partition and memory (when a `ClusterSubmitter` is provided), bin count, master array ID, individual job ID, colour-coded status, elapsed runtime, estimated time remaining (ETA), peak memory usage, and CPU efficiency. Peak memory and CPU efficiency are fetched from `sacct` once a job reaches a terminal state and persisted to `peak_resources.json` in the simulation directory, so they remain visible even after the job ages out of the SLURM accounting database.
+The monitor displays a table with one row per simulation. Columns include the Hamiltonian name, any `param_keys` you specify, `n_omp`/`n_mpi`, SLURM partition and memory (when a `ClusterSubmitter` is provided), bin count / ETA bar, master array ID, individual job ID, colour-coded status, node name, elapsed runtime, peak memory usage, and CPU efficiency.
+
+**Bin count / ETA display mode** — the progress column adapts to how the simulation is configured:
+
+- **NBin mode**: when `sim_dict` contains an `NBin` key, the column shows an ASCII progress bar toward that bin target (e.g. `12/40 [//------]`).
+- **CPU_MAX mode**: when only `CPU_MAX` is set (no `NBin`), the column shows a raw bin count and the adjacent ETA column displays the estimated time remaining based on elapsed wall time.
+
+Peak memory and CPU efficiency are fetched from `sacct` once a job reaches a terminal state and persisted to `peak_resources.json` in the simulation directory, so they remain visible even after the job ages out of the SLURM accounting database.
 
 The title bar updates with the SLURM array ID(s) once the first status poll completes.
 
@@ -149,10 +156,11 @@ The title bar updates with the SLURM array ID(s) once the first status poll comp
 | Key | Action |
 |-----|--------|
 | `l` | View log for the selected job |
+| `i` | View the `info` file written by ALF on completion (warns if not yet present) |
 | `c` | Cancel the selected job (confirmation required) |
 | `a` | Cancel the entire SLURM array the selected job belongs to (confirmation required) |
 | `r` | Force resubmit the selected simulation (confirmation required; requires `cluster_submitter`) |
-| `f5` | Refresh status immediately |
+| `f` | Refresh status immediately |
 | `q` | Quit |
 
 ---

@@ -13,6 +13,7 @@ __author__ = "Johannes Hofmann"
 __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -1210,7 +1211,8 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
         # terminal state (TIMEOUT, COMPLETED, FAILED, …).
         missing_jobids = [jid for jid in jobids if jid not in found_in_squeue]
         completing_ids = [
-            jid for jid in found_in_squeue
+            jid
+            for jid in found_in_squeue
             if status_map[jid].get("status") == "COMPLETING"
         ]
         need_sacct = missing_jobids + completing_ids
@@ -1241,7 +1243,9 @@ _resource_cache: dict[str, dict[str, str | None]] = {}
 _submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
 
 
-def _is_submitit_timeout(jobid: str, submit_dir: str | Path, status: str = "FAILED") -> bool:
+def _is_submitit_timeout(
+    jobid: str, submit_dir: str | Path, status: str = "FAILED"
+) -> bool:
     """Return True if a FAILED or COMPLETED job was actually a wall-time timeout.
 
     submitit can cause SLURM to misreport the terminal state in two ways:
@@ -1258,16 +1262,15 @@ def _is_submitit_timeout(jobid: str, submit_dir: str | Path, status: str = "FAIL
         text = ""
         log_path = Path(submit_dir) / f"{jobid}_0_log.out"
         if log_path.exists():
-            try:
+            with contextlib.suppress(OSError):
                 text = log_path.read_text(errors="replace")
-            except OSError:
-                pass
         _submitit_timeout_cache[jobid] = (
             "this job is timed-out" in text,
             "Bypassing signal SIGTERM" in text,
         )
     timed_out, sigterm_bypassed = _submitit_timeout_cache[jobid]
     return timed_out or (status == "COMPLETED" and sigterm_bypassed)
+
 
 _TERMINAL_STATES: frozenset[str] = frozenset(
     {

@@ -40,6 +40,13 @@ Batch selection
   3  extra_long · MPI×8 · 8 OMP   (CPU_MAX = 400 h → extra_long)
   4  unfit partition               (CPU_MAX = 800 h → submit blocked)
   5  local executor                (no cluster, no partition display)
+  6  NBin mode · slurm_time preset (ALF stops by bin count; CPU_MAX=0)
+  7  data conflict                 (data.h5 without conf files → blocked ⚠)
+
+Post-submission features
+  UI locks immediately on submit (edit/toggle/add keys disappear).
+  Footer shows "m open monitor  q exit" once done.
+  Job name is shown in the progress bar and passed to the monitor.
 """
 
 from __future__ import annotations
@@ -94,6 +101,14 @@ CPU_PARTITIONS: dict[str, float] = {
 def _sd(name: str) -> str:
     """Return a sim_dir path inside the temp workspace."""
     return str(_TMPDIR / "ALF_data" / name)
+
+
+def _sd_conflict(name: str) -> str:
+    """Return a sim_dir path that already has data.h5 — submission is blocked."""
+    p = _TMPDIR / "ALF_data" / name
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "data.h5").touch()
+    return str(p)
 
 
 def make_mock_sim(
@@ -223,6 +238,47 @@ BATCHES: dict[str, dict] = {
         ],
         cs=ClusterSubmitter("local"),
     ),
+    # ── 6: NBin mode — slurm_time preset ─────────────────────────────────
+    #    TUI starts in NBin mode (CPU_MAX=0 for all sims).
+    #    Wall-time input controls SLURM --time directly (not ALF CPU_MAX).
+    #    The walltime-note below the input changes to reflect this.
+    #    Submit is immediately enabled because slurm_time is pre-configured.
+    "NBin mode · slurm_time=24h preset": dict(
+        sims=[
+            make_mock_sim(
+                "Hubbard_Plain_Vanilla",
+                _sd(f"Hubbard_NBin_Beta={b}_L=4"),
+                {"Beta": b, "L1": 4, "L2": 4, "NBin": 40},
+                n_omp=4,
+            )
+            for b in [1.0, 2.0, 4.0, 6.0]
+        ],
+        cs=ClusterSubmitter(
+            "slurm",
+            submit_dir=str(_TMPDIR / ".alfmonitor"),
+            slurm_mem="4G",
+            partition_rules=CPU_PARTITIONS,
+            job_name="nbin_demo",
+            slurm_kwargs={"slurm_time": "24:00:00"},
+        ),
+    ),
+    # ── 7: data conflict — data.h5 exists without checkpoint files ────────
+    #    Sims have data.h5 but no confin_* or confout_* files: the submit
+    #    button is disabled and shows "Cannot submit — N sim(s) have existing
+    #    data (deselect or add checkpoint files)".
+    #    Toggle individual sims off with  space  to re-enable the button.
+    "data conflict  (existing data, no checkpoint)": dict(
+        sims=[
+            make_mock_sim(
+                "Hubbard_Plain_Vanilla",
+                _sd_conflict(f"Hubbard_Conflict_Beta={b}"),
+                {"Beta": b, "L1": 4, "L2": 4, "CPU_MAX": 24},
+                n_omp=4,
+            )
+            for b in [1.0, 2.0, 4.0]
+        ],
+        cs=_cs("4G"),
+    ),
 }
 
 
@@ -335,7 +391,7 @@ def main() -> None:
     print("Available demo batches:\n")
     for i, name in enumerate(names):
         print(f"  {i}  {name}")
-    raw = input(f"\nPick batch [0–{len(names) - 1}, default 0]: ").strip()
+    raw = input(f"\nSelect batch [0–{len(names) - 1}, default 0]: ").strip()
     idx = int(raw) if raw.isdigit() and int(raw) < len(names) else 0
     chosen = names[idx]
     print(f"\nLaunching: {chosen}")
