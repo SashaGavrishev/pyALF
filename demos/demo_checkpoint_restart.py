@@ -8,41 +8,59 @@ Run from the repo root:
 
 What this demonstrates
 ----------------------
-Submission TUI
-  Three of the six sims already have confin_* files on disk, meaning ALF
-  would continue from a checkpoint rather than start fresh.
+Submission TUI — four sim states are pre-built on disk:
 
-  When you press  s  to submit, the confirmation dialog shows:
+  confin_*  (2 sims)   Already have confin_*.h5 files: checkpoint restarts.
+                        The confirmation dialog shows a tree of confin files.
 
-      ⚠  3 checkpoint restart(s) detected.
-      ALF will append to existing data.h5.
+  confout_* (2 sims)   Have confout_*.h5 files written by a completed ALF run.
+                        _prep_sim_dir auto-renames them to confin_*.h5 on submit.
+                        The dialog shows "confout_0.h5  →  confin_0.h5 (auto)".
 
-  Selecting the jobs individually (space) lets you submit only fresh or
-  only checkpoint-restart sims and watch the warning count update.
+  conflict  (1 sim)    Has data.h5 but no conf files: interrupted run.
+                        Submission is blocked (⚠ mark); the submit button reads
+                        "Cannot submit — 1 sim(s) have existing data".
+                        Deselect it with  space  to re-enable the submit button.
+
+  fresh     (2 sims)   Empty directories: no special handling.
+
+When you press  s  to submit (after deselecting the blocked sim), the
+confirmation dialog shows:
+
+    ⚠  4 checkpoint restart(s) detected.
+    ALF will append to existing data.h5.
+       confout_* → confin_* will be auto-renamed on submit.
+
+      ↳ Hubbard_Plain_Vanilla_Beta=1.0/
+          ├── confin_0.h5
+          └── confin_1.h5
+
+      ↳ Hubbard_Plain_Vanilla_Beta=4.0/
+          └── confout_0.h5  →  confin_0.h5
+
+  … (etc.)
 
 Monitor TUI
-  After submission the monitor opens with a pre-built mix of statuses:
-
-    RUNNING  ↺  (green)   — checkpoint-restart job is actively running
-    PENDING  ↺  (green)   — checkpoint-restart job is queued
-    COMPLETED ↺ (yellow)  — completed restart; confin_* still present,
-                             ready for another continuation
-    RUNNING               — fresh job (no checkpoint)
-    COMPLETED             — fresh job, done, no confin_* files
-
-  Press  r  on any row to see the resubmit confirm dialog — checkpoint
-  sims show the ⚠ warning; fresh sims do not.
+  After submission the monitor shows a mix of statuses.
+  Press  i  on a COMPLETED row to view the ALF info file.
+  Press  l  on any row to view the log.
+  Cancel Job / Cancel Array are disabled for terminal states (COMPLETED etc.).
 
 Controls
 --------
   (submission TUI)
   space   toggle sim selected / deselected
   s       submit → confirmation dialog
+  m       open monitor (after submission)
   q       quit
 
   (monitor TUI)
-  r       resubmit selected sim
+  i       view ALF info file (only active when COMPLETED)
   l       view log
+  c       cancel individual job  (mocked)
+  a       cancel SLURM array    (mocked)
+  r       resubmit selected sim (mocked)
+  f       manual refresh
   q       quit
 """
 
@@ -82,27 +100,40 @@ CPU_PARTITIONS: dict[str, float] = {
 # Sim setup
 # ---------------------------------------------------------------------------
 
-# (ham_name, Beta, has_checkpoint)
+# (ham_name, Beta, state)
+#   "confin"   — has confin_*.h5 files (prior checkpoint)
+#   "confout"  — has confout_*.h5 files (completed run, auto-renamed on submit)
+#   "conflict" — has data.h5 only, no conf files (blocked ⚠)
+#   None       — fresh directory
 _SIM_SPECS = [
-    ("Hubbard_Plain_Vanilla", 1.0, True),  # checkpoint restart
-    ("Hubbard_Plain_Vanilla", 2.0, True),  # checkpoint restart
-    ("Hubbard_Plain_Vanilla", 4.0, True),  # checkpoint restart
-    ("Hubbard_Plain_Vanilla", 6.0, False),  # fresh run
-    ("Hubbard_Plain_Vanilla", 8.0, False),  # fresh run
-    ("tV_Model", 1.0, False),  # fresh run
+    ("Hubbard_Plain_Vanilla", 1.0, "confin"),    # checkpoint restart
+    ("Hubbard_Plain_Vanilla", 2.0, "confin"),    # checkpoint restart
+    ("Hubbard_Plain_Vanilla", 4.0, "confout"),   # completed → auto-rename on submit
+    ("Hubbard_Plain_Vanilla", 6.0, "confout"),   # completed → auto-rename on submit
+    ("Hubbard_Plain_Vanilla", 8.0, "conflict"),  # blocked ⚠ — deselect before submit
+    ("Hubbard_Plain_Vanilla", 10.0, None),       # fresh
+    ("tV_Model", 1.0, None),                     # fresh
 ]
 
 
 def _setup_sims() -> list:
     sims = []
-    for ham, beta, has_ckpt in _SIM_SPECS:
+    for ham, beta, state in _SIM_SPECS:
         name = f"{ham}_Beta={beta}"
         sim_dir = _TMPDIR / "ALF_data" / name
         sim_dir.mkdir(parents=True, exist_ok=True)
 
-        if has_ckpt:
-            (sim_dir / "confin_0").touch()
-            (sim_dir / "confin_1").touch()
+        if state == "confin":
+            (sim_dir / "confin_0.h5").touch()
+            (sim_dir / "confin_1.h5").touch()
+            (sim_dir / "data.h5").touch()
+        elif state == "confout":
+            (sim_dir / "confout_0.h5").touch()
+            (sim_dir / "data.h5").touch()
+        elif state == "conflict":
+            # data.h5 without any conf files — submission is blocked
+            (sim_dir / "data.h5").touch()
+        # None → fresh, leave directory empty
 
         sim = SimpleNamespace(
             ham_name=ham,
@@ -147,10 +178,14 @@ def _mock_submit(self: ClusterSubmitter, sims, **kwargs) -> list:
 # Monitor handover
 # ---------------------------------------------------------------------------
 
-# Assign statuses that showcase all ↺ variants:
-#   checkpoint sims (indices 0–2): RUNNING ↺, PENDING ↺, COMPLETED ↺
-#   fresh sims      (indices 3–5): RUNNING,   COMPLETED, COMPLETED
-_STATUS_CYCLE = ["RUNNING", "PENDING", "COMPLETED", "RUNNING", "COMPLETED", "COMPLETED"]
+_STATUS_CYCLE = [
+    "RUNNING",    # confin beta=1   ↺ running
+    "PENDING",    # confin beta=2   ↺ queued
+    "COMPLETED",  # confout beta=4  ↺ completed (confin after rename)
+    "RUNNING",    # confout beta=6  running
+    "COMPLETED",  # fresh beta=10   completed
+    "RUNNING",    # fresh tV        running
+]
 
 
 def _launch_monitor(sims: list, app: SubmissionReview) -> None:
@@ -170,10 +205,16 @@ def _launch_monitor(sims: list, app: SubmissionReview) -> None:
             status, 0
         )
 
-        # Write a fake log for running / completed jobs.
+        # Write fake log for RUNNING / COMPLETED jobs.
         log = _SUBMIT_DIR / f"{jid}_0_log.out"
-        ckpt = any(Path(sim.sim_dir).glob("confin_*"))
-        mode = "checkpoint restart" if ckpt else "fresh start"
+        has_confin = any(Path(sim.sim_dir).glob("confin_*"))
+        has_confout = any(Path(sim.sim_dir).glob("confout_*"))
+        if has_confout:
+            mode = "continuation (confout → confin auto-renamed)"
+        elif has_confin:
+            mode = "checkpoint restart"
+        else:
+            mode = "fresh start"
         lines = [
             f"[ALF] job {jid}  ham={sim.ham_name}  Beta={sim.sim_dict['Beta']}",
             f"[ALF] Mode: {mode}",
@@ -185,6 +226,20 @@ def _launch_monitor(sims: list, app: SubmissionReview) -> None:
         else:
             lines += ["[ALF] Still running…"]
         log.write_text("\n".join(lines) + "\n")
+
+        # Write ALF info file for COMPLETED jobs so the  i  keybinding works.
+        if status == "COMPLETED":
+            info_file = Path(sim.sim_dir) / "info"
+            info_file.write_text(
+                f"Hamiltonian : {sim.ham_name}\n"
+                f"Beta        : {sim.sim_dict['Beta']}\n"
+                f"L1 / L2     : {sim.sim_dict['L1']} / {sim.sim_dict['L2']}\n"
+                f"OMP threads : {sim.n_omp}\n"
+                f"NBin target : {sim.sim_dict.get('NBin', '—')}\n"
+                f"Bins done   : 40\n"
+                f"Mode        : {mode}\n"
+                f"Status      : COMPLETED\n"
+            )
 
     def _mock_bin_count(sim, **_kw):
         return bin_map.get(str(sim.sim_dir), 0)
@@ -220,17 +275,26 @@ def main() -> None:
     print(f"Temp workspace: {_TMPDIR}\n")
 
     sims = _setup_sims()
-    ckpt_count = sum(any(Path(s.sim_dir).glob("confin_*")) for s in sims)
-    fresh_count = len(sims) - ckpt_count
+    counts: dict = {}
+    for _, _, state in _SIM_SPECS:
+        counts[state] = counts.get(state, 0) + 1
     print(
-        f"Prepared {len(sims)} simulations: {ckpt_count} checkpoint, {fresh_count} fresh\n"
+        f"Prepared {len(sims)} simulations:  "
+        f"{counts.get('confin', 0)} confin  "
+        f"{counts.get('confout', 0)} confout  "
+        f"{counts.get('conflict', 0)} blocked (⚠)  "
+        f"{counts.get(None, 0)} fresh"
     )
+    print()
+    print("  The blocked sim (Beta=8.0) has data.h5 but no checkpoint files.")
+    print("  Deselect it with  space  before pressing  s  to submit.\n")
 
     cs = ClusterSubmitter(
         "slurm",
         submit_dir=str(_SUBMIT_DIR),
         slurm_mem="8G",
         partition_rules=CPU_PARTITIONS,
+        job_name="ckpt_demo",
     )
 
     with patch.object(ClusterSubmitter, "submit", _mock_submit):

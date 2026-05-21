@@ -10,7 +10,7 @@ Two demo modes
 --------------
   0  fresh sims — launches the monitor directly with a pre-built mix of
                   SLURM statuses (RUNNING, PENDING, COMPLETED, FAILED,
-                  CANCELLED, INACTIVE, CRASHED)
+                  CANCELLED, INACTIVE)
   1  from session — writes a session manifest to disk and loads it via
                     SimulationMonitor.from_session(), exercising the same
                     code path used after a real SubmissionReview run
@@ -21,11 +21,12 @@ cluster connection is needed.
 Controls inside the TUI
 -----------------------
   q     quit
+  i     view ALF info file  (only active on COMPLETED rows)
   l     view log (shows fake ALF output for jobs that have a log file)
-  c     cancel individual job    (mocked — prints confirmation)
-  a     cancel SLURM array       (mocked)
+  c     cancel individual job    (mocked — disabled for terminal states)
+  a     cancel SLURM array       (mocked — disabled for terminal states)
   r     resubmit selected sim    (mocked)
-  f5    manual refresh
+  f     manual refresh
 """
 
 from __future__ import annotations
@@ -112,10 +113,13 @@ def _setup_workspace() -> tuple[list, dict, dict]:
 
         if jid is not None:
             (sim_dir / "jobid.txt").write_text(jid)
-            statuses[jid] = {"status": status, "runtime": runtime}
+            nodelist = f"compute{i:02d}" if status == "RUNNING" else None
+            statuses[jid] = {"status": status, "runtime": runtime, "nodelist": nodelist}
             if status in ("RUNNING", "COMPLETED"):
                 log = _SUBMIT_DIR / f"{jid}_0_log.out"
                 log.write_text(_fake_log(jid, ham, beta, L, status))
+            if status == "COMPLETED":
+                (sim_dir / "info").write_text(_fake_info(ham, beta, L))
         else:
             # INACTIVE: leave a RUNNING sentinel file to trigger CRASHED display
             # if you want to test that path, uncomment the next line:
@@ -154,6 +158,18 @@ def _fake_log(jid: str, ham: str, beta: float, L: int, status: str) -> str:
     else:
         lines += ["[ALF] Still running..."]
     return "\n".join(lines) + "\n"
+
+
+def _fake_info(ham: str, beta: float, L: int) -> str:
+    return (
+        f"Hamiltonian : {ham}\n"
+        f"Beta        : {beta}\n"
+        f"L1 / L2     : {L} / {L}\n"
+        f"OMP threads : 4\n"
+        f"Bins done   : 40\n"
+        f"Status      : COMPLETED\n"
+        f"Observables : Kin_Energy, Pot_Energy, Density, SpinZ\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +227,7 @@ def _write_demo_session(sims: list, statuses: dict) -> Path:
             "submit_dir": str(_SUBMIT_DIR),
             "slurm_mem": "8G",
             "partition_rules": CPU_PARTITIONS,
-            "job_name": None,
+            "job_name": "monitor_demo",
             "mail_type": "END",
             "wckey": None,
             "stderr_to_stdout": False,
@@ -252,6 +268,7 @@ def main() -> None:
         submit_dir=str(_SUBMIT_DIR),
         slurm_mem="8G",
         partition_rules=CPU_PARTITIONS,
+        job_name="monitor_demo",
     )
 
     with (

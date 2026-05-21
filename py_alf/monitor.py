@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re as _re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, DataTable, Footer, Label, Static
+from textual.widgets import Button, DataTable, Label, Static
 
 from .cluster_submission import (
     _TERMINAL_STATES,
@@ -33,22 +34,29 @@ from .cluster_submission import (
     _find_job_log,
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
+    _is_submitit_timeout,
     cancel_cluster_job,
     get_job_id,
 )
 from .simulation import Simulation
 
+_ANIM_FRAMES = ("· ", " ·")
+
 _STATUS_COLORS: dict[str, str] = {
-    "RUNNING": "bold green",
-    "PENDING": "bold yellow",
-    "FAILED": "bold red",
-    "CANCELLED": "bold red",
-    "TIMEOUT": "bold red",
-    "CRASHED": "bold red",
-    "COMPLETED": "blue",
+    "RUNNING": "",
+    "PENDING": "dim",
+    "COMPLETING": "dim",
+    "FAILED": "red",
+    "CANCELLED": "dim",
+    "TIMEOUT": "red",
+    "OUT_OF_MEMORY": "red",
+    "NODE_FAIL": "red",
+    "PREEMPTED": "dim",
+    "CRASHED": "red",
+    "COMPLETED": "",
     "INACTIVE": "dim",
     "UNKNOWN": "dim",
-    "ERROR": "bold red",
+    "ERROR": "red",
 }
 
 
@@ -78,34 +86,45 @@ def _parse_elapsed_hours(runtime: str) -> float | None:
         return None
 
 
-def _bins_cell(n_bins: int, nbin_target: int | None) -> Any:
+def _bins_cell(n_bins: int, nbin_target: int | None, max_bins_w: int = 1) -> Any:
     """Return a Rich Text progress bar for the N_bins column."""
     if nbin_target is None or nbin_target <= 0:
         return str(n_bins)
     bar_width = 8
     filled = min(bar_width, round(bar_width * n_bins / nbin_target))
-    bar = "█" * filled + "░" * (bar_width - filled)
-    # Pad n_bins to the same digit width as nbin_target so bars stay aligned.
-    w = len(str(nbin_target))
+    bar = "[" + "/" * filled + "-" * (bar_width - filled) + "]"
+    # Pad n_bins to the widest value across all rows so bars start at the same column.
+    w = max(max_bins_w, len(str(n_bins)))
     t = Text(f"{n_bins:{w}d}/{nbin_target} ")
-    t.append(bar, style="green" if n_bins >= nbin_target else "yellow")
+    t.append(bar, style="" if n_bins >= nbin_target else "dim")
     return t
 
 
-def _eta_str(cpu_max_h: float, elapsed_h: float) -> str:
+def _eta_cell(cpu_max_h: float, elapsed_h: float | None) -> Any:
+    bar_width = 8
+    if elapsed_h is None:
+        return Text("-")
+    fraction = min(1.0, elapsed_h / cpu_max_h) if cpu_max_h > 0 else 1.0
+    filled = round(bar_width * fraction)
+    bar = "[" + "/" * filled + "-" * (bar_width - filled) + "]"
     remaining_h = cpu_max_h - elapsed_h
     if remaining_h <= 0:
-        return "overtime"
-    total_m = int(remaining_h * 60)
-    h, m = divmod(total_m, 60)
-    return f"{h}h{m:02d}m" if h else f"{m}m"
+        t = Text("overtime ")
+        t.append(bar, style="red")
+    else:
+        total_m = int(remaining_h * 60)
+        h, m = divmod(total_m, 60)
+        eta_str = f"{h}h{m:02d}m" if h else f"{m}m"
+        t = Text(f"{eta_str} ")
+        t.append(bar, style="dim")
+    return t
 
 
 _MONO_THEME = Theme(
     name="monitor-mono",
     primary="ansi_default",
     secondary="ansi_default",
-    warning="ansi_yellow",
+    warning="ansi_default",
     error="ansi_red",
     success="ansi_default",
     accent="ansi_default",
@@ -120,7 +139,6 @@ _MONO_THEME = Theme(
         "ansi-background": "ansi_default",
         "ansi-foreground": "ansi_default",
         "border-blurred": "ansi_default",
-        "block-cursor-foreground": "ansi_default",
         "block-cursor-background": "ansi_default",
         "input-cursor-background": "ansi_default",
         "input-cursor-foreground": "ansi_default",
@@ -192,6 +210,93 @@ def load_session_sims(session_path: str | Path) -> list[_SessionEntry]:
 
 
 # ---------------------------------------------------------------------------
+# Shared TUI widgets
+# ---------------------------------------------------------------------------
+
+_SQUARE_LEAD_RE = _re.compile(r"^\[dim\]□ |^■ ")
+_DIM_CLOSE_RE = _re.compile(r"\[/dim\]$")
+
+
+def _strip_square_markup(label: str) -> str:
+    return _DIM_CLOSE_RE.sub("", _SQUARE_LEAD_RE.sub("", label))
+
+
+class _ToggleButton(Button):
+    """Button that shows '>' while hovered or focused instead of inverting."""
+
+    _hovered: bool = False
+    _focused: bool = False
+    _base_label: str = ""
+    _setting_hover: bool = False
+
+    def __init__(self, label: str = "", **kwargs) -> None:
+        super().__init__(label, **kwargs)
+        self._base_label = label
+        if _strip_square_markup(label) == label:
+            self._base_label = f"■ {label}"
+            self._setting_hover = True
+            self.label = f"■ {label}"  # type: ignore[assignment]
+            self._setting_hover = False
+
+    def validate_label(self, label: object) -> object:
+        if isinstance(label, str) and not self._setting_hover:
+            self._base_label = label
+        return super().validate_label(label)  # type: ignore[arg-type]
+
+    def _sync_label(self) -> None:
+        want_active = (self._hovered or self._focused) and not self.disabled
+        stripped = _strip_square_markup(self._base_label)
+        target = "> " + stripped if want_active else self._base_label
+        self._setting_hover = True
+        self.label = target  # type: ignore[assignment]
+        self._setting_hover = False
+
+    def _apply_hover(self) -> None:
+        if self.disabled or self._hovered:
+            return
+        self._hovered = True
+        self._sync_label()
+
+    def _remove_hover(self) -> None:
+        if not self._hovered:
+            return
+        self._hovered = False
+        self._sync_label()
+
+    def on_focus(self) -> None:
+        if self._focused:
+            return
+        self._focused = True
+        self._sync_label()
+
+    def on_blur(self) -> None:
+        if not self._focused:
+            return
+        self._focused = False
+        self._sync_label()
+
+    def on_enter(self) -> None:
+        self._apply_hover()
+
+    def on_mouse_enter(self) -> None:
+        self._apply_hover()
+
+    def on_leave(self) -> None:
+        self._remove_hover()
+
+    def on_mouse_leave(self) -> None:
+        self._remove_hover()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.call_after_refresh(self._clear_after_click)
+
+    def _clear_after_click(self) -> None:
+        self._hovered = False
+        self._focused = False
+        self._sync_label()
+
+
+# ---------------------------------------------------------------------------
 # Modal screens
 # ---------------------------------------------------------------------------
 
@@ -214,7 +319,7 @@ class LogViewerScreen(ModalScreen):
             yield Label(self._log_title, id="log-title")
             with ScrollableContainer(id="log-scroll"):
                 yield Static(self._content, id="log-body", markup=False)
-            yield Button("Close  [esc]", variant="primary", id="log-close")
+            yield _ToggleButton("Close  [esc]", variant="primary", id="log-close")
 
     @on(Button.Pressed, "#log-close")
     def close(self) -> None:
@@ -234,11 +339,11 @@ class ConfirmScreen(ModalScreen[bool]):
         with Container(id="confirm-dialog"):
             yield Label(self._message, id="confirm-msg")
             with Horizontal(id="confirm-buttons"):
-                yield Button("Yes", variant="error", id="confirm-yes")
-                yield Button("No", variant="default", id="confirm-no")
+                yield _ToggleButton("Yes", variant="error", id="confirm-yes")
+                yield _ToggleButton("No", id="confirm-no")
 
     def on_mount(self) -> None:
-        self.query_one("#confirm-no", Button).focus()
+        self.query_one("#confirm-no", _ToggleButton).focus()
 
     @on(Button.Pressed, "#confirm-yes")
     def _yes(self) -> None:
@@ -268,6 +373,7 @@ class _SessionEntry:
         "mpi",
         "sim_dict",
         "config",
+        "alf_dir",
         "job_id",
         "mpiexec",
         "mpiexec_args",
@@ -284,6 +390,8 @@ class _SessionEntry:
         job_id=None,
         mpiexec="mpiexec",
         mpiexec_args=None,
+        config="",
+        alf_dir=".",
         **_extra,
     ):
         self.sim_dir = sim_dir
@@ -292,7 +400,8 @@ class _SessionEntry:
         self.n_mpi = n_mpi
         self.mpi = mpi
         self.sim_dict = sim_dict
-        self.config = ""
+        self.config = config
+        self.alf_dir = alf_dir
         self.job_id = job_id
         self.mpiexec = mpiexec
         self.mpiexec_args = mpiexec_args or []
@@ -313,6 +422,8 @@ class _SessionEntry:
             self.mpi,
             self.mpiexec,
             self.mpiexec_args,
+            config=self.config,
+            alf_dir=self.alf_dir,
         )
 
 
@@ -343,7 +454,7 @@ class SimulationMonitor(App):
         Column header labels for ``param_keys``. Defaults to the key names.
     """
 
-    TITLE = "pyALF · Simulation Monitor"
+    TITLE = "pyALF │ Simulation Monitor"
     ENABLE_COMMAND_PALETTE = False
 
     CSS = """
@@ -357,11 +468,10 @@ class SimulationMonitor(App):
     DataTable { scrollbar-size: 0 0; }
 
     #title-bar {
-        height: 1;
-        background: ansi_bright_black;
+        height: 2;
         color: ansi_default;
-        text-style: bold;
         padding: 0 1;
+        border-bottom: solid ansi_default;
     }
 
     #status-bar {
@@ -372,25 +482,18 @@ class SimulationMonitor(App):
 
     Horizontal, Container, ScrollableContainer, Static, Label { background: transparent; }
     DataTable { height: 1fr; background: transparent; }
-    DataTable > .datatable--header { color: ansi_default; background: transparent; }
-    DataTable > .datatable--cursor { background: ansi_bright_black; color: ansi_default; text-style: bold; }
-    DataTable > .datatable--hover { background: ansi_bright_black; color: ansi_default; }
+    DataTable > .datatable--header { color: ansi_default; background: transparent; text-style: none; }
+    DataTable > .datatable--cursor { background: transparent; text-style: none; }
+    DataTable > .datatable--hover { background: transparent; }
     DataTable > .datatable--even-row { background: transparent; }
     DataTable > .datatable--odd-row { background: transparent; }
 
-    Footer { background: transparent; color: ansi_default; }
-    FooterKey .footer-key--key { background: ansi_bright_black; color: ansi_default; padding: 0 1; }
-    FooterKey .footer-key--description { padding-left: 1; padding-right: 2; }
+    #footer-keys { height: 1; content-align: left middle; padding: 0 1; }
 
-    Button { border: blank; color: ansi_default; background: transparent; }
-    Button.-primary { background: ansi_bright_black; color: ansi_default; }
-    Button.-error { background: ansi_red; color: ansi_default; }
-    Button.-error.-active { background: ansi_red; color: ansi_default; text-style: bold; }
-    Button.-error:hover { background: ansi_red; color: ansi_default; text-style: bold; }
-    Button.-active { background: ansi_bright_black; color: ansi_default; text-style: bold; }
-    Button.-primary.-active { background: ansi_bright_black; color: ansi_default; text-style: bold; }
-    Button:hover { color: ansi_default; background: transparent; }
-    Button.-primary:hover { color: ansi_default; background: ansi_bright_black; text-style: bold; }
+    Button { border: none; height: 1; width: auto; color: ansi_default; background: transparent; text-style: none; content-align: left middle; text-align: left; }
+    Button.-error { color: ansi_red; }
+    Button.-error.-active { color: ansi_red; }
+    Button.-active { color: ansi_default; }
 
     /* --- Log viewer modal --- */
     LogViewerScreen { align: center middle; }
@@ -402,8 +505,6 @@ class SimulationMonitor(App):
         height: 92%;
     }
     #log-title {
-        text-style: bold;
-        background: ansi_bright_black;
         color: ansi_default;
         padding: 0 1;
         margin-bottom: 1;
@@ -414,7 +515,7 @@ class SimulationMonitor(App):
         scrollbar-size: 0 0;
     }
     #log-body { padding: 0 1; }
-    #log-close { margin-top: 1; width: 100%; }
+    #log-close { margin-top: 1; }
 
     /* --- Confirmation modal --- */
     ConfirmScreen { align: center middle; }
@@ -430,13 +531,14 @@ class SimulationMonitor(App):
         margin-bottom: 2;
         color: ansi_default;
     }
-    #confirm-buttons { align: center middle; height: 3; }
-    #confirm-buttons Button { margin: 0 2; }
+    #confirm-buttons { align: center middle; height: 1; }
+    #confirm-buttons Button { margin: 0 2; min-width: 9; }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("l", "view_logs", "Logs", show=True),
+        Binding("i", "view_info", "Info", show=True),
         Binding("c", "cancel_job", "Cancel Job", show=True),
         Binding("a", "cancel_array", "Cancel Array", show=True),
         Binding("r", "resubmit", "Resubmit", show=True),
@@ -471,6 +573,8 @@ class SimulationMonitor(App):
         )
         self._submitted_at: str | None = submitted_at
         self._row_data: list[dict[str, Any]] = []
+        self._dt_cursor_row: int = 0
+        self._anim_tick: int = 0
 
     # ------------------------------------------------------------------
     # Session manifest
@@ -521,14 +625,21 @@ class SimulationMonitor(App):
     def compose(self) -> ComposeResult:
         yield Static(f"  {self.TITLE}", id="title-bar")
         yield Static("", id="status-bar")
-        yield DataTable(id="sim-table", zebra_stripes=True, cursor_type="row")
-        yield Footer()
+        yield DataTable(
+            id="sim-table",
+            zebra_stripes=True,
+            cursor_type="row",
+            cursor_foreground_priority="renderable",
+        )
+        yield Static("", id="footer-keys", markup=False)
 
     def on_mount(self) -> None:
         self.register_theme(_MONO_THEME)
         self.theme = "monitor-mono"
+        self._update_footer_keys()
         self._any_mpi: bool = any(getattr(s, "mpi", False) for s in self._sims)
         table = self.query_one("#sim-table", DataTable)
+        table.add_column("", key="cur", width=3)
         table.add_column("#", key="idx")
         table.add_column("Hamiltonian", key="ham")
         for key, hdr in zip(self._param_keys, self._param_headers):
@@ -551,6 +662,7 @@ class SimulationMonitor(App):
 
         self._trigger_refresh()
         self.set_interval(self._refresh_interval, self._trigger_refresh)
+        self.set_interval(2.0, self._step_animation)
         self.call_after_refresh(self._remove_ansi_scrollbar_class)
 
     def watch_theme(self, _theme: str) -> None:
@@ -612,13 +724,19 @@ class SimulationMonitor(App):
                 status = se.get("status", "UNKNOWN")
                 runtime = se.get("runtime")
                 nodelist = se.get("nodelist")
+                if (
+                    status in {"FAILED", "COMPLETED"}
+                    and self._submit_dir is not None
+                    and _is_submitit_timeout(jobid, self._submit_dir, status=status)
+                ):
+                    status = "TIMEOUT"
             else:
                 running_file = Path(sim.sim_dir) / "RUNNING"
                 status = "CRASHED" if running_file.exists() else "INACTIVE"
                 runtime = None
                 nodelist = None
 
-            n_bins = _bin_count(sim, refresh=(status == "RUNNING"))
+            n_bins = _bin_count(sim, refresh=(status in {"RUNNING"} | _TERMINAL_STATES))
             has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
 
             sim_dict = sim.sim_dict
@@ -627,17 +745,15 @@ class SimulationMonitor(App):
 
             array_id = jobid.split("_")[0] if jobid and "_" in jobid else jobid or "-"
 
-            if status == "RUNNING" and runtime:
-                cpu_max = (
-                    sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
-                )
-                elapsed_h = _parse_elapsed_hours(runtime)
-                if cpu_max is not None and elapsed_h is not None:
-                    eta = _eta_str(float(cpu_max), elapsed_h)
-                else:
-                    eta = "-"
-            else:
-                eta = "-"
+            _cpu_max_raw = (
+                sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
+            )
+            _cpu_max = float(_cpu_max_raw) if _cpu_max_raw is not None else None
+            _elapsed_h = (
+                _parse_elapsed_hours(runtime)
+                if status == "RUNNING" and runtime
+                else None
+            )
 
             nbin_target = sim_dict.get("NBin") or sim_dict.get("Nbin")
 
@@ -665,7 +781,8 @@ class SimulationMonitor(App):
                 "has_checkpoint": has_checkpoint,
                 "node": nodelist or "-",
                 "elapsed": runtime or "-",
-                "eta": eta,
+                "cpu_max": _cpu_max,
+                "elapsed_h": _elapsed_h,
                 "peak_mem": res.get("max_rss") or "-",
                 "cpu_eff": res.get("cpu_eff") or "-",
             }
@@ -692,8 +809,20 @@ class SimulationMonitor(App):
             )
         )
 
-        for row in rows:
-            values: list[Any] = [row["idx"], row["ham"]]
+        restore_cursor = min(saved_cursor, len(rows) - 1) if rows else 0
+
+        # Pre-compute the width of the widest n_bins value across all rows so
+        # the fraction text has a uniform prefix and bars start at the same column.
+        max_bins_w = max((len(str(r["n_bins"])) for r in rows), default=1)
+
+        for i, row in enumerate(rows):
+            if i == restore_cursor:
+                cur_indicator = ">"
+            elif row["status"] == "RUNNING":
+                cur_indicator = _ANIM_FRAMES[self._anim_tick % 2]
+            else:
+                cur_indicator = " "
+            values: list[Any] = [cur_indicator, row["idx"], row["ham"]]
             for key in self._param_keys:
                 values.append(row.get(key, "-"))
             values.append(row["n_omp"])
@@ -701,12 +830,23 @@ class SimulationMonitor(App):
                 values.append(row["n_mpi"])
             if self._cs is not None and self._cs.executor == "slurm":
                 values.extend([row["partition"], row["mem"]])
+            _cpu_max = row.get("cpu_max")
+            _nbin_target = None if row.get("has_checkpoint") else row.get("nbin_target")
+            # CPU_MAX mode: wall-time budget set, no NBin target → show ETA bar.
+            # NBin mode: bin target set (or no cpu_max) → show bins progress bar.
+            cpu_max_mode = _cpu_max is not None and _cpu_max > 0 and not _nbin_target
+            _bins_val = _bins_cell(row["n_bins"], None if cpu_max_mode else _nbin_target, max_bins_w)
+            if cpu_max_mode:
+                assert _cpu_max is not None  # guaranteed by cpu_max_mode
+                if row["status"] == "COMPLETED":
+                    _eta_val = Text("[" + "/" * 8 + "]")
+                else:
+                    _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
+            else:
+                _eta_val = Text("-")
             values.extend(
                 [
-                    _bins_cell(
-                        row["n_bins"],
-                        None if row.get("has_checkpoint") else row.get("nbin_target"),
-                    ),
+                    _bins_val,
                     row["array_id"],
                     row["jobid"],
                 ]
@@ -714,15 +854,15 @@ class SimulationMonitor(App):
             status_cell = _styled(row["status"])
             if row.get("has_checkpoint"):
                 if row["status"] in ("RUNNING", "PENDING"):
-                    status_cell.append(" ↺", style="bold green")
+                    status_cell.append(" [R]")
                 else:
-                    status_cell.append(" ↺", style="yellow")
+                    status_cell.append(" [R]", style="dim")
             values.append(status_cell)
             values.append(row["node"])
             values.extend(
                 [
                     row["elapsed"],
-                    row["eta"],
+                    _eta_val,
                     row.get("peak_mem", "-"),
                     row.get("cpu_eff", "-"),
                 ]
@@ -730,23 +870,116 @@ class SimulationMonitor(App):
             table.add_row(*values, key=str(row["idx"]))
 
         if rows:
-            table.move_cursor(row=min(saved_cursor, len(rows) - 1))
+            self._dt_cursor_row = restore_cursor
+            table.move_cursor(row=restore_cursor)
 
         if array_ids:
             label = "Array" if len(array_ids) == 1 else "Arrays"
             array_suffix = f"  ·  {label} {', '.join(array_ids)}"
         else:
             array_suffix = ""
-        self.query_one("#title-bar", Static).update(f"  {self.TITLE}{array_suffix}")
+        job_name_suffix = (
+            f"  ·  job: {self._cs.job_name}" if self._cs and self._cs.job_name else ""
+        )
+        self.query_one("#title-bar", Static).update(
+            f"  {self.TITLE}{job_name_suffix}{array_suffix}"
+        )
 
         at_str = f"  ·  submitted {self._submitted_at}" if self._submitted_at else ""
         self.query_one("#status-bar", Static).update(
             f"[dim]{len(rows)} simulation(s)  ·  auto-refresh every {self._refresh_interval:.0f}s{at_str}[/dim]"
         )
+        self._update_footer_keys()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        try:
+            table = self.query_one("#sim-table", DataTable)
+        except Exception:
+            return None  # DOM not ready yet
+        row = table.cursor_row
+        status = (
+            self._row_data[row]["status"] if 0 <= row < len(self._row_data) else None
+        )
+        if action == "view_logs":
+            jobid = (
+                self._row_data[row].get("jobid", "-")
+                if 0 <= row < len(self._row_data)
+                else "-"
+            )
+            return True if jobid != "-" else None
+        if action == "view_info":
+            return True if status == "COMPLETED" else None
+        if action == "cancel_job":
+            return None if status in _TERMINAL_STATES else True
+        if action == "cancel_array":
+            if not (0 <= row < len(self._row_data)):
+                return None
+            selected_array_id = self._row_data[row].get("array_id", "-")
+            if selected_array_id == "-":
+                return None
+            if "_" in self._row_data[row].get("jobid", ""):
+                # Array job: enable if any task in this array is still active.
+                any_active = any(
+                    r.get("array_id") == selected_array_id
+                    and r.get("status") not in _TERMINAL_STATES
+                    for r in self._row_data
+                )
+                return True if any_active else None
+            # Single job: same logic as cancel_job.
+            return None if status in _TERMINAL_STATES else True
+        return True
+
+    @on(DataTable.RowHighlighted, "#sim-table")
+    def _on_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        table = self.query_one("#sim-table", DataTable)
+        old_row = self._dt_cursor_row
+        self._dt_cursor_row = event.cursor_row
+        with contextlib.suppress(Exception):
+            old_status = (
+                self._row_data[old_row]["status"]
+                if old_row < len(self._row_data)
+                else ""
+            )
+            old_indicator = (
+                _ANIM_FRAMES[self._anim_tick % 2] if old_status == "RUNNING" else " "
+            )
+            table.update_cell(str(old_row), "cur", old_indicator)
+        with contextlib.suppress(Exception):
+            table.update_cell(str(self._dt_cursor_row), "cur", ">")
+        self._update_footer_keys()
+
+    def _update_footer_keys(self) -> None:
+        _KEYS: list[tuple[str, str, str | None]] = [
+            ("q", "Quit", None),
+            ("l", "Logs", "view_logs"),
+            ("i", "Info", "view_info"),
+            ("c", "Cancel Job", "cancel_job"),
+            ("a", "Cancel Array", "cancel_array"),
+            ("r", "Resubmit", None),
+            ("f", "Refresh", None),
+        ]
+        t = Text()
+        for idx, (key, label, action) in enumerate(_KEYS):
+            enabled = self.check_action(action, ()) if action else True
+            style = "" if enabled else "dim"
+            if idx:
+                t.append("    ")
+            t.append(f"[{key}] {label}", style=style)
+        with contextlib.suppress(Exception):
+            self.query_one("#footer-keys", Static).update(t)
+
+    def _step_animation(self) -> None:
+        self._anim_tick += 1
+        frame = _ANIM_FRAMES[self._anim_tick % 2]
+        table = self.query_one("#sim-table", DataTable)
+        for i, row in enumerate(self._row_data):
+            if row["status"] == "RUNNING" and i != self._dt_cursor_row:
+                with contextlib.suppress(Exception):
+                    table.update_cell(str(i), "cur", frame)
 
     def _selected_sim(self) -> Simulation | None:
         table = self.query_one("#sim-table", DataTable)
@@ -764,16 +997,14 @@ class SimulationMonitor(App):
         if sim is None:
             self.notify("No simulation selected.", severity="warning")
             return
-        self._load_and_show_log(sim)
-
-    @work(thread=True)
-    def _load_and_show_log(self, sim: Simulation) -> None:
         jobid = get_job_id(sim)
         if not jobid:
-            self.call_from_thread(
-                self.notify, "No job ID for this simulation.", severity="warning"
-            )
+            self.notify("No job ID for this simulation.", severity="warning")
             return
+        self._load_and_show_log(sim, jobid)
+
+    @work(thread=True)
+    def _load_and_show_log(self, sim: Simulation, jobid: str) -> None:
         log_path = _find_job_log(
             jobid, root_dir=[sim.sim_dir, "."], submit_dir=self._submit_dir
         )
@@ -799,6 +1030,26 @@ class SimulationMonitor(App):
             )
 
     def _show_log_screen(self, title: str, content: str) -> None:
+        self.push_screen(LogViewerScreen(title, content))
+
+    def action_view_info(self) -> None:
+        sim = self._selected_sim()
+        if sim is None:
+            self.notify("No simulation selected.", severity="warning")
+            return
+        info_path = Path(sim.sim_dir) / "info"
+        if not info_path.exists():
+            self.notify(
+                f"No info file found in {Path(sim.sim_dir).name}.",
+                severity="warning",
+            )
+            return
+        try:
+            content = info_path.read_text(errors="replace")
+        except Exception as exc:
+            self.notify(f"Error reading info file: {exc}", severity="error")
+            return
+        title = f"Info: {Path(sim.sim_dir).name}"
         self.push_screen(LogViewerScreen(title, content))
 
     def action_cancel_job(self) -> None:
@@ -875,7 +1126,7 @@ class SimulationMonitor(App):
         has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
         msg = f"Force resubmit {sim_name}?"
         if has_checkpoint:
-            msg += "\n\n⚠  Checkpoint restart detected.\nALF will append to existing data.h5."
+            msg += "\n\n[!]  Checkpoint restart detected.\nALF will append to existing data.h5."
 
         def _on_confirm(confirmed: bool | None) -> None:
             if not confirmed:

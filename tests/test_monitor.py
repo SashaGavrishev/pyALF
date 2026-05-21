@@ -88,7 +88,7 @@ def no_slurm():
 def test_styled_running():
     t = _styled("RUNNING")
     assert str(t) == "RUNNING"
-    assert "green" in t.style
+    assert t.style == ""
 
 
 def test_styled_failed():
@@ -98,7 +98,7 @@ def test_styled_failed():
 
 def test_styled_pending():
     t = _styled("PENDING")
-    assert "yellow" in t.style
+    assert "dim" in t.style
 
 
 def test_styled_unknown_status():
@@ -253,9 +253,10 @@ async def test_action_view_logs_warns_when_no_jobid(tmp_path, no_slurm):
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
+        # check_action disables "l" when row has no job ID, so call directly
+        # to exercise the defensive guard in action_view_logs.
         with patch.object(app, "notify") as mock_notify:
-            await pilot.press("l")
-            await app.workers.wait_for_complete()
+            app.action_view_logs()
             await pilot.pause()
     assert any("No job ID" in str(call.args[0]) for call in mock_notify.call_args_list)
 
@@ -465,13 +466,13 @@ async def test_action_resubmit_declined(tmp_path):
     cs.submit.assert_not_called()
 
 
-async def test_f5_retriggers_refresh(tmp_path, no_slurm):
+async def test_f_retriggers_refresh(tmp_path, no_slurm):
     sim = _make_mock_sim(tmp_path / "sim0")
     app = _monitor([sim])
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        await pilot.press("f5")
+        await pilot.press("f")
         await app.workers.wait_for_complete()
         await pilot.pause()
         # Table should still have one row after the refresh
@@ -675,7 +676,7 @@ def test_bins_cell_partial_progress_returns_rich_text():
     result = _bins_cell(50, 100)
     assert isinstance(result, Text)
     assert "50/100" in result.plain
-    assert "░" in result.plain  # bar is not fully filled
+    assert "-" in result.plain  # bar is not fully filled
 
 
 def test_bins_cell_complete_progress_no_empty_blocks():
@@ -686,28 +687,91 @@ def test_bins_cell_complete_progress_no_empty_blocks():
     result = _bins_cell(100, 100)
     assert isinstance(result, Text)
     assert "100/100" in result.plain
-    assert "░" not in result.plain  # bar is fully filled
+    assert "-" not in result.plain  # bar is fully filled (no empty slots)
 
 
-def test_bins_cell_complete_uses_green_style():
+def test_bins_cell_complete_uses_no_dim_style():
     from py_alf.monitor import _bins_cell
 
     result = _bins_cell(100, 100)
-    assert any("green" in str(span.style) for span in result._spans)
+    # Complete bar uses default ("") style, not dim — distinct from partial
+    assert not any("dim" in str(span.style) for span in result._spans)
 
 
-def test_bins_cell_partial_uses_yellow_style():
+def test_bins_cell_partial_uses_dim_style():
     from py_alf.monitor import _bins_cell
 
     result = _bins_cell(50, 100)
-    assert any("yellow" in str(span.style) for span in result._spans)
+    assert any("dim" in str(span.style) for span in result._spans)
 
 
 def test_bins_cell_over_target_capped_at_full_bar():
     from py_alf.monitor import _bins_cell
 
     result = _bins_cell(200, 100)
-    assert "░" not in result.plain
+    assert "-" not in result.plain
+
+
+def test_bins_cell_max_bins_w_pads_count():
+    from py_alf.monitor import _bins_cell
+
+    result = _bins_cell(5, 100, max_bins_w=3)
+    assert result.plain.startswith("  5/100")
+
+
+# ---------------------------------------------------------------------------
+# _eta_cell
+# ---------------------------------------------------------------------------
+
+
+def test_eta_cell_no_elapsed_returns_dash():
+    from rich.text import Text
+
+    from py_alf.monitor import _eta_cell
+
+    result = _eta_cell(24.0, None)
+    assert isinstance(result, Text)
+    assert result.plain == "-"
+
+
+def test_eta_cell_running_shows_remaining_time():
+    from rich.text import Text
+
+    from py_alf.monitor import _eta_cell
+
+    # 2h elapsed out of 24h → 22h remaining
+    result = _eta_cell(24.0, 2.0)
+    assert isinstance(result, Text)
+    assert "22h" in result.plain
+    assert "[" in result.plain  # bar present
+
+
+def test_eta_cell_running_bar_uses_dim_style():
+    from py_alf.monitor import _eta_cell
+
+    result = _eta_cell(24.0, 2.0)
+    assert any("dim" in str(span.style) for span in result._spans)
+
+
+def test_eta_cell_overtime_shows_overtime_label():
+    from py_alf.monitor import _eta_cell
+
+    result = _eta_cell(2.0, 3.0)  # 3h elapsed, only 2h allowed
+    assert "overtime" in result.plain
+
+
+def test_eta_cell_overtime_bar_uses_red_style():
+    from py_alf.monitor import _eta_cell
+
+    result = _eta_cell(2.0, 3.0)
+    assert any("red" in str(span.style) for span in result._spans)
+
+
+def test_eta_cell_exactly_at_limit_shows_zero_remaining():
+    from py_alf.monitor import _eta_cell
+
+    result = _eta_cell(2.0, 2.0)
+    assert "overtime" in result.plain
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +808,7 @@ def test_session_entry_run_calls_alf_binary(tmp_path):
 
     with (
         patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("py_alf.cluster_submission.getenv", return_value={}),
         patch("subprocess.run") as mock_run,
     ):
         e.run()
@@ -767,6 +832,7 @@ def test_session_entry_run_mpi_wraps_with_mpiexec(tmp_path):
 
     with (
         patch("py_alf.simulation.cd", new=_fake_cd),
+        patch("py_alf.cluster_submission.getenv", return_value={}),
         patch("subprocess.run") as mock_run,
     ):
         e.run()
@@ -836,6 +902,33 @@ async def test_monitor_peak_resources_dash_for_running_job(tmp_path):
             await pilot.pause()
     assert app._row_data[0]["peak_mem"] == "-"
     assert app._row_data[0]["cpu_eff"] == "-"
+
+
+async def test_monitor_cpu_max_completed_shows_full_ascii_bar(tmp_path):
+    """CPU_MAX mode: COMPLETED row ETA cell is a full ASCII bar, not block chars."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"CPU_MAX": 24}  # no NBin → CPU_MAX mode
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="10"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"10": {"status": "COMPLETED", "runtime": "02:00:00", "nodelist": None}},
+        ),
+        patch("py_alf.monitor._bin_count", return_value=40),
+        patch("py_alf.monitor._get_jobs_resources_bulk", return_value={}),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            # The ETA cell for COMPLETED in CPU_MAX mode must be an ASCII bar, not "█".
+            table = app.query_one("DataTable")
+            col_labels = [str(col.label) for col in table.columns.values()]
+            eta_idx = col_labels.index("ETA")
+            cell = table.get_cell_at((0, eta_idx))
+            cell_plain = cell.plain if hasattr(cell, "plain") else str(cell)
+            assert "[" in cell_plain and "/" in cell_plain
+            assert "█" not in cell_plain
 
 
 async def test_monitor_nbin_target_from_sim_dict(tmp_path, no_slurm):

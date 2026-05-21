@@ -13,6 +13,7 @@ __author__ = "Johannes Hofmann"
 __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -25,7 +26,7 @@ from colorama import Fore
 from tabulate import tabulate
 from tqdm import tqdm
 
-from .simulation import Simulation
+from .simulation import Simulation, getenv
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +383,8 @@ def _exec_alf_binary(
     mpi: bool,
     mpiexec: str = "mpiexec",
     mpiexec_args: list[str] | None = None,
+    config: str = "",
+    alf_dir: str = ".",
 ) -> None:
     """Execute the ALF binary already present in *sim_dir*.
 
@@ -393,7 +396,7 @@ def _exec_alf_binary(
 
     sim_dir_path = Path(sim_dir)
     executable = os.path.join(str(sim_dir), "ALF.out")
-    env = os.environ.copy()
+    env = getenv(config, alf_dir)
     # Prefer SLURM_CPUS_PER_TASK so OMP_NUM_THREADS exactly matches the
     # allocated CPU slots, which is best practice for hybrid MPI+OpenMP jobs.
     env["OMP_NUM_THREADS"] = os.environ.get("SLURM_CPUS_PER_TASK", str(n_omp))
@@ -440,6 +443,8 @@ def _run_alf(sim: Simulation) -> None:
         getattr(sim, "mpi", False),
         mpiexec=getattr(sim, "mpiexec", "mpiexec"),
         mpiexec_args=getattr(sim, "mpiexec_args", []),
+        config=getattr(sim, "config", ""),
+        alf_dir=getattr(sim.alf_src, "alf_dir", "."),
     )
 
 
@@ -459,6 +464,23 @@ def _hours_to_hms(h: float) -> str:
     hh, rem = divmod(total_s, 3600)
     mm, ss = divmod(rem, 60)
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def _slurm_time_to_minutes(value: int | str) -> int:
+    """Normalise a slurm_time value to integer minutes.
+
+    Accepts an integer (already in minutes) or an HH:MM:SS / D-HH:MM:SS string.
+    Raises ValueError for unrecognised strings.
+    """
+    if isinstance(value, int):
+        return value
+    hours = _parse_slurm_time_hours(value)
+    if hours is None:
+        raise ValueError(
+            f"Cannot parse slurm_time {value!r} — expected an integer (minutes) "
+            "or a string in HH:MM:SS / D-HH:MM:SS format."
+        )
+    return int(hours * 60)
 
 
 class ClusterSubmitter:
@@ -800,7 +822,21 @@ class ClusterSubmitter:
                         f"n_omp={s.n_omp}, n_mpi={s.n_mpi}, mpi={s.mpi}."
                     )
 
-        timeout_hours = max(1, float(sim.sim_dict.get("CPU_MAX", 24)))
+        _raw_slurm_time = (self.slurm_kwargs or {}).get("slurm_time")
+        if _raw_slurm_time is None:
+            _raw_slurm_time = (job_properties or {}).get("slurm_time")
+        if _raw_slurm_time is not None:
+            timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
+        else:
+            cpu_max = float(sim.sim_dict.get("CPU_MAX", 0))
+            if cpu_max <= 0 and self.executor == "slurm":
+                raise ValueError(
+                    "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
+                    "time limit, so a SLURM wall time cannot be derived automatically. "
+                    "Pass slurm_time (int minutes or HH:MM:SS) to ClusterSubmitter "
+                    "or job_properties."
+                )
+            timeout_hours = cpu_max if cpu_max > 0 else 0.0
 
         # Build executor parameters from defaults, instance-level kwargs,
         # then per-call overrides.
@@ -855,6 +891,8 @@ class ClusterSubmitter:
         params.update(self.slurm_kwargs)
         if job_properties:
             params.update(job_properties)
+        if "slurm_time" in params:
+            params["slurm_time"] = _slurm_time_to_minutes(params["slurm_time"])
 
         if self.executor == "slurm":
             extra = dict(params.get("additional_parameters") or {})
@@ -875,7 +913,7 @@ class ClusterSubmitter:
                         self.partition_rules[selected].get("max_hours", slurm_time_h)
                     )
                     slurm_time_h = min(slurm_time_h, max_h)
-                extra["time"] = _hours_to_hms(slurm_time_h)
+                extra["time"] = int(slurm_time_h * 60)
             params["additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.
@@ -999,6 +1037,19 @@ def get_job_id(sim: Simulation) -> str | None:
         return jobid_file.read_text().strip()
 
 
+def _normalize_slurm_state(raw: str) -> str:
+    """Return a canonical SLURM state from a raw sacct or squeue value.
+
+    sacct truncates state strings to its column width and appends ``+``, e.g.
+    ``CANCELLED+`` (cancelled by uid) or ``OUT_OF_ME+`` (out of memory).
+    This strips the truncation marker and restores full names.
+    """
+    state = raw.split()[0].rstrip("+")
+    if state == "OUT_OF_ME":
+        return "OUT_OF_MEMORY"
+    return state
+
+
 def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
     """
     Query SLURM sacct for job status, elapsed time, and allocated node.
@@ -1023,7 +1074,7 @@ def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
         for line in lines:
             parts = line.split()
             if len(parts) >= 1:
-                state = parts[0]
+                state = _normalize_slurm_state(parts[0])
                 runtime = parts[1] if len(parts) > 1 else None
                 raw_node = parts[2] if len(parts) > 2 else None
                 return {
@@ -1061,7 +1112,7 @@ def _get_slurm_status_bulk_sacct(
             parts = line.split()
             if len(parts) >= 2:
                 jobid = parts[0]
-                state = parts[1]
+                state = _normalize_slurm_state(parts[1])
                 runtime = parts[2] if len(parts) > 2 else None
                 raw_node = parts[3] if len(parts) > 3 else None
                 status_map[jobid] = {
@@ -1142,11 +1193,11 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
                 if len(parts) < 4:
                     logger.warning(f"Unexpected squeue output line: '{line}'")
                     continue
-                jid, idx, state, runtime = parts[:4]
+                jid, idx, raw_state, runtime = parts[:4]
                 raw_node = parts[4] if len(parts) > 4 else None
                 full_id = jid if idx == "N/A" else idx
                 status_map[full_id] = {
-                    "status": state,
+                    "status": _normalize_slurm_state(raw_state),
                     "runtime": runtime,
                     "nodelist": _sanitise_nodelist(raw_node),
                 }
@@ -1154,14 +1205,28 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
             except Exception as e:
                 logger.error(f"Error parsing squeue output line '{line}': {e}")
                 continue
-        # For jobs not found in squeue output, fallback to sacct bulk
+        # For jobs not found in squeue, fall back to sacct.
+        # Also include COMPLETING jobs: that state means the job has finished
+        # executing and SLURM is cleaning up — sacct may already have the true
+        # terminal state (TIMEOUT, COMPLETED, FAILED, …).
         missing_jobids = [jid for jid in jobids if jid not in found_in_squeue]
-        if missing_jobids:
-            sacct_statuses = _get_slurm_status_bulk_sacct(missing_jobids)
+        completing_ids = [
+            jid
+            for jid in found_in_squeue
+            if status_map[jid].get("status") == "COMPLETING"
+        ]
+        need_sacct = missing_jobids + completing_ids
+        if need_sacct:
+            sacct_statuses = _get_slurm_status_bulk_sacct(need_sacct)
             for jid in missing_jobids:
                 status_map[jid] = sacct_statuses.get(
                     jid, {"status": "UNKNOWN", "runtime": None, "nodelist": None}
                 )
+            for jid in completing_ids:
+                entry = sacct_statuses.get(jid, {})
+                if entry.get("status") not in (None, "UNKNOWN"):
+                    status_map[jid] = entry
+                # else: sacct hasn't caught up yet — keep COMPLETING
     else:
         # squeue failed, use sacct bulk for all jobids
         sacct_statuses = _get_slurm_status_bulk_sacct(jobids)
@@ -1174,6 +1239,38 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
 
 
 _resource_cache: dict[str, dict[str, str | None]] = {}
+
+_submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
+
+
+def _is_submitit_timeout(
+    jobid: str, submit_dir: str | Path, status: str = "FAILED"
+) -> bool:
+    """Return True if a FAILED or COMPLETED job was actually a wall-time timeout.
+
+    submitit can cause SLURM to misreport the terminal state in two ways:
+
+    - FAILED: submitit's SIGUSR1 handler fires before SLURM's kill, decides the
+      job timed out, and exits non-zero.  Indicator: "this job is timed-out".
+    - COMPLETED: SLURM sends SIGTERM at the wall time; submitit bypasses it, ALF
+      exits cleanly before SIGKILL, so SLURM records COMPLETED.  Indicator:
+      "Bypassing signal SIGTERM".  Not applied to FAILED to avoid
+      misclassifying preempted-then-requeued jobs, which also log the SIGTERM
+      bypass but correctly stay FAILED.
+    """
+    if jobid not in _submitit_timeout_cache:
+        text = ""
+        log_path = Path(submit_dir) / f"{jobid}_0_log.out"
+        if log_path.exists():
+            with contextlib.suppress(OSError):
+                text = log_path.read_text(errors="replace")
+        _submitit_timeout_cache[jobid] = (
+            "this job is timed-out" in text,
+            "Bypassing signal SIGTERM" in text,
+        )
+    timed_out, sigterm_bypassed = _submitit_timeout_cache[jobid]
+    return timed_out or (status == "COMPLETED" and sigterm_bypassed)
+
 
 _TERMINAL_STATES: frozenset[str] = frozenset(
     {
