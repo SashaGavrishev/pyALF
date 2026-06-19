@@ -828,7 +828,8 @@ class ClusterSubmitter:
         if _raw_slurm_time is not None:
             timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
         else:
-            cpu_max = float(sim.sim_dict.get("CPU_MAX", 0))
+            _sim_dict0 = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+            cpu_max = float(_sim_dict0.get("CPU_MAX", 0))
             if cpu_max <= 0 and self.executor == "slurm":
                 raise ValueError(
                     "CPU_MAX=0 means ALF stops after Nbin bins with no internal "
@@ -979,9 +980,10 @@ class ClusterSubmitter:
             for sim in sims_to_resubmit:
                 num_bins = sim.bin_count(counting_obs=counting_obs, refresh=True)
                 status = sim.get_cluster_job_status()
+                _sd = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
                 label = (
                     "".join(
-                        f"{k}={sim.sim_dict[v]}, " if v in sim.sim_dict else ""
+                        f"{k}={_sd[v]}, " if v in _sd else ""
                         for k, v in params.items()
                     )
                     if params
@@ -1441,7 +1443,8 @@ def get_status_all(
         num_bins = _bin_count(
             sim, counting_obs, refresh=(status == "RUNNING") or refresh_cache
         )
-        row = [sim.sim_dict.get(key, None) for key in keys]
+        _sd = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+        row = [_sd.get(key, None) for key in keys]
         if showid:
             row = [idx] + row
         row.append(num_bins)
