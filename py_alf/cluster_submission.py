@@ -1647,7 +1647,10 @@ _bin_cache: dict[Any, int] = {}
 
 
 def _bin_count(
-    sim: Simulation, counting_obs: str = "Ener_scal", refresh: bool = False
+    sim: Simulation,
+    counting_obs: str = "Ener_scal",
+    refresh: bool = False,
+    data_dir: str | None = None,
 ) -> int:
     """
     Counts bins for a given observable in simulation data, with caching.
@@ -1655,12 +1658,15 @@ def _bin_count(
         sim: Simulation instance.
         counting_obs: Observable name.
         refresh: Whether to refresh cache.
+        data_dir: Directory holding ``data.h5`` to read instead of
+            ``sim.sim_dir`` — used to count bins in a single ``Temp_i/``
+            realisation of a PARALLEL_PARAMS job.
     Returns:
         Number of bins.
     """
     import h5py
 
-    filename = os.path.join(sim.sim_dir, "data.h5")
+    filename = os.path.join(data_dir if data_dir is not None else sim.sim_dir, "data.h5")
     key = (filename, counting_obs)
 
     if (key in _bin_cache) and (not refresh):

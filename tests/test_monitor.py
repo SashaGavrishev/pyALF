@@ -1041,3 +1041,76 @@ def test_load_session_sims_missing_job_id_defaults_to_none(tmp_path):
     _write_session_file(session, [entry])
     sims = load_session_sims(session)
     assert sims[0].job_id is None
+
+
+# ---------------------------------------------------------------------------
+# PARALLEL_PARAMS expansion — one row per Temp_i realisation
+# ---------------------------------------------------------------------------
+
+
+def _make_parallel_params_sim(sim_dir: Path, n_real: int):
+    """A PARALLEL_PARAMS sim (single job) with n_real prepared Temp_i/ dirs."""
+    sim = _make_mock_sim(sim_dir, n_mpi=n_real, mpi=True)
+    sim.config = "GNU PARALLEL_PARAMS HDF5 NO-INTERACTIVE"
+    sim.sim_dict = [{"U": 4.0, "beta": 10.0, "mpi_per_parameter_set": 1}] * n_real
+    for i in range(n_real):
+        (sim_dir / f"Temp_{i}").mkdir(parents=True, exist_ok=True)
+    return sim
+
+
+async def test_parallel_params_expands_into_per_realisation_rows(tmp_path):
+    sim = _make_parallel_params_sim(tmp_path / "sim0", n_real=3)
+    # Distinct bin counts per realisation, keyed off the Temp_i data_dir.
+    bins_by_temp = {"Temp_0": 10, "Temp_1": 20, "Temp_2": 30}
+
+    def fake_bin_count(_sim, refresh=False, data_dir=None, **_kw):
+        return bins_by_temp[Path(data_dir).name]
+
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="100"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "100": {"status": "RUNNING", "runtime": "01:00:00", "nodelist": "n01"}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", side_effect=fake_bin_count),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            title = str(app.query_one("#title-bar").render())
+
+    rows = app._row_data
+    # One row per realisation, all sharing the single (non-array) job id.
+    assert len(rows) == 3
+    assert [r["realisation"] for r in rows] == [0, 1, 2]
+    assert [r["n_bins"] for r in rows] == [10, 20, 30]
+    assert [r["array_display"] for r in rows] == ["PP[0]", "PP[1]", "PP[2]"]
+    assert all(r["jobid"] == "100" for r in rows)
+    assert all(r["array_id"] == "-" for r in rows)  # not a SLURM array
+    assert all(r["is_pp"] for r in rows)
+    assert all(r["_sim_ref"] == 0 for r in rows)  # all map back to the one sim
+    assert "PARALLEL_PARAMS expansion" in title
+
+
+async def test_parallel_params_without_temp_dirs_falls_back_to_single_row(tmp_path):
+    """PARALLEL_PARAMS config but no Temp_i yet → one parent row, no crash."""
+    sim = _make_mock_sim(tmp_path / "sim0", n_mpi=4, mpi=True)
+    sim.config = "GNU PARALLEL_PARAMS HDF5"
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="55"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={"55": {"status": "PENDING", "runtime": None, "nodelist": None}},
+        ),
+        patch("py_alf.monitor._bin_count", return_value=0),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert len(app._row_data) == 1
+    assert app._row_data[0]["realisation"] is None
+    assert app._row_data[0]["is_pp"] is False

@@ -428,6 +428,35 @@ class _SessionEntry:
 
 
 # ---------------------------------------------------------------------------
+# PARALLEL_PARAMS expansion
+# ---------------------------------------------------------------------------
+
+
+def _is_parallel_params(sim) -> bool:
+    """True if *sim* is a PARALLEL_PARAMS job (one SLURM job, Temp_i/ per rank).
+
+    Detected from the build config rather than ``sim_dict`` because a session
+    manifest stores only the first parameter dict, so the list is not available
+    after reattachment — but the ``PARALLEL_PARAMS`` config tag is preserved.
+    """
+    return "PARALLEL_PARAMS" in (getattr(sim, "config", "") or "")
+
+
+def _parallel_param_temp_dirs(sim_dir: str | Path) -> list[tuple[int, Path]]:
+    """Return ``(realisation_index, Temp_i_path)`` pairs under *sim_dir*, sorted.
+
+    ALF prepares these directories at submission time (``run(only_prep=True)``),
+    so they exist even while the job is still PENDING.
+    """
+    found: list[tuple[int, Path]] = []
+    for p in Path(sim_dir).glob("Temp_*"):
+        m = _re.fullmatch(r"Temp_(\d+)", p.name)
+        if m and p.is_dir():
+            found.append((int(m.group(1)), p))
+    return sorted(found, key=lambda t: t[0])
+
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -717,8 +746,9 @@ class SimulationMonitor(App):
             _shared_mem = self._cs.slurm_mem
 
         rows: list[dict[str, Any]] = []
-        for idx, sim in enumerate(self._sims):
-            jobid = jobid_list[idx]
+        display_idx = 0
+        for sim_ref, sim in enumerate(self._sims):
+            jobid = jobid_list[sim_ref]
             if jobid:
                 se = statuses.get(jobid, {"status": "UNKNOWN", "runtime": None})
                 status = se.get("status", "UNKNOWN")
@@ -736,14 +766,21 @@ class SimulationMonitor(App):
                 runtime = None
                 nodelist = None
 
-            n_bins = _bin_count(sim, refresh=(status in {"RUNNING"} | _TERMINAL_STATES))
-            has_checkpoint = any(Path(sim.sim_dir).glob("confin_*"))
-
             sim_dict = sim.sim_dict
             if isinstance(sim_dict, list):
                 sim_dict = sim_dict[0] if sim_dict else {}
 
-            array_id = jobid.split("_")[0] if jobid and "_" in jobid else jobid or "-"
+            # A PARALLEL_PARAMS job is a *single* SLURM job whose ranks each write
+            # an independent realisation into Temp_i/.  Expand it into one row per
+            # realisation so per-config bin progress is visible.  These rows share
+            # the one job id — this is NOT a SLURM array (see array_id below).
+            if _is_parallel_params(sim):
+                temp_dirs = _parallel_param_temp_dirs(sim.sim_dir)
+                units: list[tuple[int | None, Path]] = temp_dirs or [
+                    (None, Path(sim.sim_dir))
+                ]
+            else:
+                units = [(None, Path(sim.sim_dir))]
 
             _cpu_max_raw = (
                 sim_dict.get("CPU_MAX") if isinstance(sim_dict, dict) else None
@@ -768,30 +805,62 @@ class SimulationMonitor(App):
                     with contextlib.suppress(Exception):
                         res = json.loads(res_file.read_text())
 
-            row: dict[str, Any] = {
-                "idx": idx,
-                "ham": sim.ham_name,
-                "n_omp": sim.n_omp,
-                "n_mpi": sim.n_mpi if getattr(sim, "mpi", False) else 1,
-                "n_bins": n_bins,
-                "nbin_target": int(nbin_target) if nbin_target is not None else None,
-                "array_id": array_id,
-                "jobid": jobid or "-",
-                "status": status,
-                "has_checkpoint": has_checkpoint,
-                "node": nodelist or "-",
-                "elapsed": runtime or "-",
-                "cpu_max": _cpu_max,
-                "elapsed_h": _elapsed_h,
-                "peak_mem": res.get("max_rss") or "-",
-                "cpu_eff": res.get("cpu_eff") or "-",
-            }
-            for key in self._param_keys:
-                row[key] = str(sim_dict.get(key, "-"))
-            if self._cs is not None and self._cs.executor == "slurm":
-                row["partition"] = _shared_partition
-                row["mem"] = _shared_mem
-            rows.append(row)
+            for realisation, eff_dir in units:
+                is_pp_row = realisation is not None
+                n_bins = _bin_count(
+                    sim,
+                    refresh=(status in {"RUNNING"} | _TERMINAL_STATES),
+                    data_dir=str(eff_dir),
+                )
+                has_checkpoint = any(eff_dir.glob("confin_*"))
+
+                # array_id drives the "Cancel Array" action and the array title
+                # note; only true array tasks (jobid like 1234_5) qualify.  A PP
+                # expansion is one job, so array_id stays "-" and the column shows
+                # a distinct "PP[i]" tag instead.
+                if jobid and "_" in jobid:
+                    array_id = jobid.split("_")[0]
+                elif is_pp_row:
+                    array_id = "-"
+                else:
+                    array_id = jobid or "-"
+                array_display = f"PP[{realisation}]" if is_pp_row else array_id
+
+                if is_pp_row:
+                    n_mpi = int(sim_dict.get("mpi_per_parameter_set", 1) or 1)
+                else:
+                    n_mpi = sim.n_mpi if getattr(sim, "mpi", False) else 1
+
+                row: dict[str, Any] = {
+                    "idx": display_idx,
+                    "_sim_ref": sim_ref,
+                    "realisation": realisation,
+                    "effective_dir": str(eff_dir),
+                    "is_pp": is_pp_row,
+                    "ham": sim.ham_name,
+                    "n_omp": sim.n_omp,
+                    "n_mpi": n_mpi,
+                    "n_bins": n_bins,
+                    "nbin_target": int(nbin_target) if nbin_target is not None else None,
+                    "array_id": array_id,
+                    "array_display": array_display,
+                    "jobid": jobid or "-",
+                    "status": status,
+                    "has_checkpoint": has_checkpoint,
+                    "node": nodelist or "-",
+                    "elapsed": runtime or "-",
+                    "cpu_max": _cpu_max,
+                    "elapsed_h": _elapsed_h,
+                    "peak_mem": res.get("max_rss") or "-",
+                    "cpu_eff": res.get("cpu_eff") or "-",
+                }
+                for key in self._param_keys:
+                    row[key] = str(sim_dict.get(key, "-"))
+                if self._cs is not None and self._cs.executor == "slurm":
+                    row["partition"] = _shared_partition
+                    row["mem"] = _shared_mem
+                rows.append(row)
+                display_idx += 1
 
         self.call_from_thread(self._apply_rows, rows)
 
@@ -847,7 +916,7 @@ class SimulationMonitor(App):
             values.extend(
                 [
                     _bins_val,
-                    row["array_id"],
+                    row.get("array_display", row["array_id"]),
                     row["jobid"],
                 ]
             )
@@ -878,16 +947,33 @@ class SimulationMonitor(App):
             array_suffix = f"  ·  {label} {', '.join(array_ids)}"
         else:
             array_suffix = ""
+        # PARALLEL_PARAMS jobs are expanded into one row per Temp_i realisation
+        # that all share a single job id — flag this so it is not mistaken for a
+        # SLURM array (whose tasks have distinct {base}_{i} ids).
+        n_pp_jobs = len({r["jobid"] for r in rows if r.get("is_pp")})
+        if n_pp_jobs:
+            pp_suffix = (
+                f"  ·  PARALLEL_PARAMS expansion"
+                f"{f' ×{n_pp_jobs}' if n_pp_jobs > 1 else ''} (rows per realisation, not a SLURM array)"
+            )
+        else:
+            pp_suffix = ""
         job_name_suffix = (
             f"  ·  job: {self._cs.job_name}" if self._cs and self._cs.job_name else ""
         )
         self.query_one("#title-bar", Static).update(
-            f"  {self.TITLE}{job_name_suffix}{array_suffix}"
+            f"  {self.TITLE}{job_name_suffix}{array_suffix}{pp_suffix}"
         )
 
+        n_jobs = len(self._sims)
+        count_str = (
+            f"{len(rows)} row(s) · {n_jobs} job(s)"
+            if len(rows) != n_jobs
+            else f"{len(rows)} simulation(s)"
+        )
         at_str = f"  ·  submitted {self._submitted_at}" if self._submitted_at else ""
         self.query_one("#status-bar", Static).update(
-            f"[dim]{len(rows)} simulation(s)  ·  auto-refresh every {self._refresh_interval:.0f}s{at_str}[/dim]"
+            f"[dim]{count_str}  ·  auto-refresh every {self._refresh_interval:.0f}s{at_str}[/dim]"
         )
         self._update_footer_keys()
 
@@ -981,12 +1067,21 @@ class SimulationMonitor(App):
                 with contextlib.suppress(Exception):
                     table.update_cell(str(i), "cur", frame)
 
-    def _selected_sim(self) -> Simulation | None:
+    def _selected_row(self) -> dict[str, Any] | None:
         table = self.query_one("#sim-table", DataTable)
         row = table.cursor_row
-        if 0 <= row < len(self._sims):
-            return self._sims[row]
+        if 0 <= row < len(self._row_data):
+            return self._row_data[row]
         return None
+
+    def _selected_sim(self) -> Simulation | None:
+        # Rows and sims are no longer 1:1 (a PARALLEL_PARAMS sim expands into
+        # one row per realisation), so resolve the underlying sim via the row's
+        # _sim_ref.  Job-level actions (logs, cancel, resubmit) act on this sim.
+        rowd = self._selected_row()
+        if rowd is None:
+            return None
+        return self._sims[rowd["_sim_ref"]]
 
     # ------------------------------------------------------------------
     # Actions
@@ -1034,23 +1129,26 @@ class SimulationMonitor(App):
 
     def action_view_info(self) -> None:
         sim = self._selected_sim()
-        if sim is None:
+        rowd = self._selected_row()
+        if sim is None or rowd is None:
             self.notify("No simulation selected.", severity="warning")
             return
-        info_path = Path(sim.sim_dir) / "info"
+        # For a PARALLEL_PARAMS row, info lives in the realisation's Temp_i/.
+        info_dir = Path(rowd.get("effective_dir") or sim.sim_dir)
+        info_path = info_dir / "info"
+        if rowd.get("realisation") is not None:
+            where = f"{Path(sim.sim_dir).name}/{info_dir.name}"
+        else:
+            where = Path(sim.sim_dir).name
         if not info_path.exists():
-            self.notify(
-                f"No info file found in {Path(sim.sim_dir).name}.",
-                severity="warning",
-            )
+            self.notify(f"No info file found in {where}.", severity="warning")
             return
         try:
             content = info_path.read_text(errors="replace")
         except Exception as exc:
             self.notify(f"Error reading info file: {exc}", severity="error")
             return
-        title = f"Info: {Path(sim.sim_dir).name}"
-        self.push_screen(LogViewerScreen(title, content))
+        self.push_screen(LogViewerScreen(f"Info: {where}", content))
 
     def action_cancel_job(self) -> None:
         sim = self._selected_sim()
