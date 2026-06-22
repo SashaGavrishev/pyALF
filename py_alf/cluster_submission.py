@@ -14,10 +14,12 @@ __copyright__ = "Copyright 2020-2025, The ALF Project"
 __license__ = "GPL"
 
 import contextlib
+import json
 import logging
 import os
 import subprocess
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -483,6 +485,66 @@ def _slurm_time_to_minutes(value: int | str) -> int:
     return int(hours * 60)
 
 
+def write_session_manifest(
+    submitted: list[Simulation],
+    job_ids: list[str],
+    cs: ClusterSubmitter,
+    executor: str,
+) -> Path | None:
+    """Write a JSON record of the submitted sims to ``cs.submit_dir``.
+
+    The manifest is what :meth:`SimulationMonitor.from_session` and the
+    ``alf_monitor`` CLI read to reattach to a previous submission, so writing
+    one after a programmatic :meth:`ClusterSubmitter.submit` makes script-driven
+    jobs trackable by the monitor TUI without keeping the submitting process
+    alive. Returns the manifest path, or ``None`` on error.
+    """
+    entries = [
+        {
+            "sim_dir": str(sim.sim_dir),
+            "job_id": jid,
+            "ham_name": sim.ham_name,
+            "n_omp": sim.n_omp,
+            "n_mpi": getattr(sim, "n_mpi", 1),
+            "mpi": getattr(sim, "mpi", False),
+            "mpiexec": getattr(sim, "mpiexec", "mpiexec"),
+            "mpiexec_args": getattr(sim, "mpiexec_args", []),
+            "sim_dict": dict(
+                sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+            ),
+            "config": getattr(sim, "config", ""),
+            "alf_dir": str(getattr(getattr(sim, "alf_src", None), "alf_dir", ".")),
+        }
+        for sim, jid in zip(submitted, job_ids)
+    ]
+    cs_record: dict = {
+        "executor": executor,
+        "submit_dir": str(cs.submit_dir),
+        "slurm_mem": cs.slurm_mem,
+        "partition_rules": cs.partition_rules,
+        "job_name": cs.job_name,
+        "mail_type": cs.mail_type,
+        "wckey": cs.wckey,
+        "stderr_to_stdout": cs.stderr_to_stdout,
+        "slurm_kwargs": cs.slurm_kwargs,
+    }
+    manifest = {
+        "version": 1,
+        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+        "cluster_submitter": cs_record,
+        "entries": entries,
+    }
+    out_path = (
+        cs.submit_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    try:
+        cs.submit_dir.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(manifest, indent=2, default=str))
+        return out_path
+    except Exception:
+        return None
+
+
 class ClusterSubmitter:
     """
     Handles job submission using submitit.
@@ -704,6 +766,7 @@ class ClusterSubmitter:
         job_properties: dict[str, Any] | None = None,
         submit_dir: str | Path | None = None,
         confirm_checkpoint: bool = True,
+        write_session: bool = True,
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -723,6 +786,12 @@ class ClusterSubmitter:
         submit_dir : str or Path, optional
             Directory for submitit logs and state for this submission.
             Overrides the instance-level ``submit_dir`` set at construction.
+        write_session : bool, default=True
+            For the ``slurm`` executor, write a ``session_*.json`` manifest into
+            the submit directory so the submission can be reattached later with
+            :meth:`SimulationMonitor.from_session` / the ``alf_monitor`` CLI.
+            The interactive TUI sets this to ``False`` because it writes its own
+            manifest from the newly-submitted subset.
 
         Returns
         -------
@@ -828,7 +897,9 @@ class ClusterSubmitter:
         if _raw_slurm_time is not None:
             timeout_hours = _slurm_time_to_minutes(_raw_slurm_time) / 60
         else:
-            _sim_dict0 = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+            _sim_dict0 = (
+                sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+            )
             cpu_max = float(_sim_dict0.get("CPU_MAX", 0))
             if cpu_max <= 0 and self.executor == "slurm":
                 raise ValueError(
@@ -940,6 +1011,15 @@ class ClusterSubmitter:
         for s, job in zip(filtered_sims, jobs):
             Path(s.sim_dir, "jobid.txt").write_text(job.job_id)
 
+        # Durable session manifest so the monitor TUI / alf_monitor CLI can
+        # reattach to this submission after the submitting process exits.
+        if write_session and self.executor == "slurm" and jobs:
+            manifest_path = write_session_manifest(
+                filtered_sims, [j.job_id for j in jobs], self, self.executor
+            )
+            if manifest_path is not None:
+                logger.info(f"Wrote session manifest: {manifest_path}")
+
         logger.info(f"Submitted {len(jobs)} job(s): {[j.job_id for j in jobs]}")
         return jobs
 
@@ -980,11 +1060,12 @@ class ClusterSubmitter:
             for sim in sims_to_resubmit:
                 num_bins = sim.bin_count(counting_obs=counting_obs, refresh=True)
                 status = sim.get_cluster_job_status()
-                _sd = sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+                _sd = (
+                    sim.sim_dict[0] if isinstance(sim.sim_dict, list) else sim.sim_dict
+                )
                 label = (
                     "".join(
-                        f"{k}={_sd[v]}, " if v in _sd else ""
-                        for k, v in params.items()
+                        f"{k}={_sd[v]}, " if v in _sd else "" for k, v in params.items()
                     )
                     if params
                     else sim.sim_dir

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import json
 import os
 import re
 from datetime import datetime, timedelta
@@ -36,6 +35,9 @@ from .cluster_submission import (
     _parse_mem_gb,
     _parse_slurm_time_hours,
     _slurm_time_to_minutes,
+)
+from .cluster_submission import (
+    write_session_manifest as _write_session_manifest,
 )
 from .simulation import Simulation
 
@@ -267,57 +269,6 @@ def save_for_ssh(
     )
     print(f"{cmd}")
     return cmd
-
-
-def _write_session_manifest(
-    submitted: list[Simulation],
-    job_ids: list[str],
-    cs: ClusterSubmitter,
-    executor: str,
-) -> Path | None:
-    """Write a JSON record of the submitted sims to submit_dir. Returns the path, or None on error."""
-    entries = [
-        {
-            "sim_dir": str(sim.sim_dir),
-            "job_id": jid,
-            "ham_name": sim.ham_name,
-            "n_omp": sim.n_omp,
-            "n_mpi": getattr(sim, "n_mpi", 1),
-            "mpi": getattr(sim, "mpi", False),
-            "mpiexec": getattr(sim, "mpiexec", "mpiexec"),
-            "mpiexec_args": getattr(sim, "mpiexec_args", []),
-            "sim_dict": dict(_sim_dict_of(sim)),
-            "config": getattr(sim, "config", ""),
-            "alf_dir": str(getattr(getattr(sim, "alf_src", None), "alf_dir", ".")),
-        }
-        for sim, jid in zip(submitted, job_ids)
-    ]
-    cs_record: dict = {
-        "executor": executor,
-        "submit_dir": str(cs.submit_dir),
-        "slurm_mem": cs.slurm_mem,
-        "partition_rules": cs.partition_rules,
-        "job_name": cs.job_name,
-        "mail_type": cs.mail_type,
-        "wckey": cs.wckey,
-        "stderr_to_stdout": cs.stderr_to_stdout,
-        "slurm_kwargs": cs.slurm_kwargs,
-    }
-    manifest = {
-        "version": 1,
-        "submitted_at": datetime.now().isoformat(timespec="seconds"),
-        "cluster_submitter": cs_record,
-        "entries": entries,
-    }
-    out_path = (
-        cs.submit_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    )
-    try:
-        cs.submit_dir.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(manifest, indent=2, default=str))
-        return out_path
-    except Exception:
-        return None
 
 
 class _SimProxy:
@@ -1695,7 +1646,10 @@ class SubmissionReview(App):
 
         try:
             jobs = cs.submit(
-                sims, job_properties=job_properties, confirm_checkpoint=False
+                sims,
+                job_properties=job_properties,
+                confirm_checkpoint=False,
+                write_session=False,
             )
         except Exception as exc:
             for i in range(len(sims)):
@@ -2129,7 +2083,11 @@ class SubmissionReview(App):
     def on_key(self, event: object) -> None:
         from textual.events import Key
 
-        if isinstance(event, Key) and event.key == "escape" and isinstance(self.focused, Input):
+        if (
+            isinstance(event, Key)
+            and event.key == "escape"
+            and isinstance(self.focused, Input)
+        ):
             with contextlib.suppress(Exception):
                 self.query_one("#sim-table", DataTable).focus()
             event.stop()  # type: ignore[attr-defined]
@@ -2237,7 +2195,12 @@ class SubmissionReview(App):
                 self._cs.slurm_kwargs["slurm_time"] = int(hours * 60)
             elif "slurm_time" in (self._cs.slurm_kwargs or {}):
                 self._cs.slurm_kwargs["slurm_time"] = int(hours * 60)
-        elif self._end_mode == "nbin" and val.strip() == "" and self._sims and self._cs.slurm_kwargs:
+        elif (
+            self._end_mode == "nbin"
+            and val.strip() == ""
+            and self._sims
+            and self._cs.slurm_kwargs
+        ):
             # User cleared the wall-time field in NBin mode — remove slurm_time
             # so the arch panel reverts to the "set SLURM time" prompts.
             self._cs.slurm_kwargs.pop("slurm_time", None)
