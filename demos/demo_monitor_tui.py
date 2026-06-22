@@ -6,14 +6,20 @@ Run from the repo root:
 
     python demos/demo_monitor_tui.py
 
-Two demo modes
---------------
+Demo modes
+----------
   0  fresh sims — launches the monitor directly with a pre-built mix of
                   SLURM statuses (RUNNING, PENDING, COMPLETED, FAILED,
                   CANCELLED, INACTIVE)
   1  from session — writes a session manifest to disk and loads it via
                     SimulationMonitor.from_session(), exercising the same
                     code path used after a real SubmissionReview run
+  2  parallel params — a single PARALLEL_PARAMS job (one SLURM id) is expanded
+                       into one row per Temp_i disorder realisation, each with
+                       its own bin progress.  Tagged PP[i] and flagged in the
+                       title bar so it is not mistaken for a SLURM array.  One
+                       job is RUNNING (live per-config bars) and one COMPLETED
+                       (press 'i' to see each realisation's distinct seed).
 
 All SLURM queries, bin counts, and cluster operations are mocked so no
 cluster connection is needed.
@@ -173,13 +179,129 @@ def _fake_info(ham: str, beta: float, L: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# PARALLEL_PARAMS workspace (mode 2): one job, many Temp_i realisations
+# ---------------------------------------------------------------------------
+
+# ham,                    sigma, job_id,  status,      runtime,   NBin, bins per realisation
+_PP_JOBS: list[tuple[str, float, str, str, str | None, int, list[int]]] = [
+    (
+        "Hubbard_PV_Disorder",
+        0.5,
+        "55123",
+        "RUNNING",
+        "1:12:40",
+        40,
+        [22, 18, 25, 30, 15, 28],
+    ),
+    (
+        "Hubbard_PV_Disorder",
+        1.0,
+        "55124",
+        "COMPLETED",
+        "1:58:03",
+        40,
+        [40, 40, 40, 40, 40, 40],
+    ),
+]
+
+
+def _setup_parallel_params_workspace() -> tuple[list, dict, dict]:
+    """One SLURM job per entry, each prepared with len(bins) Temp_i/ dirs.
+
+    Mirrors a real PARALLEL_PARAMS submission: a single job id, one MPI rank per
+    disorder realisation writing into Temp_i/.  The monitor expands each job into
+    one row per Temp_i.
+    """
+    from types import SimpleNamespace
+
+    sims: list = []
+    statuses: dict[str, dict] = {}
+    bin_map: dict[str, int] = {}
+
+    for ham, sigma, jid, status, runtime, nbin, bins in _PP_JOBS:
+        n_real = len(bins)
+        sim_dir = _TMPDIR / "ALF_data" / f"{ham}_sigma={sigma}"
+        sim_dir.mkdir(parents=True, exist_ok=True)
+        (sim_dir / "jobid.txt").write_text(jid)
+
+        nodelist = "compute[01-02]" if status == "RUNNING" else None
+        statuses[jid] = {"status": status, "runtime": runtime, "nodelist": nodelist}
+        if status in ("RUNNING", "COMPLETED"):
+            log = _SUBMIT_DIR / f"{jid}_0_log.out"
+            log.write_text(_fake_pp_log(jid, ham, sigma, status, n_real))
+
+        for i, n_bins in enumerate(bins):
+            temp = sim_dir / f"Temp_{i}"
+            temp.mkdir(parents=True, exist_ok=True)
+            bin_map[str(temp)] = n_bins
+            # Per-realisation info shows the distinct seed (base + igroup); only
+            # meaningful once COMPLETED, when 'i' is enabled in the TUI.
+            if status == "COMPLETED":
+                (temp / "info").write_text(_fake_pp_info(ham, sigma, seed=i))
+
+        sims.append(
+            SimpleNamespace(
+                ham_name=ham,
+                sim_dir=str(sim_dir),
+                sim_dict=[
+                    {
+                        "Beta": 5.0,
+                        "L1": 8,
+                        "L2": 8,
+                        "NBin": nbin,
+                        "Ham_chem_disorder_std": sigma,
+                        "mpi_per_parameter_set": 1,
+                    }
+                ]
+                * n_real,
+                n_omp=1,
+                n_mpi=n_real,
+                mpi=True,
+                mpiexec="mpiexec",
+                mpiexec_args=[],
+                config="GNU PARALLEL_PARAMS HDF5 NO-INTERACTIVE",
+            )
+        )
+
+    return sims, statuses, bin_map
+
+
+def _fake_pp_log(jid: str, ham: str, sigma: float, status: str, n_real: int) -> str:
+    lines = [
+        f"[ALF] job {jid}  PARALLEL_PARAMS  ham={ham}  sigma={sigma}",
+        f"[ALF] {n_real} disorder realisations, one MPI rank each "
+        f"→ Temp_0 … Temp_{n_real - 1}",
+        "[ALF] Each rank seeded ham_disorder_seed + igroup before drawing disorder.",
+    ]
+    lines += [
+        "[ALF] All realisations done." if status == "COMPLETED" else "[ALF] Running…"
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _fake_pp_info(ham: str, sigma: float, seed: int) -> str:
+    return (
+        f"Model is                   : {ham}\n"
+        f"Ham_chem_disorder_std      : {sigma}\n"
+        f"Disorder seed (base+igroup): {seed}\n"
+        f"Beta                       : 5.0\n"
+        f"L1 / L2                    : 8 / 8\n"
+        f"Status                     : COMPLETED\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mock patches
 # ---------------------------------------------------------------------------
 
 
 def _mock_bin_count_factory(bin_map: dict[str, int]):
-    def _mock(sim, **_kw):
-        return bin_map.get(str(sim.sim_dir), 0)
+    def _mock(sim, data_dir=None, **_kw):
+        # The monitor passes the per-row directory as data_dir (the parent
+        # sim_dir for a normal row, or Temp_i/ for a PARALLEL_PARAMS row), so
+        # keying on it works for both ordinary and expanded jobs.
+        key = data_dir if data_dir is not None else sim.sim_dir
+        return bin_map.get(str(key), 0)
 
     return _mock
 
@@ -247,12 +369,11 @@ def _write_demo_session(sims: list, statuses: dict) -> Path:
 MODES = {
     "fresh sims (direct SimulationMonitor)": "fresh",
     "from session manifest (SimulationMonitor.from_session)": "session",
+    "PARALLEL_PARAMS expansion (one row per Temp_i realisation)": "parallel_params",
 }
 
 
 def main() -> None:
-    sims, statuses, bin_map = _setup_workspace()
-
     names = list(MODES)
     print("Demo modes:\n")
     for i, name in enumerate(names):
@@ -260,6 +381,11 @@ def main() -> None:
     raw = input(f"\nPick mode [0–{len(names) - 1}, default 0]: ").strip()
     idx = int(raw) if raw.isdigit() and int(raw) < len(names) else 0
     mode = list(MODES.values())[idx]
+
+    if mode == "parallel_params":
+        sims, statuses, bin_map = _setup_parallel_params_workspace()
+    else:
+        sims, statuses, bin_map = _setup_workspace()
 
     print(f"\nTemp workspace: {_TMPDIR}\n")
 
@@ -279,19 +405,22 @@ def main() -> None:
         patch("py_alf.monitor.cancel_cluster_job", return_value=True),
         patch.object(ClusterSubmitter, "submit", _mock_resubmit),
     ):
-        if mode == "fresh":
-            monitor = SimulationMonitor(
-                sims,
-                cluster_submitter=cs,
-                submit_dir=str(_SUBMIT_DIR),
-                param_keys=["Beta", "L1"],
-            )
-        else:
+        if mode == "session":
             session_path = _write_demo_session(sims, statuses)
             print(f"Session manifest: {session_path}\n")
             monitor = SimulationMonitor.from_session(
                 session_path,
                 cluster_submitter=cs,
+                param_keys=["Beta", "L1"],
+            )
+        else:
+            # "fresh" and "parallel_params" both launch the monitor directly;
+            # the PARALLEL_PARAMS expansion is driven entirely by each sim's
+            # config tag and its Temp_i/ dirs on disk.
+            monitor = SimulationMonitor(
+                sims,
+                cluster_submitter=cs,
+                submit_dir=str(_SUBMIT_DIR),
                 param_keys=["Beta", "L1"],
             )
 
