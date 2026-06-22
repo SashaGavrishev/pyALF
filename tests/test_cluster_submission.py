@@ -762,7 +762,8 @@ def test_submit_mpi_sim_sets_use_srun_false(tmp_path):
         cs.submit(sim)
 
     call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
-    assert call_kwargs["use_srun"] is False
+    assert call_kwargs["slurm_use_srun"] is False
+    assert "use_srun" not in call_kwargs  # legacy (deprecated) key not passed
 
 
 def test_submit_non_mpi_sim_has_no_use_srun(tmp_path):
@@ -783,6 +784,29 @@ def test_submit_non_mpi_sim_has_no_use_srun(tmp_path):
 
     call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
     assert "use_srun" not in call_kwargs
+    assert "slurm_use_srun" not in call_kwargs
+
+
+def test_submit_uses_prefixed_additional_parameters(tmp_path):
+    """The auto wall-time goes via slurm_additional_parameters, not the
+    deprecated unprefixed additional_parameters key."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    sim.sim_dict = {"CPU_MAX": 1}  # CPU_MAX mode → submit derives a wall time
+
+    mock_job = MagicMock()
+    mock_job.job_id = "1"
+
+    with _patch_submitit(mock_job) as mock_executor:
+        cs = ClusterSubmitter(
+            submit_dir=tmp_path / "logs",
+            slurm_mem="2G",
+            partition_rules=_RULES,
+        )
+        cs.submit(sim)
+
+    call_kwargs = mock_executor.return_value.update_parameters.call_args.kwargs
+    assert "additional_parameters" not in call_kwargs  # legacy key not passed
+    assert "time" in call_kwargs["slurm_additional_parameters"]
 
 
 # --- _parse_slurm_time_hours ---

@@ -957,7 +957,7 @@ class ClusterSubmitter:
                 # OMP_NUM_THREADS is set to sim.n_omp inside sim.run() before
                 # mpiexec is called, consistent with cpus_per_task=n_omp so
                 # each MPI rank fills exactly its allocated cores with threads.
-                params["use_srun"] = False
+                params["slurm_use_srun"] = False
         if self.stderr_to_stdout:
             params["stderr_to_stdout"] = True
         params.update(self.slurm_kwargs)
@@ -965,14 +965,26 @@ class ClusterSubmitter:
             params.update(job_properties)
         if "slurm_time" in params:
             params["slurm_time"] = _slurm_time_to_minutes(params["slurm_time"])
+        # Migrate legacy unprefixed slurm parameters a caller may have supplied;
+        # submitit deprecates them in favour of the slurm_-prefixed forms and
+        # warns when they are passed to update_parameters().
+        if "use_srun" in params:
+            params.setdefault("slurm_use_srun", params.pop("use_srun"))
+        if "additional_parameters" in params:
+            _legacy = params.pop("additional_parameters") or {}
+            params["slurm_additional_parameters"] = {
+                **_legacy,
+                **(params.get("slurm_additional_parameters") or {}),
+            }
 
         if self.executor == "slurm":
-            extra = dict(params.get("additional_parameters") or {})
+            extra = dict(params.get("slurm_additional_parameters") or {})
             # Add 10% buffer so ALF can finish writing output after CPU_MAX;
             # cap at the selected partition's wall-time limit.
             # Skip auto-computation when the caller already supplied slurm_time
-            # (a submitit-style kwarg) or an explicit "time" in additional_parameters,
-            # so user-set wall times are never silently overwritten.
+            # (a submitit-style kwarg) or an explicit "time" in
+            # slurm_additional_parameters, so user-set wall times are never
+            # silently overwritten.
             if "slurm_time" not in params and "time" not in extra:
                 slurm_time_h = timeout_hours * 1.1
                 selected = params.get("slurm_partition")
@@ -986,7 +998,7 @@ class ClusterSubmitter:
                     )
                     slurm_time_h = min(slurm_time_h, max_h)
                 extra["time"] = int(slurm_time_h * 60)
-            params["additional_parameters"] = extra
+            params["slurm_additional_parameters"] = extra
 
         # Prepare simulation directories and copy binary.
         for s in filtered_sims:
