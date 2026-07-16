@@ -258,12 +258,11 @@ class Lattice:
         """
         if X.shape[-1] != self.N:
             raise TypeError("Last index of X has wrong number of elements")
-        Y = np.zeros(X.shape, dtype=X.dtype)
-        for i in range(self.N):
-            for j in range(self.N):
-                Y[..., i] += X[..., j] * np.exp(1j * np.dot(self.r[i], self.k[j]))
-        Y = Y / self.N
-        return Y
+        # Y[..., i] = sum_j X[..., j] exp(i r_i k_j), i.e. one matmul against
+        # the phase matrix. Building the N x N phases costs far less than the
+        # N^2 Python loop this replaces.
+        phases = np.exp(1j * (self.r @ self.k.T))
+        return (X @ phases.T) / self.N
 
     def fourier_R_to_K(self, X):
         """Fourier transform from r to k space.
@@ -274,12 +273,11 @@ class Lattice:
         """
         if X.shape[-1] != self.N:
             raise TypeError("Last index of X has wrong number of elements")
-        Y = np.zeros(X.shape, dtype=X.dtype)
-        for i in range(self.N):
-            for j in range(self.N):
-                Y[..., i] += X[..., j] * np.exp(-1j * np.dot(self.k[i], self.r[j]))
-        Y = Y / self.N
-        return Y
+        # Y[..., i] = sum_j X[..., j] exp(-i k_i r_j); see fourier_K_to_R.
+        # Note the 1/N here matches the k-to-r convention rather than the
+        # unnormalised one -- kept as-is, this is only a rewrite.
+        phases = np.exp(-1j * (self.k @ self.r.T))
+        return (X @ phases.T) / self.N
 
     def rotate(self, n, theta):
         """Rotate vector in k space.
