@@ -609,6 +609,18 @@ def _probe_unit(task: tuple[Any, str, Path, bool, bool]) -> tuple[int, bool]:
     return n_bins, has_checkpoint
 
 
+def _fill_probes(rows: list[dict[str, Any]], probes: list[tuple[int, bool]]) -> None:
+    """Attach probe results to their rows.  Both lists are in row order.
+
+    Each row's progress needs a stat (or h5py open) of data.h5 plus a confin_*
+    scan.  h5py serialises real reads on its global lock, so the fan-out buys
+    time on the stat and readdir calls; the stat gate keeps the opens rare.
+    """
+    for row, (n_bins, has_checkpoint) in zip(rows, probes):
+        row["n_bins"] = n_bins
+        row["has_checkpoint"] = has_checkpoint
+
+
 def _parallel_param_temp_dirs(sim_dir: str | Path) -> list[tuple[int, Path]]:
     """Return ``(realisation_index, Temp_i_path)`` pairs under *sim_dir*, sorted.
 
@@ -775,6 +787,10 @@ class SimulationMonitor(App):
         # Last rendered cells and row identities, for the in-place table update.
         self._prev_values: list[list[Any]] = []
         self._row_identity: list[tuple[int, int | None]] | None = None
+        # Last SLURM reply, used to paint the interim table while the next one
+        # is still in flight.  None until the first reply lands.
+        self._last_statuses: dict | None = None
+        self._last_resources: dict | None = None
 
     # ------------------------------------------------------------------
     # Session manifest
@@ -899,16 +915,79 @@ class SimulationMonitor(App):
             getattr(sim, "job_id", None) or get_job_id(sim) for sim in self._sims
         ]
 
+        # The Temp_* scans are independent per sim and each costs a readdir on a
+        # networked filesystem, so run them concurrently before the row build.
+        pp_refs = [i for i, s in enumerate(self._sims) if _is_parallel_params(s)]
+        temp_dirs_by_sim: dict[int, list[tuple[int, Path]]] = dict(
+            zip(
+                pp_refs,
+                _map_io(
+                    lambda i: _parallel_param_temp_dirs(self._sims[i].sim_dir), pp_refs
+                ),
+            )
+        )
+
+        # squeue can take seconds on a busy scheduler while the probes take
+        # milliseconds, and the probes do not need its reply: the stat gate makes
+        # an unconditional re-check cheap, and probing against a stale status only
+        # defers freezing a finished row by one refresh.  So overlap the two and
+        # paint the progress columns as soon as they land, instead of holding the
+        # whole table hostage to SLURM.  The probes run once and are reused for
+        # both passes.
+        with ThreadPoolExecutor(max_workers=1) as slurm_pool:
+            slurm = slurm_pool.submit(self._fetch_slurm, jobid_list)
+
+            rows, probe_tasks = self._build_rows(
+                jobid_list,
+                self._last_statuses or {},
+                self._last_resources or {},
+                temp_dirs_by_sim,
+                force,
+            )
+            probes = _map_io(_probe_unit, probe_tasks)
+            _fill_probes(rows, probes)
+
+            # On the first pass nothing is known about SLURM yet, so an interim
+            # table would just flash UNKNOWN at every row — wait for the reply.
+            if self._last_statuses is not None:
+                self.call_from_thread(self._apply_rows, rows)
+
+            statuses, resources = slurm.result()
+
+        self._last_statuses, self._last_resources = statuses, resources
+        rows, _ = self._build_rows(
+            jobid_list, statuses, resources, temp_dirs_by_sim, force
+        )
+        _fill_probes(rows, probes)
+        self.call_from_thread(self._apply_rows, rows)
+
+    def _fetch_slurm(self, jobid_list: list[str | None]) -> tuple[dict, dict]:
+        """Query SLURM for statuses and, for finished jobs, resource usage."""
         all_jids = list({jid for jid in jobid_list if jid})
         statuses = _get_slurm_status_bulk(all_jids) if all_jids else {}
-
         terminal_jids = [
             jid
             for jid in all_jids
             if statuses.get(jid, {}).get("status") in _TERMINAL_STATES
         ]
         resources = _get_jobs_resources_bulk(terminal_jids) if terminal_jids else {}
+        return statuses, resources
 
+    def _build_rows(
+        self,
+        jobid_list: list[str | None],
+        statuses: dict,
+        resources: dict,
+        temp_dirs_by_sim: dict[int, list[tuple[int, Path]]],
+        force: bool,
+    ) -> tuple[list[dict[str, Any]], list[tuple[Any, str, Path, bool, bool]]]:
+        """Render row dicts for *statuses*, plus the probe tasks they imply.
+
+        Row identity and order depend only on the sims and their Temp_* dirs, not
+        on *statuses*, so the two passes of a refresh line up and can share one
+        set of probe results.  ``n_bins`` and ``has_checkpoint`` are placeholders
+        until _fill_probes attaches them.
+        """
         # Compute partition once from the first sim's CPU_MAX — matches the
         # behaviour of ClusterSubmitter.submit(), which uses filtered_sims[0]
         # for the whole array's SLURM parameters.
@@ -924,18 +1003,6 @@ class SimulationMonitor(App):
             except ValueError:
                 _shared_partition = "???"
             _shared_mem = self._cs.slurm_mem
-
-        # The Temp_* scans are independent per sim and each costs a readdir on a
-        # networked filesystem, so run them concurrently before the row build.
-        pp_refs = [i for i, s in enumerate(self._sims) if _is_parallel_params(s)]
-        temp_dirs_by_sim: dict[int, list[tuple[int, Path]]] = dict(
-            zip(
-                pp_refs,
-                _map_io(
-                    lambda i: _parallel_param_temp_dirs(self._sims[i].sim_dir), pp_refs
-                ),
-            )
-        )
 
         rows: list[dict[str, Any]] = []
         probe_tasks: list[tuple[Any, str, Path, bool, bool]] = []
@@ -1046,15 +1113,7 @@ class SimulationMonitor(App):
                 rows.append(row)
                 display_idx += 1
 
-        # Each row's progress needs a stat (or h5py open) of data.h5 plus a
-        # confin_* scan.  Note that h5py serialises actual reads on its global
-        # lock, so the fan-out buys time on the stat and readdir calls; the
-        # stat gate in _bin_count is what keeps the h5py opens rare.
-        for row, (n_bins, has_checkpoint) in zip(rows, _map_io(_probe_unit, probe_tasks)):
-            row["n_bins"] = n_bins
-            row["has_checkpoint"] = has_checkpoint
-
-        self.call_from_thread(self._apply_rows, rows)
+        return rows, probe_tasks
 
     def _row_values(
         self, row: dict[str, Any], is_cursor: bool, max_bins_w: int

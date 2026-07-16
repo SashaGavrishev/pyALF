@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1398,3 +1399,145 @@ def test_has_checkpoint_missing_directory_is_false(tmp_path):
     from py_alf.monitor import _has_checkpoint
 
     assert _has_checkpoint(tmp_path / "nope") is False
+
+
+# ---------------------------------------------------------------------------
+# Two-phase refresh
+# ---------------------------------------------------------------------------
+
+
+def _status(state="RUNNING", rt="00:05:00"):
+    return {"64": {"status": state, "runtime": rt, "nodelist": "n1"}}
+
+
+async def test_refresh_renders_twice_once_slurm_is_known(tmp_path):
+    """With a prior SLURM reply to fall back on, a refresh paints interim
+    progress first and the confirmed status second."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="64"),
+        patch("py_alf.monitor._get_slurm_status_bulk", return_value=_status()),
+        patch("py_alf.monitor._bin_count", return_value=5),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()  # let the mount refresh settle
+            await pilot.pause()
+
+            with patch.object(app, "_apply_rows", wraps=app._apply_rows) as spy:
+                app._trigger_refresh()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+            assert spy.call_count == 2
+
+
+async def test_first_ever_refresh_paints_a_single_table(tmp_path):
+    """With no prior SLURM reply there is nothing to show, so the interim pass
+    must be skipped rather than flash UNKNOWN at every row."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    painted: list[list[str]] = []
+    real_apply = SimulationMonitor._apply_rows
+
+    def _recording(self, rows):
+        painted.append([r["status"] for r in rows])
+        return real_apply(self, rows)
+
+    # The first refresh is fired by on_mount, before the instance can be spied
+    # on, so record at class level.
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="64"),
+        patch("py_alf.monitor._get_slurm_status_bulk", return_value=_status()),
+        patch("py_alf.monitor._bin_count", return_value=5),
+        patch.object(SimulationMonitor, "_apply_rows", _recording),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    assert painted == [["RUNNING"]]
+
+
+async def test_interim_table_shows_fresh_bins_with_last_known_status(tmp_path):
+    """The progress columns must not wait for a slow squeue."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    seen: list[tuple[int, str]] = []
+    counts = iter([5, 9])
+
+    def _slow_squeue(_jids):
+        time.sleep(0.15)
+        return _status()
+
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="64"),
+        patch("py_alf.monitor._get_slurm_status_bulk", side_effect=_slow_squeue),
+        patch("py_alf.monitor._bin_count", side_effect=lambda *a, **k: next(counts)),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            real_apply = app._apply_rows
+
+            def _record(rows):
+                seen.append((rows[0]["n_bins"], rows[0]["status"]))
+                real_apply(rows)
+
+            with patch.object(app, "_apply_rows", _record):
+                app._trigger_refresh()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+
+    # Interim pass carries the new bin count before squeue has replied, then the
+    # final pass confirms the status.
+    assert seen == [(9, "RUNNING"), (9, "RUNNING")]
+
+
+async def test_probes_run_once_per_refresh_not_per_phase(tmp_path):
+    """Two render passes must not double the filesystem work."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="64"),
+        patch("py_alf.monitor._get_slurm_status_bulk", return_value=_status()),
+        patch("py_alf.monitor._bin_count", return_value=5) as mock_bins,
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            mock_bins.reset_mock()
+
+            app._trigger_refresh()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+    assert mock_bins.call_count == 1
+
+
+async def test_squeue_and_probes_overlap(tmp_path):
+    """The probes must not be serialised behind a slow squeue."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    order: list[str] = []
+
+    def _slow_squeue(_jids):
+        order.append("squeue-start")
+        time.sleep(0.2)
+        order.append("squeue-end")
+        return _status()
+
+    def _probe(*_a, **_k):
+        order.append("probe")
+        return 5
+
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="64"),
+        patch("py_alf.monitor._get_slurm_status_bulk", side_effect=_slow_squeue),
+        patch("py_alf.monitor._bin_count", side_effect=_probe),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    # The probe lands while squeue is still in flight, not after it returns.
+    assert order.index("probe") < order.index("squeue-end")
