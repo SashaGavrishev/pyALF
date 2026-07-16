@@ -1324,3 +1324,77 @@ def test_peak_resources_does_not_pin_an_empty_result(tmp_path):
     res = {"max_rss": "2G", "cpu_eff": "50%"}
     assert _peak_resources(str(tmp_path), res) == res
     assert json.loads((tmp_path / "peak_resources.json").read_text()) == res
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint scan gating
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_checkpoint_caches():
+    from py_alf import monitor as _m
+
+    _m._checkpoint_cache.clear()
+    _m._checkpoint_final.clear()
+    yield
+
+
+def _settled(d: Path) -> None:
+    """Age a directory's mtime past the settle window so it may be cached."""
+    st = d.stat()
+    os.utime(d, ns=(st.st_atime_ns, st.st_mtime_ns - 5_000_000_000))
+
+
+def test_has_checkpoint_skips_readdir_when_directory_unchanged(tmp_path):
+    """An unchanged directory is answered from cache with a stat, not a scan."""
+    from py_alf.monitor import _has_checkpoint
+
+    (tmp_path / "confin_1").write_text("x")
+    _settled(tmp_path)
+    assert _has_checkpoint(tmp_path) is True
+
+    with patch.object(Path, "glob", side_effect=AssertionError("re-scanned")):
+        assert _has_checkpoint(tmp_path) is True
+
+
+def test_has_checkpoint_rescans_when_entry_appears(tmp_path):
+    """A checkpoint appearing changes the directory mtime and is picked up."""
+    from py_alf.monitor import _has_checkpoint
+
+    _settled(tmp_path)
+    assert _has_checkpoint(tmp_path) is False
+
+    (tmp_path / "confin_1").write_text("x")
+    _settled(tmp_path)
+    assert _has_checkpoint(tmp_path) is True
+
+
+def test_has_checkpoint_does_not_cache_an_unsettled_mtime(tmp_path):
+    """A just-touched directory is re-scanned: a coarse-mtime filesystem could
+    record a later change in the same tick."""
+    from py_alf.monitor import _checkpoint_cache, _has_checkpoint
+
+    (tmp_path / "confin_1").write_text("x")  # mtime is 'now', not settled
+    assert _has_checkpoint(tmp_path) is True
+    assert str(tmp_path) not in _checkpoint_cache, "unsettled mtime must not be cached"
+
+
+def test_has_checkpoint_frozen_for_finished_job(tmp_path):
+    """A finished row costs no syscalls: its checkpoints cannot change."""
+    from py_alf.monitor import _has_checkpoint
+
+    (tmp_path / "confin_1").write_text("x")
+    assert _has_checkpoint(tmp_path, final=True) is True
+
+    with (
+        patch.object(Path, "glob", side_effect=AssertionError("re-scanned")),
+        patch.object(Path, "stat", side_effect=AssertionError("re-stat'd")),
+    ):
+        assert _has_checkpoint(tmp_path, final=True) is True
+
+
+def test_has_checkpoint_missing_directory_is_false(tmp_path):
+    from py_alf.monitor import _has_checkpoint
+
+    assert _has_checkpoint(tmp_path / "nope") is False

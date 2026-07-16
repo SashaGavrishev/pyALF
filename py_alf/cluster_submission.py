@@ -1737,6 +1737,18 @@ def _is_midwrite_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _MIDWRITE_MARKERS)
 
 
+# Filesystems record mtimes coarsely -- NFS commonly only to the second -- so a
+# change landing in the same tick as a reading is invisible to it.  Caching such
+# a reading would pin a stale answer until something else moved the mtime past
+# the tick, so a reading is only trusted once its mtime has settled.
+_MTIME_SETTLE_NS = 2_000_000_000
+
+
+def _mtime_settled(mtime_ns: int) -> bool:
+    """True if *mtime_ns* is far enough in the past to be a safe cache key."""
+    return time.time_ns() - mtime_ns > _MTIME_SETTLE_NS
+
+
 def _bin_count(
     sim: Simulation,
     counting_obs: str = "Ener_scal",
@@ -1841,7 +1853,7 @@ def _bin_count(
         return _bin_cache[key]
 
     _bin_cache[key] = N_bins
-    if read_ok and stat_sig is not None:
+    if read_ok and stat_sig is not None and _mtime_settled(stat_sig[0]):
         _bin_stat[key] = stat_sig
     # Only freeze a count that came from an actual read: a terminal job whose
     # data.h5 is missing or unreadable may still appear once the filesystem

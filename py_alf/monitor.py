@@ -36,6 +36,7 @@ from .cluster_submission import (
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
     _is_submitit_timeout,
+    _mtime_settled,
     cancel_cluster_job,
     get_job_id,
 )
@@ -521,6 +522,46 @@ def _peak_resources(sim_dir: str, res: dict) -> dict:
     return res
 
 
+# confin_* answers, keyed by directory: (dir_mtime_ns, has_checkpoint).
+_checkpoint_cache: dict[str, tuple[int, bool]] = {}
+# Directories whose answer can no longer change because the job has finished.
+_checkpoint_final: set[str] = set()
+
+
+def _has_checkpoint(eff_dir: Path, final: bool = False) -> bool:
+    """True if *eff_dir* holds a confin_* checkpoint.
+
+    Gated on the directory's own mtime, which changes when an entry is added or
+    removed but not when a file's contents are rewritten — so an unchanged mtime
+    means the answer cannot have changed.  That turns a readdir over a directory
+    of dozens of ALF output files into a single stat.
+
+    *final* marks a finished job, whose checkpoints cannot change at all; the
+    answer is then frozen and later refreshes touch nothing.
+    """
+    key = str(eff_dir)
+    if key in _checkpoint_final:
+        return _checkpoint_cache[key][1]
+
+    try:
+        mtime = eff_dir.stat().st_mtime_ns
+    except OSError:
+        return False
+
+    cached = _checkpoint_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        found = cached[1]
+    else:
+        found = any(eff_dir.glob("confin_*"))
+        if _mtime_settled(mtime):
+            _checkpoint_cache[key] = (mtime, found)
+
+    if final:
+        _checkpoint_cache[key] = (mtime, found)
+        _checkpoint_final.add(key)
+    return found
+
+
 def _probe_unit(task: tuple[Any, str, Path, bool, bool]) -> tuple[int, bool]:
     """Read the on-disk progress of one row: bin count and checkpoint presence.
 
@@ -530,14 +571,17 @@ def _probe_unit(task: tuple[Any, str, Path, bool, bool]) -> tuple[int, bool]:
     ``py_alf.monitor._bin_count`` still take effect.
     """
     sim, status, eff_dir, refresh, force = task
+    is_final = status in _TERMINAL_STATES
     n_bins = _bin_count(
         sim,
         refresh=refresh,
         data_dir=str(eff_dir),
-        final=(status in _TERMINAL_STATES),
+        final=is_final,
         force=force,
     )
-    has_checkpoint = any(eff_dir.glob("confin_*"))
+    # A finished row's bin count is frozen by _bin_count and its checkpoints
+    # cannot change, so once both are known the row costs no syscalls at all.
+    has_checkpoint = _has_checkpoint(eff_dir, final=is_final and not force)
     return n_bins, has_checkpoint
 
 

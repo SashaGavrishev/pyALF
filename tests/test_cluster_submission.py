@@ -1175,6 +1175,17 @@ def _write_bins(path: Path, n_bins: int) -> None:
         f.create_dataset("Ener_scal/obser", data=np.zeros((n_bins, 1)))
 
 
+def _settle(path: Path) -> None:
+    """Age a file's mtime past the settle window so its reading may be cached.
+
+    A just-written file is deliberately not cached (a coarse-mtime filesystem
+    could record a further change in the same tick), so tests that exercise the
+    cache have to represent a file whose writer has moved on.
+    """
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns - 5_000_000_000))
+
+
 def _bin_count_sim(sim_dir: Path):
     sim = MagicMock()
     sim.__class__ = Simulation
@@ -1187,6 +1198,7 @@ def test_bin_count_skips_reopen_when_file_unchanged(tmp_path):
     from py_alf.cluster_submission import _bin_count
 
     _write_bins(tmp_path / "data.h5", 5)
+    _settle(tmp_path / "data.h5")
     sim = _bin_count_sim(tmp_path)
 
     assert _bin_count(sim, refresh=True) == 5
@@ -1216,6 +1228,7 @@ def test_bin_count_force_bypasses_stat_gate(tmp_path):
 
     h5 = tmp_path / "data.h5"
     _write_bins(h5, 5)
+    _settle(h5)
     sim = _bin_count_sim(tmp_path)
     assert _bin_count(sim, refresh=True) == 5
 
