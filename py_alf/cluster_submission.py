@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -1704,6 +1705,37 @@ _bin_final: set[Any] = set()
 # skip the h5py open when the file has not changed since.
 _bin_stat: dict[Any, tuple[int, int]] = {}
 
+# HDF5 open failures that mean "ALF is part-way through writing this file", not
+# "this file is broken".  ALF rewrites data.h5 in place, so a reader can catch it
+# after the superblock records a new end-of-file but before the data is flushed --
+# hence "truncated file: eof = ... < stored_eof = ...".  The condition clears
+# itself as soon as the write completes.
+_MIDWRITE_MARKERS = (
+    "truncated file",
+    "file signature not found",
+    "unable to read superblock",
+    "bad object header version number",
+    "unable to lock file",
+    "resource temporarily unavailable",
+)
+
+# Backoff between re-open attempts.  ALF's write window is short, so one or two
+# retries usually turn a mid-write into a good read rather than a stale row.
+_H5_RETRY_DELAYS = (0.05, 0.15)
+
+# Consecutive failed reads of one file before a mid-write stops being treated as
+# transient and gets reported.  At a 30s refresh this is minutes of failure, by
+# which point the file is genuinely damaged rather than being written.
+_MIDWRITE_LOG_AFTER = 5
+
+_bin_read_failures: dict[Any, int] = {}
+
+
+def _is_midwrite_error(exc: BaseException) -> bool:
+    """True if *exc* looks like a read that raced ALF's writer."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _MIDWRITE_MARKERS)
+
 
 def _bin_count(
     sim: Simulation,
@@ -1763,18 +1795,42 @@ def _bin_count(
 
     N_bins = 0
     read_ok = False
-    try:
-        with h5py.File(filename, "r") as f:
-            if counting_obs in f:
-                N_bins = f[counting_obs + "/obser"].shape[0]
-        read_ok = True
-    except FileNotFoundError:
-        pass
-    except (OSError, KeyError) as e:
-        logger.error(f"Error reading {filename}: {e}")
-        # File may be mid-write; keep the last known good value rather than
-        # caching a spurious 0 that would be shown briefly on the next refresh.
+    last_exc: BaseException | None = None
+    for attempt in range(len(_H5_RETRY_DELAYS) + 1):
+        try:
+            with h5py.File(filename, "r") as f:
+                if counting_obs in f:
+                    N_bins = f[counting_obs + "/obser"].shape[0]
+            read_ok = True
+            break
+        except FileNotFoundError:
+            break
+        except (OSError, KeyError) as e:
+            last_exc = e
+            # Only a mid-write is worth retrying, and only while attempts remain.
+            if not _is_midwrite_error(e) or attempt == len(_H5_RETRY_DELAYS):
+                break
+            time.sleep(_H5_RETRY_DELAYS[attempt])
+
+    if last_exc is not None and not read_ok:
+        fails = _bin_read_failures.get(key, 0) + 1
+        _bin_read_failures[key] = fails
+        # Racing ALF's writer is expected and self-correcting, so stay quiet
+        # about it; a file that keeps failing is a real problem worth surfacing.
+        if _is_midwrite_error(last_exc) and fails < _MIDWRITE_LOG_AFTER:
+            logger.debug(
+                "%s is mid-write (attempt %d), keeping the cached bin count: %s",
+                filename,
+                fails,
+                last_exc,
+            )
+        else:
+            logger.error(f"Error reading {filename}: {last_exc}")
+        # Keep the last known good value rather than caching a spurious 0 that
+        # would be shown briefly on the next refresh.
         return _bin_cache.get(key, 0)
+
+    _bin_read_failures.pop(key, None)
 
     # Don't let a transient 0 overwrite a previously-seen non-zero count —
     # ALF truncates and rewrites data.h5 between bins, so a 0 mid-write is

@@ -1,5 +1,6 @@
 """Tests for ClusterSubmitter in py_alf.cluster_submission."""
 
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -29,7 +30,12 @@ def _clear_module_caches():
     """Keep the module-level status/bin caches from leaking between tests."""
     from py_alf import cluster_submission as _cs
 
-    for cache in (_cs._terminal_status_cache, _cs._bin_cache, _cs._bin_stat):
+    for cache in (
+        _cs._terminal_status_cache,
+        _cs._bin_cache,
+        _cs._bin_stat,
+        _cs._bin_read_failures,
+    ):
         cache.clear()
     _cs._bin_final.clear()
     yield
@@ -1248,6 +1254,118 @@ def test_bin_count_does_not_cache_signature_of_midwrite_zero(tmp_path):
     _write_bins(h5, 8)
     os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 20))
     assert _bin_count(sim, refresh=True) == 8
+
+
+# --- _bin_count mid-write handling ---
+
+
+def _truncate(path: Path, fraction: float = 0.9) -> None:
+    """Shorten data.h5 so its superblock disagrees with its size, as a
+    reader racing ALF's writer would observe."""
+    size = path.stat().st_size
+    with open(path, "r+b") as fh:
+        fh.truncate(int(size * fraction))
+
+
+def test_midwrite_read_keeps_cached_count_and_stays_quiet(tmp_path, caplog):
+    """Racing ALF's writer is expected: keep the last count, log nothing loud."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 40)
+    sim = _bin_count_sim(tmp_path)
+    assert _bin_count(sim, refresh=True) == 40
+
+    _truncate(h5)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+    with caplog.at_level(logging.ERROR, logger="py_alf.cluster_submission"):
+        assert _bin_count(sim, refresh=True) == 40, "must fall back to cached count"
+    assert caplog.records == [], "a mid-write must not be logged as an error"
+
+
+def test_midwrite_error_is_reported_once_it_stops_being_transient(tmp_path, caplog):
+    """A file that keeps failing is real damage and must surface."""
+    from py_alf.cluster_submission import _MIDWRITE_LOG_AFTER, _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 40)
+    sim = _bin_count_sim(tmp_path)
+    assert _bin_count(sim, refresh=True) == 40
+    _truncate(h5)
+
+    with caplog.at_level(logging.ERROR, logger="py_alf.cluster_submission"):
+        for _ in range(_MIDWRITE_LOG_AFTER - 1):
+            os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+            _bin_count(sim, refresh=True)
+        assert caplog.records == [], "still within the transient window"
+
+        os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+        _bin_count(sim, refresh=True)
+    assert len(caplog.records) == 1
+    assert "truncated file" in caplog.records[0].getMessage()
+
+
+def test_midwrite_failure_streak_resets_after_a_good_read(tmp_path, caplog):
+    """A recovered file must not carry its old failure count toward the alarm."""
+    from py_alf.cluster_submission import _MIDWRITE_LOG_AFTER, _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 40)
+    sim = _bin_count_sim(tmp_path)
+    _bin_count(sim, refresh=True)
+
+    for _ in range(_MIDWRITE_LOG_AFTER - 1):
+        _truncate(h5)
+        os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+        _bin_count(sim, refresh=True)
+
+    # The writer finishes; the next read succeeds and clears the streak.
+    _write_bins(h5, 41)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 20))
+    assert _bin_count(sim, refresh=True) == 41
+
+    _truncate(h5)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 30))
+    with caplog.at_level(logging.ERROR, logger="py_alf.cluster_submission"):
+        _bin_count(sim, refresh=True)
+    assert caplog.records == [], "streak should have reset after the good read"
+
+
+def test_midwrite_read_is_retried(tmp_path):
+    """A file that settles between attempts is read rather than reported stale."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 40)
+    sim = _bin_count_sim(tmp_path)
+    _bin_count(sim, refresh=True)
+
+    good = h5.read_bytes()
+    _truncate(h5)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+
+    real_open = h5py.File
+    calls: list[int] = []
+
+    def _settling_open(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the writer completes before the second attempt
+            h5.write_bytes(good)
+        return real_open(*args, **kwargs)
+
+    with patch("h5py.File", side_effect=_settling_open):
+        assert _bin_count(sim, refresh=True, force=True) == 40
+    assert len(calls) >= 2, "a mid-write must be retried, not given up on"
+
+
+def test_missing_file_is_not_counted_as_a_read_failure(tmp_path, caplog):
+    """A sim that has not started yet is not an error."""
+    from py_alf.cluster_submission import _bin_count
+
+    sim = _bin_count_sim(tmp_path)
+    with caplog.at_level(logging.DEBUG, logger="py_alf.cluster_submission"):
+        assert _bin_count(sim, refresh=True) == 0
+    assert caplog.records == []
 
 
 # --- _get_jobs_resources_bulk ---
