@@ -35,6 +35,7 @@ def _clear_module_caches():
         _cs._bin_cache,
         _cs._bin_stat,
         _cs._bin_read_failures,
+        _cs._submitit_timeout_cache,
     ):
         cache.clear()
     _cs._bin_final.clear()
@@ -1161,6 +1162,39 @@ def test_terminal_cache_still_queries_unfinished_jobs():
     assert j_arg == ["99201"], "cached terminal job must be excluded from the query"
     assert result["99200"]["status"] == "COMPLETED"
     assert result["99201"]["status"] == "RUNNING"
+
+
+# --- _is_submitit_timeout ---
+
+
+def test_submitit_timeout_detected_from_log(tmp_path):
+    from py_alf.cluster_submission import _is_submitit_timeout
+
+    (tmp_path / "77_0_log.out").write_text("... this job is timed-out ...")
+    assert _is_submitit_timeout("77", tmp_path) is True
+
+
+def test_submitit_missing_log_is_not_cached(tmp_path):
+    """A log that lags the job's state change must not pin "not timed out"."""
+    from py_alf.cluster_submission import _is_submitit_timeout
+
+    assert _is_submitit_timeout("78", tmp_path) is False
+
+    # The log lands on a later refresh; the timeout must now be reported.
+    (tmp_path / "78_0_log.out").write_text("... this job is timed-out ...")
+    assert _is_submitit_timeout("78", tmp_path) is True
+
+
+def test_submitit_present_log_is_cached(tmp_path):
+    """Once read, the log is not read again -- its verdict cannot change."""
+    from py_alf.cluster_submission import _is_submitit_timeout
+
+    log = tmp_path / "79_0_log.out"
+    log.write_text("nothing interesting")
+    assert _is_submitit_timeout("79", tmp_path) is False
+
+    with patch.object(Path, "read_text", side_effect=AssertionError("re-read")):
+        assert _is_submitit_timeout("79", tmp_path) is False
 
 
 # --- _bin_count stat gate ---

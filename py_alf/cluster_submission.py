@@ -1392,17 +1392,25 @@ def _is_submitit_timeout(
       misclassifying preempted-then-requeued jobs, which also log the SIGTERM
       bypass but correctly stay FAILED.
     """
-    if jobid not in _submitit_timeout_cache:
-        text = ""
+    cached = _submitit_timeout_cache.get(jobid)
+    if cached is None:
+        text: str | None = None
         log_path = Path(submit_dir) / f"{jobid}_0_log.out"
-        if log_path.exists():
-            with contextlib.suppress(OSError):
-                text = log_path.read_text(errors="replace")
-        _submitit_timeout_cache[jobid] = (
+        # Suppressing the read covers the missing file, so no separate exists().
+        with contextlib.suppress(OSError):
+            text = log_path.read_text(errors="replace")
+        if text is None:
+            # The log has not appeared yet — on a networked filesystem it can lag
+            # the job's state change.  Caching "not timed out" now would pin that
+            # answer for the session and misreport a real TIMEOUT, so report the
+            # default without caching and look again next refresh.
+            return False
+        cached = (
             "this job is timed-out" in text,
             "Bypassing signal SIGTERM" in text,
         )
-    timed_out, sigterm_bypassed = _submitit_timeout_cache[jobid]
+        _submitit_timeout_cache[jobid] = cached
+    timed_out, sigterm_bypassed = cached
     return timed_out or (status == "COMPLETED" and sigterm_bypassed)
 
 
