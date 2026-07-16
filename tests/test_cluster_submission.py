@@ -22,6 +22,15 @@ from py_alf.simulation import Simulation
 _RULES = {"short": 8, "long": 168}
 
 
+@pytest.fixture(autouse=True)
+def _clear_module_caches():
+    """Keep the module-level status cache from leaking between tests."""
+    from py_alf import cluster_submission as _cs
+
+    _cs._terminal_status_cache.clear()
+    yield
+
+
 # --- __init__ validation ---
 
 
@@ -1068,6 +1077,80 @@ def test_get_slurm_status_bulk_non_array_job_passed_through():
     first_cmd = mock_run.call_args_list[0][0][0]
     j_arg = first_cmd[first_cmd.index("-j") + 1]
     assert "77777" in j_arg.split(",")
+
+
+def test_sacct_fallback_filters_by_job_id():
+    """The sacct fallback asks for specific jobs, never the whole day's history."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk_sacct
+
+    sacct_output = "88000_0|COMPLETED|01:00:00|node01\n"
+    with _mock_subprocess(sacct_output) as mock_run:
+        _get_slurm_status_bulk_sacct(["88000_0"])
+
+    cmd = mock_run.call_args_list[0][0][0]
+    assert cmd[0] == "sacct"
+    assert "-j" in cmd, "sacct must be filtered by job id"
+    assert "88000" in cmd[cmd.index("-j") + 1].split(",")
+
+
+def test_sacct_fallback_ignores_substep_rows():
+    """sacct's .batch/.extern sub-steps must not leak into the status map."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk_sacct
+
+    sacct_output = (
+        "88001 COMPLETED 01:00:00 node01\n"
+        "88001.batch FAILED 01:00:00 node01\n"
+        "88001.extern COMPLETED 01:00:00 node01\n"
+    )
+    with _mock_subprocess(sacct_output):
+        result = _get_slurm_status_bulk_sacct(["88001"])
+
+    assert set(result) == {"88001"}
+    assert result["88001"]["status"] == "COMPLETED"
+
+
+def test_terminal_status_is_cached_and_not_requeried():
+    """A finished job is served from cache, sparing SLURM a query per refresh."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk
+
+    squeue_output = "99100 99100 RUNNING 00:30:00 node07\n"
+    with _mock_subprocess(squeue_output):
+        first = _get_slurm_status_bulk(["99100"])
+    assert first["99100"]["status"] == "RUNNING"
+
+    # Still RUNNING → not cached, so the next refresh must query again.
+    with _mock_subprocess(squeue_output) as mock_run:
+        _get_slurm_status_bulk(["99100"])
+    assert mock_run.call_count > 0
+
+    # Now it completes; squeue no longer lists it and sacct reports the state.
+    with _mock_subprocess("99100 COMPLETED 01:00:00 node07\n"):
+        done = _get_slurm_status_bulk(["99100"])
+    assert done["99100"]["status"] == "COMPLETED"
+
+    # Terminal states are immutable — no further subprocess calls.
+    with _mock_subprocess("") as mock_run:
+        cached = _get_slurm_status_bulk(["99100"])
+    assert mock_run.call_count == 0
+    assert cached["99100"]["status"] == "COMPLETED"
+
+
+def test_terminal_cache_still_queries_unfinished_jobs():
+    """A mixed session queries only the jobs that can still change."""
+    from py_alf.cluster_submission import _get_slurm_status_bulk
+
+    with _mock_subprocess("99200 COMPLETED 01:00:00 node01\n"):
+        _get_slurm_status_bulk(["99200"])
+
+    squeue_output = "99201 99201 RUNNING 00:10:00 node02\n"
+    with _mock_subprocess(squeue_output) as mock_run:
+        result = _get_slurm_status_bulk(["99200", "99201"])
+
+    queried = mock_run.call_args_list[0][0][0]
+    j_arg = queried[queried.index("-j") + 1].split(",")
+    assert j_arg == ["99201"], "cached terminal job must be excluded from the query"
+    assert result["99200"]["status"] == "COMPLETED"
+    assert result["99201"]["status"] == "RUNNING"
 
 
 # --- _get_jobs_resources_bulk ---

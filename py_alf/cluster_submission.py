@@ -1183,6 +1183,19 @@ def _get_slurm_status_sacct(jobid: str) -> dict[str, str | None]:
         return {"status": "ERROR", "runtime": None, "nodelist": None}
 
 
+def _parent_ids(jobids: list[str]) -> list[str]:
+    """Return the distinct array-parent IDs behind *jobids*, preserving order.
+
+    Querying individual task IDs (e.g. "12345_1") is unreliable on some SLURM
+    versions; the parent ID "12345" always returns every task row.
+    """
+    seen: dict[str, None] = {}
+    for jid in jobids:
+        parts = jid.rsplit("_", 1)
+        seen[parts[0] if len(parts) == 2 and parts[1].isdigit() else jid] = None
+    return list(seen)
+
+
 def _get_slurm_status_bulk_sacct(
     jobids: list[str],
 ) -> dict[str, dict[str, str | None]]:
@@ -1198,7 +1211,14 @@ def _get_slurm_status_bulk_sacct(
 
     try:
         result = subprocess.run(
-            ["sacct", "--format=JobID,State,Elapsed,NodeList", "--noheader", "--array"],
+            [
+                "sacct",
+                "-j",
+                ",".join(_parent_ids(jobids)),
+                "--format=JobID,State,Elapsed,NodeList",
+                "--noheader",
+                "--array",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -1207,6 +1227,10 @@ def _get_slurm_status_bulk_sacct(
             parts = line.split()
             if len(parts) >= 2:
                 jobid = parts[0]
+                # sacct also returns ".batch"/".extern" sub-steps; keep only the
+                # job rows that were actually asked for.
+                if jobid not in status_map:
+                    continue
                 state = _normalize_slurm_state(parts[1])
                 runtime = parts[2] if len(parts) > 2 else None
                 raw_node = parts[3] if len(parts) > 3 else None
@@ -1239,6 +1263,20 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
     if not jobids:
         return {}
 
+    # A job in a terminal state can never change again, so it is served from
+    # cache without touching SLURM.  This matters most for the sacct fallback
+    # below: terminal jobs have left the queue, so leaving them in the query set
+    # would make every refresh of a partly-finished session pay for an sacct
+    # call that can only return what is already known.
+    cached = {
+        jid: _terminal_status_cache[jid]
+        for jid in jobids
+        if jid in _terminal_status_cache
+    }
+    jobids = [jid for jid in jobids if jid not in _terminal_status_cache]
+    if not jobids:
+        return cached
+
     status_map: dict[str, dict[str, str | None]] = {
         jid: {"status": "FINISHED_OR_NOT_FOUND", "runtime": None, "nodelist": None}
         for jid in jobids
@@ -1246,15 +1284,6 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
     found_in_squeue = set()
 
     try:
-        # Query by parent array IDs so all tasks are returned reliably.
-        # Querying individual task IDs (e.g. "12345_1") is unreliable on some
-        # SLURM versions; the parent ID "12345" always returns every task row.
-        _seen_parents: dict[str, None] = {}
-        for _jid in jobids:
-            _parts = _jid.rsplit("_", 1)
-            _parent = _parts[0] if len(_parts) == 2 and _parts[1].isdigit() else _jid
-            _seen_parents[_parent] = None
-        parent_ids = list(_seen_parents)
         result = subprocess.run(
             [
                 "squeue",
@@ -1263,7 +1292,7 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
                 "%A %i %T %M %N",
                 "--array",
                 "-j",
-                ",".join(parent_ids),
+                ",".join(_parent_ids(jobids)),
             ],
             capture_output=True,
             text=True,
@@ -1330,12 +1359,21 @@ def _get_slurm_status_bulk(jobids: list[str]) -> dict[str, dict[str, str | None]
                 jid, {"status": "UNKNOWN", "runtime": None, "nodelist": None}
             )
 
+    for jid, entry in status_map.items():
+        if entry.get("status") in _TERMINAL_STATES:
+            _terminal_status_cache[jid] = dict(entry)
+
+    status_map.update(cached)
     return status_map
 
 
 _resource_cache: dict[str, dict[str, str | None]] = {}
 
 _submitit_timeout_cache: dict[str, tuple[bool, bool]] = {}
+
+# Terminal SLURM states are immutable, so they are cached per job ID and never
+# re-queried.  Keyed by the full task ID ("12345" or "12345_7").
+_terminal_status_cache: dict[str, dict[str, str | None]] = {}
 
 
 def _is_submitit_timeout(
