@@ -1277,3 +1277,50 @@ async def test_status_style_change_is_not_skipped_by_cell_diff(tmp_path):
     assert not _cell_eq(Text("8"), Text("9"))
     assert _cell_eq("-", "-")
     assert not _cell_eq("-", Text("-"))
+
+
+# ---------------------------------------------------------------------------
+# Peak-resource persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_monitor_caches():
+    from py_alf import monitor as _m
+
+    _m._peak_resources_cache.clear()
+    yield
+
+
+def test_peak_resources_written_once_not_every_refresh(tmp_path):
+    """Identical JSON must not be rewritten on every refresh."""
+    from py_alf.monitor import _peak_resources
+
+    res = {"max_rss": "4.2G", "cpu_eff": "97%"}
+    assert _peak_resources(str(tmp_path), res) == res
+    assert json.loads((tmp_path / "peak_resources.json").read_text()) == res
+
+    # A second refresh must not touch the filesystem at all.
+    with patch("pathlib.Path.write_text", side_effect=AssertionError("rewritten")):
+        assert _peak_resources(str(tmp_path), res) == res
+
+
+def test_peak_resources_falls_back_to_file_when_sacct_forgets(tmp_path):
+    """Once sacct drops the job, the mirrored figures are read back."""
+    from py_alf.monitor import _peak_resources
+
+    stored = {"max_rss": "8G", "cpu_eff": "88%"}
+    (tmp_path / "peak_resources.json").write_text(json.dumps(stored))
+    assert _peak_resources(str(tmp_path), {}) == stored
+
+
+def test_peak_resources_does_not_pin_an_empty_result(tmp_path):
+    """sacct lagging must not hide the figures for the rest of the session."""
+    from py_alf.monitor import _peak_resources
+
+    assert _peak_resources(str(tmp_path), {}) == {}
+
+    # sacct catches up on a later refresh; the figures must now be picked up.
+    res = {"max_rss": "2G", "cpu_eff": "50%"}
+    assert _peak_resources(str(tmp_path), res) == res
+    assert json.loads((tmp_path / "peak_resources.json").read_text()) == res

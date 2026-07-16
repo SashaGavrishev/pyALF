@@ -485,6 +485,42 @@ def _is_parallel_params(sim) -> bool:
     return "PARALLEL_PARAMS" in (getattr(sim, "config", "") or "")
 
 
+# Peak-resource figures already resolved this session, keyed by sim_dir.  A
+# finished job's numbers cannot change, so neither the mirror write nor the
+# fallback read needs repeating.
+_peak_resources_cache: dict[str, dict] = {}
+
+
+def _peak_resources(sim_dir: str, res: dict) -> dict:
+    """Resolve a finished job's peak memory and CPU efficiency.
+
+    sacct eventually forgets a job, so the figures are mirrored into
+    ``peak_resources.json`` beside the run and read back from there once sacct
+    has dropped them.  Both happen once per sim_dir: rewriting identical JSON on
+    every refresh is the most expensive thing a refresh can do on a networked
+    filesystem.
+
+    An empty result is not cached — sacct can lag a job's state change, and
+    pinning "no data" would hide the figures for the rest of the session.
+    """
+    cached = _peak_resources_cache.get(sim_dir)
+    if cached is not None:
+        return cached
+
+    res_file = Path(sim_dir) / "peak_resources.json"
+    if res.get("max_rss") or res.get("cpu_eff"):
+        with contextlib.suppress(OSError):
+            res_file.write_text(json.dumps(res))
+    else:
+        # Suppressing the read covers the missing file, so no separate exists().
+        with contextlib.suppress(Exception):
+            res = json.loads(res_file.read_text())
+
+    if res.get("max_rss") or res.get("cpu_eff"):
+        _peak_resources_cache[sim_dir] = res
+    return res
+
+
 def _probe_unit(task: tuple[Any, str, Path, bool, bool]) -> tuple[int, bool]:
     """Read the on-disk progress of one row: bin count and checkpoint presence.
 
@@ -885,14 +921,7 @@ class SimulationMonitor(App):
 
             res: dict = {}
             if jobid and status in _TERMINAL_STATES:
-                res = resources.get(jobid, {})
-                res_file = Path(sim.sim_dir) / "peak_resources.json"
-                if res.get("max_rss") or res.get("cpu_eff"):
-                    with contextlib.suppress(OSError):
-                        res_file.write_text(json.dumps(res))
-                elif res_file.exists():
-                    with contextlib.suppress(Exception):
-                        res = json.loads(res_file.read_text())
+                res = _peak_resources(sim.sim_dir, resources.get(jobid, {}))
 
             for realisation, eff_dir in units:
                 is_pp_row = realisation is not None
