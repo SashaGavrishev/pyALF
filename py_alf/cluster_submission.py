@@ -1700,6 +1700,10 @@ _bin_cache: dict[Any, int] = {}
 # re-open every data.h5 on every refresh.
 _bin_final: set[Any] = set()
 
+# (st_mtime_ns, st_size) of the data.h5 each cached count was read from, used to
+# skip the h5py open when the file has not changed since.
+_bin_stat: dict[Any, tuple[int, int]] = {}
+
 
 def _bin_count(
     sim: Simulation,
@@ -1707,6 +1711,7 @@ def _bin_count(
     refresh: bool = False,
     data_dir: str | None = None,
     final: bool = False,
+    force: bool = False,
 ) -> int:
     """
     Counts bins for a given observable in simulation data, with caching.
@@ -1720,6 +1725,8 @@ def _bin_count(
         final: Whether the job has reached a terminal state. The file is still
             read once (the last bins may have landed since the previous
             refresh), but the result is then frozen and served from cache.
+        force: Skip the (mtime, size) short-circuit and re-read the file even if
+            it looks unchanged.
     Returns:
         Number of bins.
     """
@@ -1732,6 +1739,26 @@ def _bin_count(
         return _bin_cache.get(key, 0)
 
     if (key in _bin_cache) and (not refresh):
+        return _bin_cache[key]
+
+    # ALF rewrites data.h5 as a whole, so an unchanged (mtime, size) means
+    # unchanged content: a stat is far cheaper than letting h5py parse the file
+    # structure, and a running job appends a bin far less often than the monitor
+    # polls.  Stat *before* reading — a write landing between the two then leaves
+    # a stale signature that forces a re-read next time, whereas stat-after would
+    # pair the new signature with the old count and never re-read.
+    stat_sig: tuple[int, int] | None = None
+    try:
+        st = os.stat(filename)
+        stat_sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    if (
+        not force
+        and stat_sig is not None
+        and key in _bin_cache
+        and _bin_stat.get(key) == stat_sig
+    ):
         return _bin_cache[key]
 
     N_bins = 0
@@ -1751,11 +1778,15 @@ def _bin_count(
 
     # Don't let a transient 0 overwrite a previously-seen non-zero count —
     # ALF truncates and rewrites data.h5 between bins, so a 0 mid-write is
-    # not meaningful and would cause the progress bar to flicker.
+    # not meaningful and would cause the progress bar to flicker.  The stat
+    # signature is deliberately not recorded here, so the next refresh re-reads
+    # rather than caching the mid-write state.
     if N_bins == 0 and _bin_cache.get(key, 0) > 0:
         return _bin_cache[key]
 
     _bin_cache[key] = N_bins
+    if read_ok and stat_sig is not None:
+        _bin_stat[key] = stat_sig
     # Only freeze a count that came from an actual read: a terminal job whose
     # data.h5 is missing or unreadable may still appear once the filesystem
     # catches up, or once a truncated file is repaired.

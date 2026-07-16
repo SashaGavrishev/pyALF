@@ -1114,3 +1114,28 @@ async def test_parallel_params_without_temp_dirs_falls_back_to_single_row(tmp_pa
     assert len(app._row_data) == 1
     assert app._row_data[0]["realisation"] is None
     assert app._row_data[0]["is_pp"] is False
+
+
+async def test_refresh_key_forces_reread(tmp_path):
+    """The 'f' key bypasses the stat gate; the periodic refresh does not."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="62"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "62": {"status": "RUNNING", "runtime": "00:05:00", "nodelist": "n1"}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=1) as mock_bins,
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert mock_bins.call_args.kwargs["force"] is False
+
+            await pilot.press("f")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert mock_bins.call_args.kwargs["force"] is True

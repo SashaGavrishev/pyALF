@@ -60,6 +60,12 @@ _STATUS_COLORS: dict[str, str] = {
 }
 
 
+# States whose bin count can still change and so must be re-checked on refresh.
+# Terminal states are included so the last bins written before exit are picked
+# up; _bin_count then freezes the result.
+_REFRESHING_STATES: frozenset[str] = frozenset({"RUNNING"}) | _TERMINAL_STATES
+
+
 def _styled(status: str) -> Text:
     return Text(status, style=_STATUS_COLORS.get(status, ""))
 
@@ -705,12 +711,12 @@ class SimulationMonitor(App):
     # Data fetching (background thread)
     # ------------------------------------------------------------------
 
-    def _trigger_refresh(self) -> None:
+    def _trigger_refresh(self, force: bool = False) -> None:
         self.query_one("#status-bar", Static).update("[dim]Refreshing…[/dim]")
-        self._fetch_and_update()
+        self._fetch_and_update(force)
 
     @work(thread=True)
-    def _fetch_and_update(self) -> None:
+    def _fetch_and_update(self, force: bool = False) -> None:
         # Build a per-index job ID list.  Prefer the ID stored in the session
         # manifest (sim.job_id on _SessionEntry objects) so that a later
         # re-submission that overwrites jobid.txt does not corrupt this session's
@@ -809,9 +815,10 @@ class SimulationMonitor(App):
                 is_pp_row = realisation is not None
                 n_bins = _bin_count(
                     sim,
-                    refresh=(status in {"RUNNING"} | _TERMINAL_STATES),
+                    refresh=(status in _REFRESHING_STATES),
                     data_dir=str(eff_dir),
                     final=(status in _TERMINAL_STATES),
+                    force=force,
                 )
                 has_checkpoint = any(eff_dir.glob("confin_*"))
 
@@ -1246,4 +1253,6 @@ class SimulationMonitor(App):
         self.query_one("#sim-table", DataTable).scroll_right(animate=False)
 
     def action_refresh_data(self) -> None:
-        self._trigger_refresh()
+        # An explicit refresh bypasses the (mtime, size) short-circuit, so a
+        # stale filesystem attribute cache cannot pin the bin count.
+        self._trigger_refresh(force=True)

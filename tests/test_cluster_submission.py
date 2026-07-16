@@ -1,8 +1,10 @@
 """Tests for ClusterSubmitter in py_alf.cluster_submission."""
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import h5py
 import pytest
 
 from py_alf.cluster_submission import (
@@ -24,10 +26,12 @@ _RULES = {"short": 8, "long": 168}
 
 @pytest.fixture(autouse=True)
 def _clear_module_caches():
-    """Keep the module-level status cache from leaking between tests."""
+    """Keep the module-level status/bin caches from leaking between tests."""
     from py_alf import cluster_submission as _cs
 
-    _cs._terminal_status_cache.clear()
+    for cache in (_cs._terminal_status_cache, _cs._bin_cache, _cs._bin_stat):
+        cache.clear()
+    _cs._bin_final.clear()
     yield
 
 
@@ -1151,6 +1155,99 @@ def test_terminal_cache_still_queries_unfinished_jobs():
     assert j_arg == ["99201"], "cached terminal job must be excluded from the query"
     assert result["99200"]["status"] == "COMPLETED"
     assert result["99201"]["status"] == "RUNNING"
+
+
+# --- _bin_count stat gate ---
+
+
+def _write_bins(path: Path, n_bins: int) -> None:
+    """Write a data.h5 holding *n_bins* bins of the counting observable."""
+    import h5py
+    import numpy as np
+
+    with h5py.File(path, "w") as f:
+        f.create_dataset("Ener_scal/obser", data=np.zeros((n_bins, 1)))
+
+
+def _bin_count_sim(sim_dir: Path):
+    sim = MagicMock()
+    sim.__class__ = Simulation
+    sim.sim_dir = str(sim_dir)
+    return sim
+
+
+def test_bin_count_skips_reopen_when_file_unchanged(tmp_path):
+    """An unchanged data.h5 is served from cache without an h5py open."""
+    from py_alf.cluster_submission import _bin_count
+
+    _write_bins(tmp_path / "data.h5", 5)
+    sim = _bin_count_sim(tmp_path)
+
+    assert _bin_count(sim, refresh=True) == 5
+
+    # A second refresh must not reach h5py: the file has not moved.
+    with patch("h5py.File", side_effect=AssertionError("data.h5 re-opened")):
+        assert _bin_count(sim, refresh=True) == 5
+
+
+def test_bin_count_rereads_when_file_changes(tmp_path):
+    """A new bin landing changes (mtime, size), so the count is re-read."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 5)
+    sim = _bin_count_sim(tmp_path)
+    assert _bin_count(sim, refresh=True) == 5
+
+    _write_bins(h5, 9)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+    assert _bin_count(sim, refresh=True) == 9
+
+
+def test_bin_count_force_bypasses_stat_gate(tmp_path):
+    """force=True re-reads even when the stat signature is unchanged."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 5)
+    sim = _bin_count_sim(tmp_path)
+    assert _bin_count(sim, refresh=True) == 5
+
+    with patch("h5py.File", side_effect=AssertionError("should not be re-opened")):
+        assert _bin_count(sim, refresh=True) == 5
+
+    # Same signature, but the user asked for a real read.
+    reads: list[int] = []
+    real_file = h5py.File
+
+    def _counting_open(*args, **kwargs):
+        reads.append(1)
+        return real_file(*args, **kwargs)
+
+    with patch("h5py.File", side_effect=_counting_open):
+        assert _bin_count(sim, refresh=True, force=True) == 5
+    assert reads == [1]
+
+
+def test_bin_count_does_not_cache_signature_of_midwrite_zero(tmp_path):
+    """A mid-write 0 keeps the old count and is not frozen by the stat gate."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 7)
+    sim = _bin_count_sim(tmp_path)
+    assert _bin_count(sim, refresh=True) == 7
+
+    # ALF truncates and rewrites data.h5 between bins; catch it holding 0 bins.
+    _write_bins(h5, 0)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 10))
+    assert _bin_count(sim, refresh=True) == 7, "transient 0 must not overwrite"
+
+    # The signature of that mid-write state must not have been recorded, or the
+    # real count would never be picked up again.
+    _write_bins(h5, 8)
+    os.utime(h5, (h5.stat().st_atime, h5.stat().st_mtime + 20))
+    assert _bin_count(sim, refresh=True) == 8
 
 
 # --- _get_jobs_resources_bulk ---
