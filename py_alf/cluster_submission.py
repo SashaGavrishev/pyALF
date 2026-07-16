@@ -1656,6 +1656,11 @@ def _get_slurm_status(jobid_element: str) -> str:
 
 
 _bin_cache: dict[Any, int] = {}
+# Keys read once while their job was already in a terminal state. Such a count
+# can never change again, so it is served from _bin_cache without touching the
+# filesystem. Callers monitoring many finished simulations would otherwise
+# re-open every data.h5 on every refresh.
+_bin_final: set[Any] = set()
 
 
 def _bin_count(
@@ -1663,6 +1668,7 @@ def _bin_count(
     counting_obs: str = "Ener_scal",
     refresh: bool = False,
     data_dir: str | None = None,
+    final: bool = False,
 ) -> int:
     """
     Counts bins for a given observable in simulation data, with caching.
@@ -1673,6 +1679,9 @@ def _bin_count(
         data_dir: Directory holding ``data.h5`` to read instead of
             ``sim.sim_dir`` — used to count bins in a single ``Temp_i/``
             realisation of a PARALLEL_PARAMS job.
+        final: Whether the job has reached a terminal state. The file is still
+            read once (the last bins may have landed since the previous
+            refresh), but the result is then frozen and served from cache.
     Returns:
         Number of bins.
     """
@@ -1681,14 +1690,19 @@ def _bin_count(
     filename = os.path.join(data_dir if data_dir is not None else sim.sim_dir, "data.h5")
     key = (filename, counting_obs)
 
+    if key in _bin_final:
+        return _bin_cache.get(key, 0)
+
     if (key in _bin_cache) and (not refresh):
         return _bin_cache[key]
 
     N_bins = 0
+    read_ok = False
     try:
         with h5py.File(filename, "r") as f:
             if counting_obs in f:
                 N_bins = f[counting_obs + "/obser"].shape[0]
+        read_ok = True
     except FileNotFoundError:
         pass
     except (OSError, KeyError) as e:
@@ -1704,6 +1718,11 @@ def _bin_count(
         return _bin_cache[key]
 
     _bin_cache[key] = N_bins
+    # Only freeze a count that came from an actual read: a terminal job whose
+    # data.h5 is missing or unreadable may still appear once the filesystem
+    # catches up, or once a truncated file is repaired.
+    if final and read_ok:
+        _bin_final.add(key)
     return N_bins
 
 

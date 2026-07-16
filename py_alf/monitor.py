@@ -811,6 +811,7 @@ class SimulationMonitor(App):
                     sim,
                     refresh=(status in {"RUNNING"} | _TERMINAL_STATES),
                     data_dir=str(eff_dir),
+                    final=(status in _TERMINAL_STATES),
                 )
                 has_checkpoint = any(eff_dir.glob("confin_*"))
 
