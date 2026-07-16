@@ -14,6 +14,7 @@ import contextlib
 import json
 import re as _re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,28 @@ from .cluster_submission import (
 from .simulation import Simulation
 
 _ANIM_FRAMES = ("· ", " ·")
+
+# Upper bound on concurrent filesystem probes.  These threads spend their time
+# blocked on a networked filesystem, so the useful width is set by I/O latency
+# rather than by core count.  Below _MIN_FANOUT items the pool costs more to
+# start than the I/O it would overlap.
+_MAX_IO_WORKERS = 16
+_MIN_FANOUT = 3
+
+
+def _map_io(fn, items: list) -> list:
+    """Apply *fn* to *items*, concurrently when there is enough work to justify it.
+
+    The probes are independent and block on filesystem latency, so on a cluster
+    filesystem the fan-out dominates: at ~5 ms per operation this turns a 32-row
+    refresh from ~200 ms into ~15 ms.  On a local disk the pool is pure overhead,
+    but well under a millisecond — far below the refresh interval either way.
+    """
+    if len(items) < _MIN_FANOUT:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(len(items), _MAX_IO_WORKERS)) as pool:
+        return list(pool.map(fn, items))
+
 
 _STATUS_COLORS: dict[str, str] = {
     "RUNNING": "",
@@ -448,6 +471,26 @@ def _is_parallel_params(sim) -> bool:
     return "PARALLEL_PARAMS" in (getattr(sim, "config", "") or "")
 
 
+def _probe_unit(task: tuple[Any, str, Path, bool, bool]) -> tuple[int, bool]:
+    """Read the on-disk progress of one row: bin count and checkpoint presence.
+
+    Split out of ``_fetch_and_update`` so the per-row filesystem work — a stat
+    or h5py open of ``data.h5`` plus a ``confin_*`` scan — can be fanned out
+    across a thread pool.  Called by module-global name so tests that patch
+    ``py_alf.monitor._bin_count`` still take effect.
+    """
+    sim, status, eff_dir, refresh, force = task
+    n_bins = _bin_count(
+        sim,
+        refresh=refresh,
+        data_dir=str(eff_dir),
+        final=(status in _TERMINAL_STATES),
+        force=force,
+    )
+    has_checkpoint = any(eff_dir.glob("confin_*"))
+    return n_bins, has_checkpoint
+
+
 def _parallel_param_temp_dirs(sim_dir: str | Path) -> list[tuple[int, Path]]:
     """Return ``(realisation_index, Temp_i_path)`` pairs under *sim_dir*, sorted.
 
@@ -751,7 +794,20 @@ class SimulationMonitor(App):
                 _shared_partition = "???"
             _shared_mem = self._cs.slurm_mem
 
+        # The Temp_* scans are independent per sim and each costs a readdir on a
+        # networked filesystem, so run them concurrently before the row build.
+        pp_refs = [i for i, s in enumerate(self._sims) if _is_parallel_params(s)]
+        temp_dirs_by_sim: dict[int, list[tuple[int, Path]]] = dict(
+            zip(
+                pp_refs,
+                _map_io(
+                    lambda i: _parallel_param_temp_dirs(self._sims[i].sim_dir), pp_refs
+                ),
+            )
+        )
+
         rows: list[dict[str, Any]] = []
+        probe_tasks: list[tuple[Any, str, Path, bool, bool]] = []
         display_idx = 0
         for sim_ref, sim in enumerate(self._sims):
             jobid = jobid_list[sim_ref]
@@ -781,7 +837,7 @@ class SimulationMonitor(App):
             # realisation so per-config bin progress is visible.  These rows share
             # the one job id — this is NOT a SLURM array (see array_id below).
             if _is_parallel_params(sim):
-                temp_dirs = _parallel_param_temp_dirs(sim.sim_dir)
+                temp_dirs = temp_dirs_by_sim[sim_ref]
                 units: list[tuple[int | None, Path]] = temp_dirs or [
                     (None, Path(sim.sim_dir))
                 ]
@@ -813,14 +869,9 @@ class SimulationMonitor(App):
 
             for realisation, eff_dir in units:
                 is_pp_row = realisation is not None
-                n_bins = _bin_count(
-                    sim,
-                    refresh=(status in _REFRESHING_STATES),
-                    data_dir=str(eff_dir),
-                    final=(status in _TERMINAL_STATES),
-                    force=force,
+                probe_tasks.append(
+                    (sim, status, eff_dir, status in _REFRESHING_STATES, force)
                 )
-                has_checkpoint = any(eff_dir.glob("confin_*"))
 
                 # array_id drives the "Cancel Array" action and the array title
                 # note; only true array tasks (jobid like 1234_5) qualify.  A PP
@@ -848,13 +899,14 @@ class SimulationMonitor(App):
                     "ham": sim.ham_name,
                     "n_omp": sim.n_omp,
                     "n_mpi": n_mpi,
-                    "n_bins": n_bins,
+                    # Filled in by the probe pass below.
+                    "n_bins": 0,
                     "nbin_target": int(nbin_target) if nbin_target is not None else None,
                     "array_id": array_id,
                     "array_display": array_display,
                     "jobid": jobid or "-",
                     "status": status,
-                    "has_checkpoint": has_checkpoint,
+                    "has_checkpoint": False,
                     "node": nodelist or "-",
                     "elapsed": runtime or "-",
                     "cpu_max": _cpu_max,
@@ -869,6 +921,14 @@ class SimulationMonitor(App):
                     row["mem"] = _shared_mem
                 rows.append(row)
                 display_idx += 1
+
+        # Each row's progress needs a stat (or h5py open) of data.h5 plus a
+        # confin_* scan.  Note that h5py serialises actual reads on its global
+        # lock, so the fan-out buys time on the stat and readdir calls; the
+        # stat gate in _bin_count is what keeps the h5py opens rare.
+        for row, (n_bins, has_checkpoint) in zip(rows, _map_io(_probe_unit, probe_tasks)):
+            row["n_bins"] = n_bins
+            row["has_checkpoint"] = has_checkpoint
 
         self.call_from_thread(self._apply_rows, rows)
 

@@ -1139,3 +1139,61 @@ async def test_refresh_key_forces_reread(tmp_path):
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert mock_bins.call_args.kwargs["force"] is True
+
+
+async def test_probe_fanout_maps_bins_to_correct_rows(tmp_path):
+    """Concurrent probes must land on the row they were issued for."""
+    sim = _make_mock_sim(tmp_path / "sim0", n_mpi=3, mpi=True)
+    sim.config = "GNU PARALLEL_PARAMS HDF5"
+    for i in range(3):
+        (tmp_path / "sim0" / f"Temp_{i}").mkdir(parents=True)
+
+    def _bins(sim_, **kwargs):
+        # Give each realisation a distinct, order-revealing count.
+        return int(Path(kwargs["data_dir"]).name.split("_")[1]) * 10
+
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="61"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "61": {"status": "RUNNING", "runtime": "00:10:00", "nodelist": "n1"}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", side_effect=_bins),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    assert [r["realisation"] for r in app._row_data] == [0, 1, 2]
+    assert [r["n_bins"] for r in app._row_data] == [0, 10, 20]
+
+
+def test_map_io_runs_small_inputs_without_a_pool():
+    """Below the fan-out threshold the work runs inline — no thread spawn."""
+    import threading
+
+    from py_alf.monitor import _MIN_FANOUT, _map_io
+
+    caller = threading.current_thread()
+    threads = _map_io(lambda i: threading.current_thread(), list(range(_MIN_FANOUT - 1)))
+    assert all(t is caller for t in threads)
+
+
+def test_map_io_fans_out_large_inputs_and_preserves_order():
+    """Above the threshold work is spread across threads but stays ordered."""
+    import threading
+
+    from py_alf.monitor import _MIN_FANOUT, _map_io
+
+    n = max(_MIN_FANOUT, 8)
+    barrier = threading.Barrier(n, timeout=5)
+
+    def work(i):
+        # Deadlocks unless the items really run concurrently.
+        barrier.wait()
+        return i * 2
+
+    assert _map_io(work, list(range(n))) == [i * 2 for i in range(n)]
