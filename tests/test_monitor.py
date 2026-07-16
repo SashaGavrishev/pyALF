@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from rich.text import Text
 
 from py_alf.cluster_submission import ClusterSubmitter
 from py_alf.monitor import ConfirmScreen, LogViewerScreen, SimulationMonitor, _styled
@@ -1197,3 +1198,82 @@ def test_map_io_fans_out_large_inputs_and_preserves_order():
         return i * 2
 
     assert _map_io(work, list(range(n))) == [i * 2 for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# In-place table updates
+# ---------------------------------------------------------------------------
+
+
+def _bins_column_text(app) -> list[str]:
+    table = app.query_one("DataTable")
+    col = app._col_keys.index("n_bins")
+    return [str(table.get_row_at(i)[col]) for i in range(table.row_count)]
+
+
+async def test_table_updated_in_place_without_rebuild(tmp_path):
+    """A steady row set is patched cell by cell rather than cleared and rebuilt."""
+    sim = _make_mock_sim(tmp_path / "sim0")
+    status = {"62": {"status": "RUNNING", "runtime": "00:05:00", "nodelist": "n1"}}
+    counts = iter([3, 7])
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="62"),
+        patch("py_alf.monitor._get_slurm_status_bulk", return_value=status),
+        patch("py_alf.monitor._bin_count", side_effect=lambda *a, **k: next(counts)),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert _bins_column_text(app) == ["3"]
+
+            with patch.object(
+                app.query_one("DataTable"),
+                "clear",
+                side_effect=AssertionError("table rebuilt"),
+            ):
+                app._trigger_refresh()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+            assert _bins_column_text(app) == ["7"]
+
+
+async def test_table_rebuilds_when_row_identity_changes(tmp_path):
+    """A new Temp_i appearing changes row identity and forces a rebuild."""
+    sim = _make_mock_sim(tmp_path / "sim0", n_mpi=2, mpi=True)
+    sim.config = "GNU PARALLEL_PARAMS HDF5"
+    (tmp_path / "sim0" / "Temp_0").mkdir(parents=True)
+
+    with (
+        patch("py_alf.monitor.get_job_id", return_value="63"),
+        patch(
+            "py_alf.monitor._get_slurm_status_bulk",
+            return_value={
+                "63": {"status": "RUNNING", "runtime": "00:05:00", "nodelist": "n1"}
+            },
+        ),
+        patch("py_alf.monitor._bin_count", return_value=2),
+    ):
+        app = _monitor([sim])
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.query_one("DataTable").row_count == 1
+
+            (tmp_path / "sim0" / "Temp_1").mkdir()
+            app._trigger_refresh()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.query_one("DataTable").row_count == 2
+            assert [r["realisation"] for r in app._row_data] == [0, 1]
+
+
+async def test_status_style_change_is_not_skipped_by_cell_diff(tmp_path):
+    """A cell whose text is unchanged but whose colour changed must be rewritten."""
+    from py_alf.monitor import _cell_eq
+
+    assert not _cell_eq(Text("8", style="red"), Text("8", style="dim"))
+    assert _cell_eq(Text("8", style="red"), Text("8", style="red"))
+    assert not _cell_eq(Text("8"), Text("9"))
+    assert _cell_eq("-", "-")
+    assert not _cell_eq("-", Text("-"))

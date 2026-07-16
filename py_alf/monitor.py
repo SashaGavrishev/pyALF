@@ -93,6 +93,20 @@ def _styled(status: str) -> Text:
     return Text(status, style=_STATUS_COLORS.get(status, ""))
 
 
+def _cell_eq(a: Any, b: Any) -> bool:
+    """True if two rendered cells are identical and the table can skip a write.
+
+    Rich's ``Text.__eq__`` compares the plain text and spans but ignores the
+    base ``style``, so a cell that only changed colour would compare equal;
+    compare the base style explicitly.
+    """
+    if isinstance(a, Text) and isinstance(b, Text):
+        return a == b and a.style == b.style
+    if isinstance(a, Text) or isinstance(b, Text):
+        return False
+    return a == b
+
+
 def _parse_elapsed_hours(runtime: str) -> float | None:
     """Parse a SLURM runtime string (``[D-]HH:MM:SS``) to fractional hours."""
     if not runtime:
@@ -653,6 +667,10 @@ class SimulationMonitor(App):
         self._row_data: list[dict[str, Any]] = []
         self._dt_cursor_row: int = 0
         self._anim_tick: int = 0
+        self._col_keys: list[str] = []
+        # Last rendered cells and row identities, for the in-place table update.
+        self._prev_values: list[list[Any]] = []
+        self._row_identity: list[tuple[int, int | None]] | None = None
 
     # ------------------------------------------------------------------
     # Session manifest
@@ -717,26 +735,35 @@ class SimulationMonitor(App):
         self._update_footer_keys()
         self._any_mpi: bool = any(getattr(s, "mpi", False) for s in self._sims)
         table = self.query_one("#sim-table", DataTable)
-        table.add_column("", key="cur", width=3)
-        table.add_column("#", key="idx")
-        table.add_column("Hamiltonian", key="ham")
+
+        # _col_keys records the column order so _apply_rows can map each value
+        # position back to a column key when updating cells in place.
+        self._col_keys = []
+
+        def add_column(label: str, key: str, **kwargs) -> None:
+            table.add_column(label, key=key, **kwargs)
+            self._col_keys.append(key)
+
+        add_column("", "cur", width=3)
+        add_column("#", "idx")
+        add_column("Hamiltonian", "ham")
         for key, hdr in zip(self._param_keys, self._param_headers):
-            table.add_column(hdr, key=key)
-        table.add_column("n_omp", key="n_omp")
+            add_column(hdr, key)
+        add_column("n_omp", "n_omp")
         if self._any_mpi:
-            table.add_column("n_mpi", key="n_mpi")
+            add_column("n_mpi", "n_mpi")
         if self._cs is not None and self._cs.executor == "slurm":
-            table.add_column("partition", key="partition")
-            table.add_column("mem", key="mem")
-        table.add_column("N_bins", key="n_bins")
-        table.add_column("Array", key="array_id")
-        table.add_column("JobID", key="jobid")
-        table.add_column("Status", key="status")
-        table.add_column("Node", key="node")
-        table.add_column("Elapsed", key="elapsed")
-        table.add_column("ETA", key="eta")
-        table.add_column("Peak Mem", key="peak_mem")
-        table.add_column("CPU Eff", key="cpu_eff")
+            add_column("partition", "partition")
+            add_column("mem", "mem")
+        add_column("N_bins", "n_bins")
+        add_column("Array", "array_id")
+        add_column("JobID", "jobid")
+        add_column("Status", "status")
+        add_column("Node", "node")
+        add_column("Elapsed", "elapsed")
+        add_column("ETA", "eta")
+        add_column("Peak Mem", "peak_mem")
+        add_column("CPU Eff", "cpu_eff")
 
         self._trigger_refresh()
         self.set_interval(self._refresh_interval, self._trigger_refresh)
@@ -932,12 +959,66 @@ class SimulationMonitor(App):
 
         self.call_from_thread(self._apply_rows, rows)
 
+    def _row_values(
+        self, row: dict[str, Any], is_cursor: bool, max_bins_w: int
+    ) -> list[Any]:
+        """Render one row's cells, in the column order recorded in _col_keys."""
+        if is_cursor:
+            cur_indicator = ">"
+        elif row["status"] == "RUNNING":
+            cur_indicator = _ANIM_FRAMES[self._anim_tick % 2]
+        else:
+            cur_indicator = " "
+        values: list[Any] = [cur_indicator, row["idx"], row["ham"]]
+        for key in self._param_keys:
+            values.append(row.get(key, "-"))
+        values.append(row["n_omp"])
+        if self._any_mpi:
+            values.append(row["n_mpi"])
+        if self._cs is not None and self._cs.executor == "slurm":
+            values.extend([row["partition"], row["mem"]])
+        _cpu_max = row.get("cpu_max")
+        _nbin_target = None if row.get("has_checkpoint") else row.get("nbin_target")
+        # CPU_MAX mode: wall-time budget set, no NBin target → show ETA bar.
+        # NBin mode: bin target set (or no cpu_max) → show bins progress bar.
+        cpu_max_mode = _cpu_max is not None and _cpu_max > 0 and not _nbin_target
+        _bins_val = _bins_cell(
+            row["n_bins"], None if cpu_max_mode else _nbin_target, max_bins_w
+        )
+        if cpu_max_mode:
+            assert _cpu_max is not None  # guaranteed by cpu_max_mode
+            if row["status"] == "COMPLETED":
+                _eta_val = Text("[" + "/" * 8 + "]")
+            else:
+                _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
+        else:
+            _eta_val = Text("-")
+        values.extend(
+            [_bins_val, row.get("array_display", row["array_id"]), row["jobid"]]
+        )
+        status_cell = _styled(row["status"])
+        if row.get("has_checkpoint"):
+            if row["status"] in ("RUNNING", "PENDING"):
+                status_cell.append(" [R]")
+            else:
+                status_cell.append(" [R]", style="dim")
+        values.append(status_cell)
+        values.append(row["node"])
+        values.extend(
+            [
+                row["elapsed"],
+                _eta_val,
+                row.get("peak_mem", "-"),
+                row.get("cpu_eff", "-"),
+            ]
+        )
+        return values
+
     def _apply_rows(self, rows: list[dict[str, Any]]) -> None:
         self._row_data = rows
         table = self.query_one("#sim-table", DataTable)
         saved_cursor = table.cursor_row
 
-        table.clear()
         array_ids: list[str] = list(
             dict.fromkeys(
                 r["array_id"]
@@ -952,59 +1033,35 @@ class SimulationMonitor(App):
         # the fraction text has a uniform prefix and bars start at the same column.
         max_bins_w = max((len(str(r["n_bins"])) for r in rows), default=1)
 
-        for i, row in enumerate(rows):
-            if i == restore_cursor:
-                cur_indicator = ">"
-            elif row["status"] == "RUNNING":
-                cur_indicator = _ANIM_FRAMES[self._anim_tick % 2]
-            else:
-                cur_indicator = " "
-            values: list[Any] = [cur_indicator, row["idx"], row["ham"]]
-            for key in self._param_keys:
-                values.append(row.get(key, "-"))
-            values.append(row["n_omp"])
-            if self._any_mpi:
-                values.append(row["n_mpi"])
-            if self._cs is not None and self._cs.executor == "slurm":
-                values.extend([row["partition"], row["mem"]])
-            _cpu_max = row.get("cpu_max")
-            _nbin_target = None if row.get("has_checkpoint") else row.get("nbin_target")
-            # CPU_MAX mode: wall-time budget set, no NBin target → show ETA bar.
-            # NBin mode: bin target set (or no cpu_max) → show bins progress bar.
-            cpu_max_mode = _cpu_max is not None and _cpu_max > 0 and not _nbin_target
-            _bins_val = _bins_cell(row["n_bins"], None if cpu_max_mode else _nbin_target, max_bins_w)
-            if cpu_max_mode:
-                assert _cpu_max is not None  # guaranteed by cpu_max_mode
-                if row["status"] == "COMPLETED":
-                    _eta_val = Text("[" + "/" * 8 + "]")
-                else:
-                    _eta_val = _eta_cell(_cpu_max, row.get("elapsed_h"))
-            else:
-                _eta_val = Text("-")
-            values.extend(
-                [
-                    _bins_val,
-                    row.get("array_display", row["array_id"]),
-                    row["jobid"],
-                ]
-            )
-            status_cell = _styled(row["status"])
-            if row.get("has_checkpoint"):
-                if row["status"] in ("RUNNING", "PENDING"):
-                    status_cell.append(" [R]")
-                else:
-                    status_cell.append(" [R]", style="dim")
-            values.append(status_cell)
-            values.append(row["node"])
-            values.extend(
-                [
-                    row["elapsed"],
-                    _eta_val,
-                    row.get("peak_mem", "-"),
-                    row.get("cpu_eff", "-"),
-                ]
-            )
-            table.add_row(*values, key=str(row["idx"]))
+        values_by_row = [
+            self._row_values(row, i == restore_cursor, max_bins_w)
+            for i, row in enumerate(rows)
+        ]
+        # Row identity is (which sim, which realisation).  While that is stable
+        # the table is patched cell by cell; a Temp_i appearing or a sim being
+        # added changes it and forces a rebuild.
+        identity = [(r["_sim_ref"], r["realisation"]) for r in rows]
+
+        if identity == self._row_identity:
+            for i, (new, old) in enumerate(zip(values_by_row, self._prev_values)):
+                for col, (nv, ov) in enumerate(zip(new, old)):
+                    key = self._col_keys[col]
+                    # The cursor and animation frames are written directly to the
+                    # "cur" column between refreshes, so _prev_values does not
+                    # track it — always write it rather than diff it.
+                    if key != "cur" and _cell_eq(nv, ov):
+                        continue
+                    with contextlib.suppress(Exception):
+                        table.update_cell(
+                            str(rows[i]["idx"]), key, nv, update_width=True
+                        )
+        else:
+            table.clear()
+            for row, values in zip(rows, values_by_row):
+                table.add_row(*values, key=str(row["idx"]))
+
+        self._row_identity = identity
+        self._prev_values = values_by_row
 
         if rows:
             self._dt_cursor_row = restore_cursor
