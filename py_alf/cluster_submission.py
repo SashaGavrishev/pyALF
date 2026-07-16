@@ -1117,20 +1117,36 @@ def get_status(sim: Simulation, colored: bool = True) -> str:
     return status
 
 
+# jobid.txt contents, keyed by path: (st_mtime_ns, st_size, jobid).
+_jobid_cache: dict[str, tuple[int, int, str | None]] = {}
+
+
 def get_job_id(sim: Simulation) -> str | None:
     """
-    Returns colorized SLURM job status for a simulation.
-    Args:
-        sim: Simulation instance.
-        colored: Colorize output if True.
-    Returns:
-        Colorized status string.
+    Returns the SLURM job ID recorded for a simulation, or None.
+
+    Cached against jobid.txt's (mtime, size) rather than by path: a resubmission
+    rewrites the file, and callers such as the cancel and log actions must see
+    the new ID rather than a stale one.
     """
     jobid_file = Path(sim.sim_dir) / "jobid.txt"
-    if not jobid_file.exists():
+    try:
+        st = jobid_file.stat()
+    except OSError:
         return None
-    else:
-        return jobid_file.read_text().strip()
+
+    key = str(jobid_file)
+    cached = _jobid_cache.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+
+    try:
+        jobid = jobid_file.read_text().strip()
+    except OSError:
+        return None
+    if _mtime_settled(st.st_mtime_ns):
+        _jobid_cache[key] = (st.st_mtime_ns, st.st_size, jobid)
+    return jobid
 
 
 def _normalize_slurm_state(raw: str) -> str:
