@@ -113,6 +113,14 @@ class Simulation:
             os.path.expanduser(os.path.join(sim_root, dir_component))
         )
         self.mpi = kwargs.pop("mpi", False)
+        # Explicit Monte-Carlo seed. When set, _prep_sim_dir writes a `seeds`
+        # file whose first line is this integer instead of copying ALF's stock
+        # pool. A single-rank NOMPI job reads only that first line
+        # (Set_random_mod.F90, #else branch), so this is what gives each such
+        # job an independent Markov chain -- essential when disorder
+        # realisations run as separate single-core jobs rather than as ranks of
+        # one PARALLEL_PARAMS job (where ALF hands each rank a distinct line).
+        self.mc_seed = kwargs.pop("mc_seed", None)
         self.parallel_params = kwargs.pop("parallel_params", False)
         self.n_mpi = kwargs.pop("n_mpi", 1)
         self.n_omp = kwargs.pop("n_omp", 1)
@@ -221,7 +229,13 @@ class Simulation:
                     sim_dict,
                 )
         else:
-            _prep_sim_dir(self.alf_src, self.sim_dir, self.ham_name, self.sim_dict)
+            _prep_sim_dir(
+                self.alf_src,
+                self.sim_dir,
+                self.ham_name,
+                self.sim_dict,
+                mc_seed=self.mc_seed,
+            )
 
         executable = os.path.join(self.alf_src.alf_dir, "Prog", "ALF.out")
         if copy_bin:
@@ -370,7 +384,7 @@ class Simulation:
         return pd.DataFrame(dicts).transpose()
 
 
-def _prep_sim_dir(alf_src, sim_dir, ham_name, sim_dict):
+def _prep_sim_dir(alf_src, sim_dir, ham_name, sim_dict, mc_seed=None):
     print(f'Prepare directory "{sim_dir}" for Monte Carlo run.')
     if not os.path.exists(sim_dir):
         print("Create new directory.")
@@ -379,12 +393,21 @@ def _prep_sim_dir(alf_src, sim_dir, ham_name, sim_dict):
     with cd(sim_dir):
         if "confout_0" in os.listdir() or "confout_0.h5" in os.listdir():
             print("Resuming previous run.")
-        shutil.copyfile(
-            os.path.join(
-                alf_src.alf_dir, "Scripts_and_Parameters_files", "Start", "seeds"
-            ),
-            "seeds",
-        )
+        if mc_seed is None:
+            shutil.copyfile(
+                os.path.join(
+                    alf_src.alf_dir, "Scripts_and_Parameters_files", "Start", "seeds"
+                ),
+                "seeds",
+            )
+        else:
+            # Write an explicit seeds file. Set_Random_number_Generator reads
+            # the first line for a single-rank job, so mc_seed goes on line 1;
+            # the extra lines keep the file valid for the (unused here) MPI read
+            # path that consumes ISIZE lines.
+            with open("seeds", "w", encoding="UTF-8") as f:
+                for _ in range(16):
+                    f.write(f"{int(mc_seed)}\n")
         params = set_param(alf_src, ham_name, sim_dict)
         write_parameters(params)
         out_to_in(verbose=False)
