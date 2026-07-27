@@ -1092,7 +1092,9 @@ class SimulationMonitor(App):
                     "n_mpi": n_mpi,
                     # Filled in by the probe pass below.
                     "n_bins": 0,
-                    "nbin_target": int(nbin_target) if nbin_target is not None else None,
+                    "nbin_target": int(nbin_target)
+                    if nbin_target is not None
+                    else None,
                     "array_id": array_id,
                     "array_display": array_display,
                     "jobid": jobid or "-",
