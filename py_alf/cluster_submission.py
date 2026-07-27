@@ -17,9 +17,10 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -614,7 +615,10 @@ class ClusterSubmitter:
         Additional keyword arguments forwarded to
         ``executor.update_parameters()``. Keys prefixed with ``slurm_``
         are sent as raw ``#SBATCH`` directives. Only valid when *executor*
-        is ``'slurm'``.
+        is ``'slurm'``. ``slurm_max_num_timeout`` is the exception: it is
+        a submitit executor setting (how many times a timed-out task may be
+        requeued, default 3) and is forwarded to the executor's constructor
+        instead.
 
     Raises
     ------
@@ -768,6 +772,9 @@ class ClusterSubmitter:
         submit_dir: str | Path | None = None,
         confirm_checkpoint: bool = True,
         write_session: bool = True,
+        runner: Callable[[Simulation], None] | None = None,
+        prep: bool = True,
+        stale_running: Literal["ask", "remove", "skip"] = "ask",
     ) -> list[submitit.Job]:
         """
         Submit one or more Simulation instances to the SLURM cluster.
@@ -793,6 +800,27 @@ class ClusterSubmitter:
             :meth:`SimulationMonitor.from_session` / the ``alf_monitor`` CLI.
             The interactive TUI sets this to ``False`` because it writes its own
             manifest from the newly-submitted subset.
+        runner : callable, optional
+            Function submitit executes on the worker, called with one
+            ``Simulation``. Defaults to :func:`_run_alf`, which execs the binary
+            directly. A caller that must decide *on the node* how to run (e.g.
+            sizing ``CPU_MAX`` from the bins already on disk) passes its own,
+            usually together with ``prep=False``.
+        prep : bool, default=True
+            Run ``sim.run(only_prep=True)`` for each simulation at submission
+            time, writing ``parameters``/``seeds`` and renaming
+            ``confout_* -> confin_*``. Set ``False`` when *runner* preps the
+            directory itself: for a job that may be requeued the rename must
+            happen each time it starts, not once when it was queued. The ALF
+            binary is copied into the simulation directory either way, so the
+            worker can rely on it being there.
+        stale_running : {'ask', 'remove', 'skip'}, default='ask'
+            What to do with a ``RUNNING`` file left behind by a previous run
+            whose job is no longer active. ``'ask'`` prompts on stdin;
+            ``'remove'`` deletes it and submits anyway; ``'skip'`` leaves the
+            simulation out. An unattended caller (cron, a driver that has
+            already established from ``sacct`` that nothing is running) must not
+            use ``'ask'``, which would block forever on a closed stdin.
 
         Returns
         -------
@@ -844,12 +872,16 @@ class ClusterSubmitter:
                         continue
                 logger.warning(f"Leftover RUNNING file detected in {s.sim_dir}.")
                 logger.warning("This indicates an error in the previous run.")
-                choice = (
-                    input("Remove RUNNING file to enable resubmission? [y/N]: ")
-                    .strip()
-                    .lower()
-                )
-                if choice in ("yes", "y"):
+                if stale_running == "ask":
+                    choice = (
+                        input("Remove RUNNING file to enable resubmission? [y/N]: ")
+                        .strip()
+                        .lower()
+                    )
+                    remove = choice in ("yes", "y")
+                else:
+                    remove = stale_running == "remove"
+                if remove:
                     running_file.unlink()
                     logger.info("File removed.")
                 else:
@@ -1001,24 +1033,41 @@ class ClusterSubmitter:
                 extra["time"] = int(slurm_time_h * 60)
             params["slurm_additional_parameters"] = extra
 
-        # Prepare simulation directories and copy binary.
+        # Prepare simulation directories and copy binary. With prep=False the
+        # runner preps on the node, so only the binary is staged here.
         for s in filtered_sims:
-            s.run(only_prep=True, copy_bin=True)
+            if prep:
+                s.run(only_prep=True, copy_bin=True)
+            else:
+                Path(s.sim_dir).mkdir(parents=True, exist_ok=True)
+                shutil.copy(
+                    os.path.join(s.alf_src.alf_dir, "Prog", "ALF.out"), s.sim_dir
+                )
 
         effective_submit_dir = (
             Path(submit_dir) if submit_dir is not None else self.submit_dir
         )
         effective_submit_dir.mkdir(parents=True, exist_ok=True)
 
+        # submitit takes the requeue budget when the executor is *constructed*,
+        # not through update_parameters(), so it is pulled back out of params.
+        max_num_timeout = params.pop("slurm_max_num_timeout", None)
+        executor_kwargs: dict[str, Any] = {}
+        if max_num_timeout is not None and self.executor == "slurm":
+            executor_kwargs["slurm_max_num_timeout"] = int(max_num_timeout)
+
         executor = submitit.AutoExecutor(
-            folder=str(effective_submit_dir), cluster=self.executor
+            folder=str(effective_submit_dir),
+            cluster=self.executor,
+            **executor_kwargs,
         )
         executor.update_parameters(**params)
 
+        run_fn = runner if runner is not None else _run_alf
         if len(filtered_sims) == 1:
-            jobs = [executor.submit(_run_alf, filtered_sims[0])]
+            jobs = [executor.submit(run_fn, filtered_sims[0])]
         else:
-            jobs = executor.map_array(_run_alf, filtered_sims)
+            jobs = executor.map_array(run_fn, filtered_sims)
 
         # Write job IDs for compatibility with get_status / get_status_all.
         for s, job in zip(filtered_sims, jobs):
@@ -1800,7 +1849,9 @@ def _bin_count(
     """
     import h5py
 
-    filename = os.path.join(data_dir if data_dir is not None else sim.sim_dir, "data.h5")
+    filename = os.path.join(
+        data_dir if data_dir is not None else sim.sim_dir, "data.h5"
+    )
     key = (filename, counting_obs)
 
     if key in _bin_final:
