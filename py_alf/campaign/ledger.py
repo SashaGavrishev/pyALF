@@ -1,0 +1,252 @@
+"""Durable record of a campaign: which chain is which, and what has run.
+
+The ledger is the campaign's index. It maps every ``chain_id`` to its
+Monte-Carlo seed, ``sim_dir``, grid coordinates (``point``) and job history,
+which is what lets a later process -- ``reconcile``, an analysis script, a
+TUI -- pick up a run it did not submit. It also answers the reverse question,
+"which chain sits at grid coordinate X", that a per-chain result needs to be
+traced back (:meth:`Ledger.by_point_key`).
+
+Writes are driver-side and atomic (temp file + ``os.replace``): a crashed or
+concurrently-running driver can never leave a half-written index. Workers never
+touch this file. Each writes its own segment record under its own ``sim_dir``
+instead (:data:`SEGMENT_SUBDIR`), so hundreds of concurrent array tasks never
+contend, and :meth:`Ledger.absorb_segment_records` folds them in afterwards.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+SEGMENT_SUBDIR = "segments"
+LEDGER_VERSION = 1
+
+# Point coordinates that older ledgers stored as top-level record keys, before
+# every grid coordinate moved into ``point``. Folded back in on read so a
+# campaign launched then can still be reopened.
+LEGACY_POINT_KEYS = ("disorder_seed",)
+
+# Observable whose bin count measures progress. Recorded per campaign, since a
+# ledger that did not name it would make ``status`` report zero bins for every
+# chain of a model that counts something else.
+DEFAULT_COUNTING_OBS = "Ener_scal"
+
+
+def segment_dir(sim_dir: str | Path) -> Path:
+    """Directory holding one chain's worker-written segment records."""
+    return Path(sim_dir) / SEGMENT_SUBDIR
+
+
+def chain_point(record: dict[str, Any]) -> dict[str, Any]:
+    """Grid coordinates of one ledger chain record, legacy keys folded in."""
+    point = dict(record.get("point") or {})
+    for key in LEGACY_POINT_KEYS:
+        if key not in point and key in record:
+            point[key] = record[key]
+    return point
+
+
+def ledger_path(data_dir: str | Path, name: str) -> Path:
+    """Where the campaign ``name`` keeps its ledger under an experiment's data.
+
+    Beside the simulation output rather than next to the launcher, so a campaign
+    stays with the data it produced when either is moved.
+    """
+    return Path(data_dir) / "campaigns" / f"{name}.json"
+
+
+class Ledger:
+    """Read/modify/write access to one campaign's index."""
+
+    def __init__(self, path: Path, data: dict[str, Any]):
+        self.path = Path(path)
+        self.data = data
+
+    # --- construction -------------------------------------------------------
+
+    @classmethod
+    def new(
+        cls,
+        path: Path,
+        *,
+        name: str,
+        target_bins: int,
+        policy: dict[str, Any],
+        counting_obs: str = DEFAULT_COUNTING_OBS,
+        experiment: str = "",
+        env_name: str = "",
+    ) -> Ledger:
+        return cls(
+            path,
+            {
+                "version": LEDGER_VERSION,
+                "name": name,
+                "experiment": experiment,
+                "env": env_name,
+                "target_bins": target_bins,
+                "counting_obs": counting_obs,
+                "policy": policy,
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "updated": None,
+                "chains": {},
+                "followups": [],
+            },
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> Ledger:
+        path = Path(path)
+        if not path.exists():
+            raise SystemExit(
+                f"No campaign ledger at {path}. Launch the campaign first, or check "
+                "--name / --env."
+            )
+        data = json.loads(path.read_text())
+        if data.get("version") != LEDGER_VERSION:
+            raise SystemExit(
+                f"{path} has ledger version {data.get('version')}, expected "
+                f"{LEDGER_VERSION}."
+            )
+        return cls(path, data)
+
+    @classmethod
+    def load_or_new(cls, path: Path, **kwargs) -> Ledger:
+        """Reopen an existing campaign, or start one. Re-launching is additive."""
+        if Path(path).exists():
+            return cls.load(path)
+        return cls.new(Path(path), **kwargs)
+
+    # --- mutation -----------------------------------------------------------
+
+    def upsert_chains(self, chains) -> None:
+        """Add chains, preserving the job history of any already present.
+
+        Re-launching a campaign with a wider grid therefore extends it rather
+        than resetting the chains that have already done work.
+        """
+        for chain in chains:
+            existing = self.data["chains"].get(chain.chain_id, {})
+            record = chain.to_record()
+            record["segments"] = existing.get("segments", [])
+            self.data["chains"][chain.chain_id] = record
+
+    def add_segment(self, chain_id: str, segment: dict[str, Any]) -> None:
+        """Append a submitted segment to a chain's history."""
+        self.data["chains"][chain_id].setdefault("segments", []).append(segment)
+
+    def add_followup(self, record: dict[str, Any]) -> None:
+        """Record a job chained after the campaign (e.g. an analysis stage)."""
+        self.data.setdefault("followups", []).append(record)
+
+    def absorb_segment_records(self) -> int:
+        """Merge worker-written segment records into the ledger.
+
+        Matches on ``job_id`` and fills in what only the node knew: bins before
+        and after, elapsed time, and the ``CPU_MAX`` it actually chose. Returns
+        the number of records folded in.
+
+        ``scontrol requeue`` reuses the job id, so several worker records can
+        match one submitted segment. Records are read in filename order, which
+        is attempt-then-timestamp, so the ledger ends up holding the latest
+        attempt; the per-chain record files keep them all, which is what
+        :func:`~py_alf.campaign.worker.measured_hours_per_bin` reads.
+        """
+        merged = 0
+        for record in self.data["chains"].values():
+            by_job = {
+                s.get("job_id"): s
+                for s in record.get("segments", [])
+                if s.get("job_id")
+            }
+            for path in sorted(segment_dir(record["sim_dir"]).glob("*.json")):
+                try:
+                    worker = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue  # still being written, or truncated by a hard kill
+                target = by_job.get(worker.get("job_id"))
+                if target is None:
+                    target = dict(worker)
+                    record.setdefault("segments", []).append(target)
+                    if worker.get("job_id"):
+                        by_job[worker["job_id"]] = target
+                else:
+                    target.update(worker)
+                merged += 1
+        return merged
+
+    def save(self) -> Path:
+        """Atomically write the ledger."""
+        self.data["updated"] = datetime.now().isoformat(timespec="seconds")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.data, indent=2, default=str))
+        os.replace(tmp, self.path)
+        return self.path
+
+    # --- lookup -------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return str(self.data.get("name", ""))
+
+    @property
+    def target_bins(self) -> int:
+        return int(self.data["target_bins"])
+
+    @property
+    def counting_obs(self) -> str:
+        """Observable this campaign counts bins of (ledgers predating it: default)."""
+        return str(self.data.get("counting_obs") or DEFAULT_COUNTING_OBS)
+
+    @property
+    def chains(self) -> dict[str, dict[str, Any]]:
+        return self.data["chains"]
+
+    def chain(self, chain_id: str) -> dict[str, Any]:
+        return self.data["chains"][chain_id]
+
+    def point(self, chain_id: str) -> dict[str, Any]:
+        """Grid coordinates of one chain, legacy keys folded in."""
+        return chain_point(self.chain(chain_id))
+
+    def by_point_key(self, key: str) -> dict[Any, str]:
+        """``point[key] -> chain_id``, the reverse index for tracing results.
+
+        Only meaningful when ``key`` alone identifies a chain: a grid reuses the
+        same disorder seeds at every parameter point, say, so a campaign
+        spanning several points maps such a value to the last chain carrying it.
+        Use :meth:`chain_ids_by_point_key` when the grid has more than one point.
+        Chains whose point lacks ``key`` are skipped.
+        """
+        out: dict[Any, str] = {}
+        for cid, record in self.chains.items():
+            point = chain_point(record)
+            if key in point:
+                out[point[key]] = cid
+        return out
+
+    def chain_ids_by_point_key(self, key: str) -> dict[Any, list[str]]:
+        """``point[key] -> [chain_id, ...]`` across every parameter point."""
+        out: dict[Any, list[str]] = {}
+        for cid, record in self.chains.items():
+            point = chain_point(record)
+            if key in point:
+                out.setdefault(point[key], []).append(cid)
+        return out
+
+    def by_sim_dir(self) -> dict[str, str]:
+        """``sim_dir -> chain_id``."""
+        return {r["sim_dir"]: cid for cid, r in self.chains.items()}
+
+    def last_segment_job_ids(self) -> list[str]:
+        """Job ids of each chain's most recent segment, for dependency gating."""
+        ids = []
+        for record in self.chains.values():
+            segments = record.get("segments", [])
+            if segments and segments[-1].get("job_id"):
+                ids.append(segments[-1]["job_id"])
+        return ids
