@@ -8,6 +8,8 @@ consuming project's integration tests.
 
 import json
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +23,7 @@ from py_alf.campaign import (
     run_segment,
 )
 from py_alf.campaign.campaign import Campaign, ChainStatus
+from py_alf.campaign.chain import Chain
 from py_alf.campaign.worker import _claim_running, _clear_own_running
 from py_alf.simulation import Simulation
 
@@ -583,3 +586,237 @@ def test_chain_status_complete_tracks_the_target():
     )
     assert not base.complete
     assert replace(base, bins=100).complete
+
+
+# --- Campaign.launch and Campaign.reconcile ---------------------------------
+#
+# What these guard is the pairing between a chain and the bin count that sizes
+# its budget. `_runnable` returns them together precisely so the launch does not
+# re-read the grid, and a misalignment there would hand every chain another
+# chain's budget while every job still submitted and every test still passed.
+
+
+class _FakeSubmitter:
+    """Stands in for ClusterSubmitter, recording what a launch asked for.
+
+    Reproduces the two behaviours ``_submit_array`` depends on: the returned
+    jobs need not line up with the sims passed in (``submit`` drops chains whose
+    previous job is still active), and the pairing is recovered from the
+    ``jobid.txt`` written into each submitted chain's own directory.
+    """
+
+    def __init__(self, submit_dir, holds=()):
+        self.submit_dir = submit_dir
+        self.calls = []
+        self.holds = set(holds)  # sim_dirs whose job is still active
+        self._array = 1000
+
+    def submit(self, sims, job_properties, **kwargs):
+        self._array += 1
+        self.calls.append({"sims": list(sims), "job_properties": dict(job_properties)})
+        jobs = []
+        for i, sim in enumerate(sims):
+            if sim.sim_dir in self.holds:
+                continue
+            job_id = f"{self._array}_{i}"
+            Path(sim.sim_dir).mkdir(parents=True, exist_ok=True)
+            (Path(sim.sim_dir) / "jobid.txt").write_text(job_id)
+            jobs.append(SimpleNamespace(job_id=job_id))
+        return jobs
+
+
+def _chain(tmp_path, name, bins, array_key="k", target_bins=100):
+    """A Chain whose data.h5 really holds ``bins`` bins."""
+    import h5py
+    import numpy as np
+
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    with h5py.File(d / "data.h5", "w") as f:
+        f.create_dataset("Ener_scal/obser", data=np.zeros((bins, 1)))
+    sim = _sim(d)
+    sim.sim_dict = {}
+    return Chain(
+        chain_id=name,
+        sim=sim,
+        mc_seed=1,
+        target_bins=target_bins,
+        array_key=array_key,
+    )
+
+
+def _launch_campaign(tmp_path, chains, **kwargs):
+    submitter = _FakeSubmitter(tmp_path / "submit", holds=kwargs.pop("holds", ()))
+    camp = Campaign(
+        name="c",
+        chains=list(chains),
+        target_bins=100,
+        submitter=submitter,
+        ledger_path=tmp_path / "c.json",
+        partition_rules=RULES,
+        # Pin the cost so a budget is a function of the bins alone.
+        hours_per_bin=dict.fromkeys({c.array_key for c in chains}, 0.1),
+        **kwargs,
+    )
+    return camp, submitter
+
+
+def test_launch_submits_only_the_chains_short_of_the_target(tmp_path):
+    chains = [_chain(tmp_path, "done", 100), _chain(tmp_path, "short", 20)]
+    camp, sub = _launch_campaign(tmp_path, chains)
+    camp.launch(verbose=False)
+
+    assert [s.sim_dir for s in sub.calls[0]["sims"]] == [chains[1].sim_dir]
+    ledger = Ledger.load(tmp_path / "c.json")
+    assert ledger.chains["short"]["segments"][0]["job_id"] == "1001_0"
+    assert ledger.chains["done"]["segments"] == []
+
+
+def test_launch_sizes_each_array_by_the_work_that_array_has_left(tmp_path):
+    """The pairing test: a nearly-done chain must not inherit an empty one's budget.
+
+    Two arrays, one chain each, differing only in bins already on disk. If the
+    counts and the chains came apart, the budgets would simply swap -- both
+    arrays would still submit, and nothing else here would notice.
+    """
+    chains = [
+        _chain(tmp_path, "fresh", 0, array_key="a"),
+        _chain(tmp_path, "nearly", 99, array_key="b"),
+    ]
+    camp, sub = _launch_campaign(tmp_path, chains)
+    camp.launch(verbose=False)
+
+    budget = {
+        call["sims"][0].sim_dir: call["sims"][0].sim_dict["CPU_MAX"]
+        for call in sub.calls
+    }
+    assert budget[chains[0].sim_dir] > budget[chains[1].sim_dir]
+    # 1 bin left at 0.1 h/bin, against 100 -- the floor is all the second needs.
+    assert budget[chains[1].sim_dir] == pytest.approx(camp.policy.min_hours)
+
+
+def test_launch_groups_one_array_per_array_key(tmp_path):
+    chains = [
+        _chain(tmp_path, "a1", 0, array_key="a"),
+        _chain(tmp_path, "a2", 0, array_key="a"),
+        _chain(tmp_path, "b1", 0, array_key="b"),
+    ]
+    camp, sub = _launch_campaign(tmp_path, chains)
+    camp.launch(verbose=False)
+
+    assert [len(c["sims"]) for c in sub.calls] == [2, 1]
+
+
+def test_launch_records_no_segment_for_a_chain_submit_held_back(tmp_path):
+    """A chain whose previous job is still active keeps its old jobid.txt."""
+    chains = [_chain(tmp_path, "held", 10), _chain(tmp_path, "free", 10)]
+    (Path(chains[0].sim_dir) / "jobid.txt").write_text("999_9")
+    camp, _ = _launch_campaign(tmp_path, chains, holds=[chains[0].sim_dir])
+    camp.launch(verbose=False)
+
+    ledger = Ledger.load(tmp_path / "c.json")
+    assert ledger.chains["held"]["segments"] == []
+    assert len(ledger.chains["free"]["segments"]) == 1
+
+
+def test_launch_dry_run_submits_nothing_and_writes_no_ledger(tmp_path):
+    camp, sub = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
+    camp.launch(dry_run=True, verbose=False)
+
+    assert sub.calls == []
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_relaunching_keeps_the_history_of_a_chain_already_run(tmp_path):
+    """Topping up a campaign must extend a chain's record, not reset it."""
+    camp, _ = _launch_campaign(tmp_path, [_chain(tmp_path, "a", 0)])
+    camp.launch(verbose=False)
+    camp.launch(verbose=False)
+
+    assert len(Ledger.load(tmp_path / "c.json").chains["a"]["segments"]) == 2
+
+
+def _reconcile_campaign(tmp_path, specs, **kwargs):
+    """Build a launched campaign whose chains sit in the given states.
+
+    ``specs`` maps a name to ``(bins, slurm_state)``; ``None`` means the chain
+    was never submitted at all.
+    """
+    chains = [_chain(tmp_path, name, bins) for name, (bins, _) in specs.items()]
+    camp, sub = _launch_campaign(tmp_path, chains, **kwargs)
+    led = _ledger(tmp_path)
+    states = {}
+    for i, (name, (_, state)) in enumerate(specs.items()):
+        segments = []
+        if state is not None:
+            job_id = f"900_{i}"
+            segments = [{"index": 0, "job_id": job_id}]
+            states[job_id] = {"status": state}
+        led.data["chains"][name] = {
+            "sim_dir": str(tmp_path / name),
+            "point": {},
+            "segments": segments,
+        }
+    led.save()
+    return camp, sub, states
+
+
+def test_reconcile_resubmits_only_what_stalled(tmp_path):
+    """done and active are left alone; a stopped chain holding bins is resumed."""
+    camp, sub, states = _reconcile_campaign(
+        tmp_path,
+        {
+            "done": (100, "COMPLETED"),
+            "active": (30, "RUNNING"),
+            "resumable": (40, "FAILED"),
+            "unstarted": (0, None),
+        },
+    )
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        camp.reconcile(verbose=False)
+
+    resubmitted = {s.sim_dir for call in sub.calls for s in call["sims"]}
+    assert resubmitted == {str(tmp_path / "resumable"), str(tmp_path / "unstarted")}
+
+
+def test_reconcile_leaves_a_suspect_chain_alone_until_forced(tmp_path):
+    """Zero bins after a run is a crash signature; requeueing it would loop."""
+    specs = {"suspect": (0, "FAILED")}
+    camp, sub, states = _reconcile_campaign(tmp_path, specs)
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        camp.reconcile(verbose=False)
+    assert sub.calls == []
+
+    camp, sub, states = _reconcile_campaign(tmp_path, specs)
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        camp.reconcile(force=True, verbose=False)
+    assert [s.sim_dir for s in sub.calls[0]["sims"]] == [str(tmp_path / "suspect")]
+
+
+def test_reconcile_reports_without_submitting_when_asked(tmp_path):
+    camp, sub, states = _reconcile_campaign(tmp_path, {"resumable": (40, "FAILED")})
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        statuses = camp.reconcile(submit=False, verbose=False)
+    assert sub.calls == []
+    assert [s.verdict for s in statuses] == ["resumable"]
+
+
+def test_reconcile_persists_the_worker_records_it_absorbed(tmp_path):
+    """reconcile stopped absorbing and saving itself; status must still do both.
+
+    Dropping those two calls is only safe because status() now folds the worker
+    records in and writes the ledger. If it ever stops, the elapsed times and
+    bin counts a node reported would be silently lost on every reconcile.
+    """
+    camp, sub, states = _reconcile_campaign(tmp_path, {"resumable": (40, "FAILED")})
+    seg = Path(tmp_path / "resumable" / "segments")
+    seg.mkdir(parents=True)
+    (seg / "000-900_0.json").write_text(
+        json.dumps({"job_id": "900_0", "bins_after": 40, "elapsed_s": 1234})
+    )
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        camp.reconcile(submit=False, verbose=False)
+
+    on_disk = Ledger.load(tmp_path / "c.json").chains["resumable"]
+    assert on_disk["segments"][0]["elapsed_s"] == 1234
+    assert on_disk["bins"] == 40
