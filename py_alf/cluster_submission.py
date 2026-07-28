@@ -40,13 +40,17 @@ logger = logging.getLogger(__name__)
 # Upper bound on concurrent filesystem probes (bin counts, submitit log reads,
 # ...).  These threads spend most of their time blocked on a networked
 # filesystem, but h5py's own parsing of each data.h5 is real CPU work, and a
-# login node is shared with everyone else logged into it -- so the width is
-# capped at the node's core count rather than left to grow purely with
-# however much latency there is to hide. Below _MIN_FANOUT items the pool
-# costs more to start than the I/O it would overlap. Shared by any caller
-# that probes many sim directories at once -- the TUI monitor and
-# :class:`py_alf.campaign.Campaign` both do.
-_MAX_IO_WORKERS = os.cpu_count() or 16
+# login node is shared with everyone else logged into it -- so on a machine
+# with room to spare the width tracks its core count rather than growing
+# purely with however much latency there is to hide.  Clamped at both ends:
+# a floor of 8 keeps real overlap available on a constrained sandbox or CI
+# container (whose core count reflects nothing about a login node and can be
+# too low to run the fan-out concurrently at all), and a ceiling of 32 avoids
+# oversubscribing a very large machine for what is still I/O-bound work.
+# Below _MIN_FANOUT items the pool costs more to start than the I/O it would
+# overlap. Shared by any caller that probes many sim directories at once --
+# the TUI monitor and :class:`py_alf.campaign.Campaign` both do.
+_MAX_IO_WORKERS = min(32, max(8, os.cpu_count() or 16))
 _MIN_FANOUT = 3
 
 
