@@ -22,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..cluster_submission import _map_io
+
 SEGMENT_SUBDIR = "segments"
 LEDGER_VERSION = 1
 
@@ -154,14 +156,21 @@ class Ledger:
         is attempt-then-timestamp, so the ledger ends up holding the latest
         attempt; the per-chain record files keep them all, which is what
         :func:`~py_alf.campaign.worker.measured_hours_per_bin` reads.
+
+        Each chain's ``segment_dir`` scan is a directory listing plus however
+        many small JSON reads it turns up, independent of every other chain's
+        -- the same shape of filesystem probe :class:`~py_alf.campaign.campaign.Campaign`
+        already fans out, so a campaign with thousands of chains does not pay
+        for this scan one chain at a time.
         """
-        merged = 0
-        for record in self.data["chains"].values():
+
+        def _absorb_one(record: dict[str, Any]) -> int:
             by_job = {
                 s.get("job_id"): s
                 for s in record.get("segments", [])
                 if s.get("job_id")
             }
+            merged = 0
             for path in sorted(segment_dir(record["sim_dir"]).glob("*.json")):
                 try:
                     worker = json.loads(path.read_text())
@@ -176,7 +185,9 @@ class Ledger:
                 else:
                     target.update(worker)
                 merged += 1
-        return merged
+            return merged
+
+        return sum(_map_io(_absorb_one, list(self.data["chains"].values())))
 
     def save(self) -> Path:
         """Atomically write the ledger."""
