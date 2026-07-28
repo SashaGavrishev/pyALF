@@ -448,6 +448,126 @@ def test_the_worker_record_taken_is_the_highest_one(tmp_path):
     assert statuses[0].bins == 40
 
 
+# --- Campaign.status against real files, with nothing mocked ----------------
+
+
+def _chain_on_disk(tmp_path, name, bins, job_id, worker_bins=None):
+    """A chain directory holding real data, and the record its worker wrote."""
+    import h5py
+    import numpy as np
+
+    d = tmp_path / name
+    (d / "segments").mkdir(parents=True)
+    with h5py.File(d / "data.h5", "w") as f:
+        f.create_dataset("Ener_scal/obser", data=np.zeros((bins, 1)))
+    if worker_bins is not None:
+        (d / "segments" / "s0.json").write_text(
+            json.dumps({"job_id": job_id, "index": 0, "bins_after": worker_bins})
+        )
+    return {
+        "sim_dir": str(d),
+        "point": {},
+        "segments": [{"index": 0, "job_id": job_id}],
+    }
+
+
+def test_the_cached_answer_matches_what_a_full_read_would_say(tmp_path):
+    """The property the whole optimisation rests on, checked without mocks.
+
+    Every other status test stubs the reader out to observe *which* files get
+    opened. That cannot catch a tier which is cheap but wrong, so this one puts
+    real data.h5 files and real worker records on disk and requires the tiered
+    answer to equal the one a full re-read gives -- on the first pass, on the
+    cached second pass, and per chain rather than in aggregate.
+    """
+    chains = {
+        "done": _chain_on_disk(tmp_path, "done", 100, "1_0", worker_bins=100),
+        "idle": _chain_on_disk(tmp_path, "idle", 40, "1_1", worker_bins=40),
+        "running": _chain_on_disk(tmp_path, "running", 55, "1_2", worker_bins=30),
+        "crashed": _chain_on_disk(tmp_path, "crashed", 7, "1_3"),
+        "unstarted": {
+            "sim_dir": str(tmp_path / "nothing"),
+            "point": {},
+            "segments": [],
+        },
+    }
+    led = _ledger(tmp_path)
+    led.data["chains"].update(chains)
+    led.save()
+
+    states = {
+        "1_0": {"status": "COMPLETED"},
+        "1_1": {"status": "FAILED"},
+        "1_2": {"status": "RUNNING"},
+        "1_3": {"status": "FAILED"},
+    }
+
+    def run(deep):
+        camp = _campaign(tmp_path)
+        with patch(
+            "py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states
+        ):
+            st = camp.status(Ledger.load(tmp_path / "c.json"), deep=deep)
+        return {s.chain_id: s.bins for s in st}
+
+    truth = {"done": 100, "idle": 40, "running": 55, "crashed": 7, "unstarted": 0}
+    assert run(deep=True) == truth
+    assert run(deep=False) == truth, "a tier disagreed with the file on disk"
+    assert run(deep=False) == truth, "the cached second pass disagreed"
+
+
+def test_a_stale_worker_record_never_undercounts_a_running_chain(tmp_path):
+    """The running chain above is the case the worker record would get wrong.
+
+    Its last record says 30 bins; the file already holds 55. Reading it is
+    exactly why a live job is excluded from the worker-record tier.
+    """
+    led = _ledger(tmp_path)
+    led.data["chains"]["running"] = _chain_on_disk(
+        tmp_path, "running", 55, "1_2", worker_bins=30
+    )
+    led.save()
+    camp = _campaign(tmp_path)
+    with patch(
+        "py_alf.campaign.campaign._get_slurm_status_bulk",
+        return_value={"1_2": {"status": "RUNNING"}},
+    ):
+        assert camp.status(Ledger.load(tmp_path / "c.json"))[0].bins == 55
+
+
+def test_status_leaves_the_ledger_alone_when_told_not_to_persist(tmp_path):
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = _chain_on_disk(tmp_path, "a", 100, "1_0", worker_bins=100)
+    led.save()
+    before = (tmp_path / "c.json").read_text()
+    camp = _campaign(tmp_path)
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}):
+        assert camp.status(persist=False)[0].bins == 100
+    assert (tmp_path / "c.json").read_text() == before
+
+
+def test_absorbing_skips_only_the_chains_already_known_finished(tmp_path):
+    """Skipping a scan must not skip a chain that could still gain records."""
+    led = _ledger(tmp_path)
+    led.data["chains"]["done"] = dict(
+        _chain_on_disk(tmp_path, "done", 100, "1_0", worker_bins=100), bins=100
+    )
+    led.data["chains"]["short"] = dict(
+        _chain_on_disk(tmp_path, "short", 40, "1_1", worker_bins=40), bins=40
+    )
+    assert led.absorb_segment_records(skip_finished=True) == 1
+    assert led.chains["short"]["segments"][0]["bins_after"] == 40
+    assert "bins_after" not in led.chains["done"]["segments"][0]
+    assert led.absorb_segment_records() == 2
+
+
+def test_record_bins_ignores_a_chain_the_ledger_does_not_hold(tmp_path):
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = {"sim_dir": "/d", "point": {}, "segments": []}
+    assert led.record_bins({"ghost": 50}) is False
+    assert "ghost" not in led.chains
+
+
 def test_chain_status_complete_tracks_the_target():
     base = ChainStatus(
         chain_id="a",
