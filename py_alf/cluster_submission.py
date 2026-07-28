@@ -1941,7 +1941,14 @@ def _bin_count(
     last_exc: BaseException | None = None
     for attempt in range(len(_H5_RETRY_DELAYS) + 1):
         try:
-            with h5py.File(filename, "r") as f:
+            # POSIX file locking stalls (or errors) on networked filesystems, and
+            # a read-only probe gets nothing from it -- the same reasoning that
+            # already disables it for the analysis jobs via
+            # HDF5_USE_FILE_LOCKING=FALSE in scripts/slurm/analysis_map.sbatch.
+            # Set here rather than relying on that env var, since this path also
+            # runs interactively (`make pipeline-status`), outside any sbatch
+            # wrapper that would have exported it.
+            with h5py.File(filename, "r", locking=False) as f:
                 if counting_obs in f:
                     N_bins = f[counting_obs + "/obser"].shape[0]
             read_ok = True

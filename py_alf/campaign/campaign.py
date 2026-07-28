@@ -564,7 +564,10 @@ def _bins_in_dir(sim_dir: str, counting_obs: str = DEFAULT_COUNTING_OBS) -> int:
     if not path.exists():
         return 0
     try:
-        with h5py.File(path, "r") as f:
+        # POSIX file locking stalls (or errors) on networked filesystems, and a
+        # read-only probe gets nothing from it -- see the same disabling for the
+        # analysis jobs in scripts/slurm/analysis_map.sbatch.
+        with h5py.File(path, "r", locking=False) as f:
             if counting_obs in f:
                 return int(f[counting_obs + "/obser"].shape[0])  # type: ignore[union-attr]
     except OSError:
