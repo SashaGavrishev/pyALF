@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -1860,9 +1860,16 @@ _MIDWRITE_LOG_AFTER = 5
 _bin_read_failures: dict[Any, int] = {}
 
 
-def _is_midwrite_error(exc: BaseException) -> bool:
-    """True if *exc* looks like a read that raced ALF's writer."""
-    text = str(exc).lower()
+def _is_midwrite_error(exc: BaseException | str) -> bool:
+    """True if *exc* looks like a read that raced ALF's writer.
+
+    Accepts a string as well as an exception: a worker process's mid-write
+    verdict has to cross back to the caller through
+    :func:`_read_bin_count`'s return value, since the exception itself is not
+    always picklable and does not need to survive the trip -- only whether it
+    matched one of these markers does.
+    """
+    text = (exc if isinstance(exc, str) else str(exc)).lower()
     return any(marker in text for marker in _MIDWRITE_MARKERS)
 
 
@@ -1878,6 +1885,83 @@ def _mtime_settled(mtime_ns: int) -> bool:
     return time.time_ns() - mtime_ns > _MTIME_SETTLE_NS
 
 
+# h5py wraps every call into the HDF5 C library in a single process-wide lock
+# (h5py._objects.phil) -- confirmed empirically: N threads each holding it for
+# 50ms behave identically to N sequential 50ms calls, regardless of how many
+# threads there are. So fanning bin-count reads out across _get_io_pool's
+# threads (as Campaign.status() does) never actually overlaps the blocking
+# h5py.File() open itself, only the Python-level dispatch around it. Only a
+# separate OS process gets its own independent HDF5 library instance -- and
+# hence its own phil -- so this pool is what actually lets two data.h5 opens
+# progress at once. Deliberately smaller than _MAX_IO_WORKERS: each worker
+# imports h5py/numpy into its own address space, which costs real memory an
+# idle thread would not, and (unlike the thread pool) is opt-in per call
+# rather than the default -- see _bin_count's ``use_process_pool``.
+_process_pool: ProcessPoolExecutor | None = None
+_process_pool_lock = threading.Lock()
+
+
+def _process_pool_size() -> int:
+    """Worker count for the h5py read pool, capped to any SLURM allocation.
+
+    Mirrors ``scripts.common.pool_workers``'s reasoning without importing it
+    (this module sits below ``scripts/`` in the dependency direction): a bare
+    process count defaults to the whole node's cores, not the cgroup a SLURM
+    task was actually granted, and a status check run as its own job (e.g.
+    ``reconcile`` on a timer) must not oversubscribe that allocation the way
+    a handful of extra processes importing h5py/numpy each could.
+    """
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    budget = int(slurm_cpus) if slurm_cpus else (os.cpu_count() or 4)
+    return min(8, max(2, budget))
+
+
+def _get_process_pool() -> ProcessPoolExecutor:
+    """The shared process pool for h5py reads, created on first use."""
+    global _process_pool
+    with _process_pool_lock:
+        if _process_pool is None:
+            _process_pool = ProcessPoolExecutor(max_workers=_process_pool_size())
+        return _process_pool
+
+
+def _read_bin_count(filename: str, counting_obs: str) -> tuple[int, bool, str | None]:
+    """Open *filename* and read its bin count, retrying through a mid-write race.
+
+    Pure function of its arguments -- no cache, no module state read or
+    written -- so it is safe to run inside a worker process via
+    :func:`_get_process_pool`. The caller (:func:`_bin_count`, its only
+    caller) owns everything stateful: caching, the stale-value fallback, and
+    the failure-count bookkeeping, none of which a worker process could share
+    back with the caller's copy of those module dicts anyway.
+    """
+    import h5py
+
+    N_bins = 0
+    read_ok = False
+    last_exc: BaseException | None = None
+    for attempt in range(len(_H5_RETRY_DELAYS) + 1):
+        try:
+            # POSIX file locking stalls (or errors) on networked filesystems, and
+            # a read-only probe gets nothing from it -- see the same reasoning
+            # in scripts/slurm/analysis_map.sbatch's HDF5_USE_FILE_LOCKING=FALSE.
+            with h5py.File(filename, "r", locking=False) as f:
+                if counting_obs in f:
+                    N_bins = f[counting_obs + "/obser"].shape[0]
+            read_ok = True
+            break
+        except FileNotFoundError:
+            break
+        except (OSError, KeyError) as e:
+            last_exc = e
+            # Only a mid-write is worth retrying, and only while attempts remain.
+            if not _is_midwrite_error(e) or attempt == len(_H5_RETRY_DELAYS):
+                break
+            time.sleep(_H5_RETRY_DELAYS[attempt])
+
+    return N_bins, read_ok, repr(last_exc) if last_exc is not None else None
+
+
 def _bin_count(
     sim: Simulation,
     counting_obs: str = "Ener_scal",
@@ -1885,6 +1969,7 @@ def _bin_count(
     data_dir: str | None = None,
     final: bool = False,
     force: bool = False,
+    use_process_pool: bool = False,
 ) -> int:
     """
     Counts bins for a given observable in simulation data, with caching.
@@ -1900,11 +1985,15 @@ def _bin_count(
             refresh), but the result is then frozen and served from cache.
         force: Skip the (mtime, size) short-circuit and re-read the file even if
             it looks unchanged.
+        use_process_pool: Run the actual read in :func:`_get_process_pool`
+            instead of this process. Worth it only when many chains are being
+            probed at once (h5py serializes every call in-process regardless
+            of thread count -- see that pool's docstring), so this defaults
+            off: a lone call, like a worker job checking its own bin count,
+            would pay a process pool's startup cost for nothing.
     Returns:
         Number of bins.
     """
-    import h5py
-
     filename = os.path.join(
         data_dir if data_dir is not None else sim.sim_dir, "data.h5"
     )
@@ -1936,46 +2025,27 @@ def _bin_count(
     ):
         return _bin_cache[key]
 
-    N_bins = 0
-    read_ok = False
-    last_exc: BaseException | None = None
-    for attempt in range(len(_H5_RETRY_DELAYS) + 1):
-        try:
-            # POSIX file locking stalls (or errors) on networked filesystems, and
-            # a read-only probe gets nothing from it -- the same reasoning that
-            # already disables it for the analysis jobs via
-            # HDF5_USE_FILE_LOCKING=FALSE in scripts/slurm/analysis_map.sbatch.
-            # Set here rather than relying on that env var, since this path also
-            # runs interactively (`make pipeline-status`), outside any sbatch
-            # wrapper that would have exported it.
-            with h5py.File(filename, "r", locking=False) as f:
-                if counting_obs in f:
-                    N_bins = f[counting_obs + "/obser"].shape[0]
-            read_ok = True
-            break
-        except FileNotFoundError:
-            break
-        except (OSError, KeyError) as e:
-            last_exc = e
-            # Only a mid-write is worth retrying, and only while attempts remain.
-            if not _is_midwrite_error(e) or attempt == len(_H5_RETRY_DELAYS):
-                break
-            time.sleep(_H5_RETRY_DELAYS[attempt])
+    if use_process_pool:
+        N_bins, read_ok, error_text = (
+            _get_process_pool().submit(_read_bin_count, filename, counting_obs).result()
+        )
+    else:
+        N_bins, read_ok, error_text = _read_bin_count(filename, counting_obs)
 
-    if last_exc is not None and not read_ok:
+    if error_text is not None and not read_ok:
         fails = _bin_read_failures.get(key, 0) + 1
         _bin_read_failures[key] = fails
         # Racing ALF's writer is expected and self-correcting, so stay quiet
         # about it; a file that keeps failing is a real problem worth surfacing.
-        if _is_midwrite_error(last_exc) and fails < _MIDWRITE_LOG_AFTER:
+        if _is_midwrite_error(error_text) and fails < _MIDWRITE_LOG_AFTER:
             logger.debug(
                 "%s is mid-write (attempt %d), keeping the cached bin count: %s",
                 filename,
                 fails,
-                last_exc,
+                error_text,
             )
         else:
-            logger.error(f"Error reading {filename}: {last_exc}")
+            logger.error(f"Error reading {filename}: {error_text}")
         # Keep the last known good value rather than caching a spurious 0 that
         # would be shown briefly on the next refresh.
         return _bin_cache.get(key, 0)

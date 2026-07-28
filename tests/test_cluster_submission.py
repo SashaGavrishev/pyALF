@@ -1580,7 +1580,9 @@ def test_map_io_runs_small_inputs_without_a_pool():
     import threading
 
     caller = threading.current_thread()
-    threads = _map_io(lambda i: threading.current_thread(), list(range(_MIN_FANOUT - 1)))
+    threads = _map_io(
+        lambda i: threading.current_thread(), list(range(_MIN_FANOUT - 1))
+    )
     assert all(t is caller for t in threads)
 
 
@@ -1597,3 +1599,57 @@ def test_map_io_fans_out_large_inputs_and_preserves_order():
         return i * 2
 
     assert _map_io(work, list(range(n))) == [i * 2 for i in range(n)]
+
+
+# --- _bin_count process pool (h5py's phil serializes reads within a process) ---
+
+
+def test_bin_count_use_process_pool_reads_correctly(tmp_path):
+    """use_process_pool=True still reads the right count, via a worker process."""
+    from py_alf.cluster_submission import _bin_count
+
+    h5 = tmp_path / "data.h5"
+    _write_bins(h5, 12)
+    sim = _bin_count_sim(tmp_path)
+
+    assert _bin_count(sim, refresh=True, force=True, use_process_pool=True) == 12
+
+
+def test_bin_count_use_process_pool_missing_file_returns_zero(tmp_path):
+    """A chain with no data.h5 yet reads as 0 bins through the process pool too."""
+    from py_alf.cluster_submission import _bin_count
+
+    sim = _bin_count_sim(tmp_path)  # no data.h5 written
+
+    assert _bin_count(sim, refresh=True, force=True, use_process_pool=True) == 0
+
+
+def test_bin_count_use_process_pool_many_files_no_cross_contamination(tmp_path):
+    """Each dispatch must come back matched to its own file, not another's."""
+    from py_alf.cluster_submission import _bin_count
+
+    sims = []
+    for i in range(6):
+        d = tmp_path / f"chain_{i}"
+        d.mkdir()
+        _write_bins(d / "data.h5", i + 1)
+        sims.append(_bin_count_sim(d))
+
+    counts = [
+        _bin_count(sim, refresh=True, force=True, use_process_pool=True) for sim in sims
+    ]
+    assert counts == [1, 2, 3, 4, 5, 6]
+
+
+def test_read_bin_count_is_a_pure_module_level_function():
+    """_read_bin_count must stay a plain, picklable top-level function.
+
+    ProcessPoolExecutor sends the callable to worker processes by reference
+    (pickling its qualified name), so turning this into a closure, a bound
+    method, or a lambda would break silently the next time it is actually
+    dispatched to a worker rather than called in-process by a test.
+    """
+    from py_alf.cluster_submission import _read_bin_count
+
+    assert _read_bin_count.__module__ == "py_alf.cluster_submission"
+    assert _read_bin_count.__qualname__ == "_read_bin_count"

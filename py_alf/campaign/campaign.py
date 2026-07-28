@@ -38,9 +38,11 @@ from typing import Any
 from ..alf_source import ALF_source
 from ..cluster_submission import (
     ClusterSubmitter,
+    _get_process_pool,
     _get_slurm_status_bulk,
     _is_submitit_timeout,
     _map_io,
+    _read_bin_count,
 )
 from ..simulation import Simulation
 from .chain import Chain
@@ -229,7 +231,15 @@ class Campaign:
         return self.cost_model(chain.sim.sim_dict)
 
     def bins_on_disk(self, chain: Chain) -> int:
-        return int(chain.sim.bin_count(counting_obs=self.counting_obs, refresh=True))
+        # use_process_pool=True: h5py serializes every call within one process
+        # (see _get_process_pool's docstring), so a campaign probing thousands
+        # of chains needs separate OS processes, not just separate threads, to
+        # actually overlap the reads.
+        return int(
+            chain.sim.bin_count(
+                counting_obs=self.counting_obs, refresh=True, use_process_pool=True
+            )
+        )
 
     # --- launching ----------------------------------------------------------
 
@@ -557,19 +567,18 @@ class Campaign:
 
 
 def _bins_in_dir(sim_dir: str, counting_obs: str = DEFAULT_COUNTING_OBS) -> int:
-    """Bin count for a ledger entry with no rebuilt ``Simulation`` behind it."""
-    import h5py
+    """Bin count for a ledger entry with no rebuilt ``Simulation`` behind it.
 
+    Only called from Campaign.status()'s per-chain fan-out, so -- like
+    bins_on_disk -- the read goes through the process pool: h5py serializes
+    every call within one process regardless of thread count (see
+    _get_process_pool's docstring), and that fan-out is exactly the "many
+    chains at once" case the pool exists for.
+    """
     path = Path(sim_dir) / "data.h5"
     if not path.exists():
         return 0
-    try:
-        # POSIX file locking stalls (or errors) on networked filesystems, and a
-        # read-only probe gets nothing from it -- see the same disabling for the
-        # analysis jobs in scripts/slurm/analysis_map.sbatch.
-        with h5py.File(path, "r", locking=False) as f:
-            if counting_obs in f:
-                return int(f[counting_obs + "/obser"].shape[0])  # type: ignore[union-attr]
-    except OSError:
-        return 0
-    return 0
+    N_bins, _read_ok, _error_text = (
+        _get_process_pool().submit(_read_bin_count, str(path), counting_obs).result()
+    )
+    return int(N_bins)
