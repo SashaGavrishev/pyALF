@@ -9,10 +9,12 @@ import h5py
 import pytest
 
 from py_alf.cluster_submission import (
+    _MIN_FANOUT,
     ClusterSubmitter,
     _exec_alf_binary,
     _find_job_log,
     _get_jobs_resources_bulk,
+    _map_io,
     _normalise_partition_spec,
     _parse_mem_gb,
     _parse_slurm_time_hours,
@@ -1571,3 +1573,27 @@ def test_exec_alf_binary_no_backup_when_no_data(tmp_path):
 
     backups = list(tmp_path.glob("data_*.h5"))
     assert backups == []
+
+
+def test_map_io_runs_small_inputs_without_a_pool():
+    """Below the fan-out threshold the work runs inline — no thread spawn."""
+    import threading
+
+    caller = threading.current_thread()
+    threads = _map_io(lambda i: threading.current_thread(), list(range(_MIN_FANOUT - 1)))
+    assert all(t is caller for t in threads)
+
+
+def test_map_io_fans_out_large_inputs_and_preserves_order():
+    """Above the threshold work is spread across threads but stays ordered."""
+    import threading
+
+    n = max(_MIN_FANOUT, 8)
+    barrier = threading.Barrier(n, timeout=5)
+
+    def work(i):
+        # Deadlocks unless the items really run concurrently.
+        barrier.wait()
+        return i * 2
+
+    assert _map_io(work, list(range(n))) == [i * 2 for i in range(n)]

@@ -14,7 +14,6 @@ import contextlib
 import json
 import re as _re
 import subprocess
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ from .cluster_submission import (
     _get_jobs_resources_bulk,
     _get_slurm_status_bulk,
     _is_submitit_timeout,
+    _map_io,
     _mtime_settled,
     cancel_cluster_job,
     get_job_id,
@@ -44,51 +44,6 @@ from .cluster_submission import (
 from .simulation import Simulation
 
 _ANIM_FRAMES = ("· ", " ·")
-
-# Upper bound on concurrent filesystem probes.  These threads spend their time
-# blocked on a networked filesystem, so the useful width is set by I/O latency
-# rather than by core count.  Below _MIN_FANOUT items the pool costs more to
-# start than the I/O it would overlap.
-_MAX_IO_WORKERS = 16
-_MIN_FANOUT = 3
-
-
-_io_pool: ThreadPoolExecutor | None = None
-_io_pool_lock = threading.Lock()
-
-
-def _get_io_pool() -> ThreadPoolExecutor:
-    """The shared probe pool, created on first use.
-
-    Reused across refreshes rather than rebuilt each time: spawning the workers
-    costs more than the probes themselves once the filesystem is fast.  The
-    threads are joined by concurrent.futures' own atexit hook, so there is no
-    lifecycle to manage here.
-    """
-    global _io_pool
-    with _io_pool_lock:
-        if _io_pool is None:
-            _io_pool = ThreadPoolExecutor(
-                max_workers=_MAX_IO_WORKERS, thread_name_prefix="alf-monitor-io"
-            )
-        return _io_pool
-
-
-def _map_io(fn, items: list) -> list:
-    """Apply *fn* to *items*, concurrently when there is enough work to justify it.
-
-    The probes are independent and block on filesystem latency, so on a cluster
-    filesystem the fan-out dominates: at ~5 ms per operation this turns a 32-row
-    refresh from ~200 ms into ~15 ms.  On a local disk the pool is pure overhead,
-    but well under a millisecond — far below the refresh interval either way.
-
-    *fn* must not itself call _map_io: the pool is shared and finite, so a nested
-    call could wait on a worker that never frees.
-    """
-    if len(items) < _MIN_FANOUT:
-        return [fn(item) for item in items]
-    return list(_get_io_pool().map(fn, items))
-
 
 _STATUS_COLORS: dict[str, str] = {
     "RUNNING": "",

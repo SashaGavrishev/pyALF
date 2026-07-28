@@ -40,6 +40,7 @@ from ..cluster_submission import (
     ClusterSubmitter,
     _get_slurm_status_bulk,
     _is_submitit_timeout,
+    _map_io,
 )
 from ..simulation import Simulation
 from .chain import Chain
@@ -310,8 +311,14 @@ class Campaign:
 
         Chains still held by SLURM are dropped by ``ClusterSubmitter.submit``
         itself, which reads each ``jobid.txt`` and skips PENDING/RUNNING jobs.
+
+        Each bin count is an independent ``data.h5`` read, so they run
+        concurrently through the shared I/O pool rather than one chain at a
+        time -- a campaign's array can hold far more chains than the wall-time
+        this costs on a networked filesystem should scale with.
         """
-        return [c for c in chains if self.bins_on_disk(c) < self.target_bins]
+        bins = _map_io(self.bins_on_disk, chains)
+        return [c for c, b in zip(chains, bins, strict=True) if b < self.target_bins]
 
     def _submit_array(
         self,
@@ -403,8 +410,8 @@ class Campaign:
         states = _get_slurm_status_bulk(all_jobs) if all_jobs else {}
         submit_dir = self.submitter.submit_dir
 
-        out: list[ChainStatus] = []
-        for chain_id, record in ledger.chains.items():
+        def _chain_status(item: tuple[str, dict]) -> ChainStatus:
+            chain_id, record = item
             chain = by_id.get(chain_id)
             bins = (
                 self.bins_on_disk(chain)
@@ -442,21 +449,26 @@ class Campaign:
             else:
                 verdict = "suspect"
 
-            out.append(
-                ChainStatus(
-                    chain_id=chain_id,
-                    sim_dir=record["sim_dir"],
-                    point=chain_point(record),
-                    bins=bins,
-                    target_bins=ledger.target_bins,
-                    segments=len(segments),
-                    active_job=active,
-                    last_state=last_state,
-                    timed_out=timed_out,
-                    verdict=verdict,
-                )
+            return ChainStatus(
+                chain_id=chain_id,
+                sim_dir=record["sim_dir"],
+                point=chain_point(record),
+                bins=bins,
+                target_bins=ledger.target_bins,
+                segments=len(segments),
+                active_job=active,
+                last_state=last_state,
+                timed_out=timed_out,
+                verdict=verdict,
             )
-        return out
+
+        # Each chain's status costs a data.h5 read (and, for a chain whose last
+        # segment just ended, a submitit log read) -- both filesystem probes
+        # independent of every other chain. A campaign can hold thousands of
+        # them, so run them through the shared I/O pool instead of one at a
+        # time: on a networked filesystem the per-probe latency, not CPU, is
+        # what `make pipeline-status` was paying for.
+        return _map_io(_chain_status, list(ledger.chains.items()))
 
     # --- repair -------------------------------------------------------------
 
