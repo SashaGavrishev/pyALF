@@ -140,11 +140,35 @@ class Ledger:
         """Append a submitted segment to a chain's history."""
         self.data["chains"][chain_id].setdefault("segments", []).append(segment)
 
+    def record_bins(self, counts: dict[str, int]) -> bool:
+        """Cache each chain's measured bin count. True if any of them moved.
+
+        This is what stops a status check paying for the whole grid every time.
+        A chain that has reached its target is finished -- ALF only ever appends
+        bins, and the worker sizes its last segment to land exactly on the
+        target -- so once that count is written here, no later run needs to open
+        that ``data.h5`` again. Mid-campaign the same cache spares the chains
+        that are merely idle, since the count only moves while a job runs.
+
+        Only a *higher* count is recorded. A read that raced ALF's writer, or a
+        directory that has yet to appear on a lagging filesystem, comes back low
+        or zero, and letting that overwrite a good value would make the campaign
+        look like it had gone backwards.
+        """
+        changed = False
+        for chain_id, bins in counts.items():
+            record = self.data["chains"].get(chain_id)
+            if record is None or bins <= record.get("bins", -1):
+                continue
+            record["bins"] = int(bins)
+            changed = True
+        return changed
+
     def add_followup(self, record: dict[str, Any]) -> None:
         """Record a job chained after the campaign (e.g. an analysis stage)."""
         self.data.setdefault("followups", []).append(record)
 
-    def absorb_segment_records(self) -> int:
+    def absorb_segment_records(self, skip_finished: bool = False) -> int:
         """Merge worker-written segment records into the ledger.
 
         Matches on ``job_id`` and fills in what only the node knew: bins before
@@ -162,7 +186,20 @@ class Ledger:
         -- the same shape of filesystem probe :class:`~py_alf.campaign.campaign.Campaign`
         already fans out, so a campaign with thousands of chains does not pay
         for this scan one chain at a time.
+
+        ``skip_finished`` drops the chains :meth:`record_bins` has already seen
+        reach their target: no further segment will ever run for one, so its
+        directory can only hold records that were folded in on an earlier pass.
+        Late in a campaign that is nearly the whole grid, and the listings it
+        avoids are the bulk of what a status check has left to pay for.
         """
+        records = list(self.data["chains"].values())
+        if skip_finished:
+            records = [
+                r
+                for r in records
+                if r.get("bins", -1) < r.get("target_bins", self.target_bins)
+            ]
 
         def _absorb_one(record: dict[str, Any]) -> int:
             by_job = {
@@ -187,7 +224,7 @@ class Ledger:
                 merged += 1
             return merged
 
-        return sum(_map_io(_absorb_one, list(self.data["chains"].values())))
+        return sum(_map_io(_absorb_one, records))
 
     def save(self) -> Path:
         """Atomically write the ledger."""

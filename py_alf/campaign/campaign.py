@@ -29,6 +29,7 @@ saying what a bin of *its* Hamiltonian costs.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -38,11 +39,11 @@ from typing import Any
 from ..alf_source import ALF_source
 from ..cluster_submission import (
     ClusterSubmitter,
-    _get_process_pool,
+    _bin_cache,
+    _bin_counts,
     _get_slurm_status_bulk,
     _is_submitit_timeout,
     _map_io,
-    _read_bin_count,
 )
 from ..simulation import Simulation
 from .chain import Chain
@@ -231,14 +232,21 @@ class Campaign:
         return self.cost_model(chain.sim.sim_dict)
 
     def bins_on_disk(self, chain: Chain) -> int:
-        # use_process_pool=True: h5py serializes every call within one process
-        # (see _get_process_pool's docstring), so a campaign probing thousands
-        # of chains needs separate OS processes, not just separate threads, to
-        # actually overlap the reads.
-        return int(
-            chain.sim.bin_count(
-                counting_obs=self.counting_obs, refresh=True, use_process_pool=True
-            )
+        """Bins currently in one chain's ``data.h5``."""
+        return self.bins_on_disk_many([chain])[0]
+
+    def bins_on_disk_many(self, chains: list[Chain]) -> list[int]:
+        """Bins in each chain's ``data.h5``, read as one batch.
+
+        Batched rather than one call per chain: h5py serializes every call
+        within one process (see ``_get_process_pool``'s docstring), so the reads
+        have to be spread over separate OS processes to overlap at all -- and
+        handing that pool one file per task makes each read cost an IPC round
+        trip instead, which on a campaign-sized grid is the whole cost. See
+        :func:`~py_alf.cluster_submission._bin_counts`.
+        """
+        return _bin_counts(
+            [os.path.join(c.sim_dir, "data.h5") for c in chains], self.counting_obs
         )
 
     # --- launching ----------------------------------------------------------
@@ -276,12 +284,7 @@ class Campaign:
                 continue
 
             plans = [
-                (
-                    chain,
-                    self.bins_on_disk(chain),
-                    self.hours_per_bin_for(chain),
-                )
-                for chain in runnable
+                (chain, bins, self.hours_per_bin_for(chain)) for chain, bins in runnable
             ]
             # One array shares one wall-time request, so the array asks for the
             # neediest chain's budget; every worker then trims its own CPU_MAX
@@ -316,19 +319,20 @@ class Campaign:
                 print(f"Ledger: {ledger.path}")
         return ledger
 
-    def _runnable(self, chains: list[Chain]) -> list[Chain]:
-        """Chains that have not yet reached the target.
+    def _runnable(self, chains: list[Chain]) -> list[tuple[Chain, int]]:
+        """Chains short of the target, each with the bin count that decided it.
 
         Chains still held by SLURM are dropped by ``ClusterSubmitter.submit``
         itself, which reads each ``jobid.txt`` and skips PENDING/RUNNING jobs.
 
-        Each bin count is an independent ``data.h5`` read, so they run
-        concurrently through the shared I/O pool rather than one chain at a
-        time -- a campaign's array can hold far more chains than the wall-time
-        this costs on a networked filesystem should scale with.
+        The count is returned rather than recomputed by the caller: sizing the
+        array's budget needs the same number, and re-reading the whole grid to
+        get it would double the launch's filesystem cost.
         """
-        bins = _map_io(self.bins_on_disk, chains)
-        return [c for c, b in zip(chains, bins, strict=True) if b < self.target_bins]
+        bins = self.bins_on_disk_many(chains)
+        return [
+            (c, b) for c, b in zip(chains, bins, strict=True) if b < self.target_bins
+        ]
 
     def _submit_array(
         self,
@@ -405,12 +409,83 @@ class Campaign:
 
     # --- inspection ---------------------------------------------------------
 
-    def status(self, ledger: Ledger | None = None) -> list[ChainStatus]:
-        """Per-chain progress and a verdict, judged by bins rather than job state."""
-        ledger = ledger or Ledger.load(self.ledger_path)
-        ledger.absorb_segment_records()
+    def _resolve_bins(
+        self,
+        ledger: Ledger,
+        states: dict[str, dict[str, str | None]],
+        deep: bool = False,
+    ) -> dict[str, int]:
+        """Every chain's bin count, opening as few ``data.h5`` files as possible.
 
+        Reading the whole grid is what makes a status check expensive, and most
+        of those reads answer a question that is already settled. Three tiers,
+        cheapest first:
+
+        1. a chain the ledger records at its target is finished and is trusted
+           outright -- bins only ever increase, and the worker stops on the
+           target rather than past it;
+        2. a chain with no running job is however many bins its last segment
+           reported writing (:func:`py_alf.campaign.worker.run_segment` records
+           ``bins_after``); nothing has touched the file since it ended;
+        3. anything else -- a live job, or a chain whose worker record is
+           missing because it died before writing one -- is read from disk, as
+           one batch.
+
+        ``deep`` skips the first two tiers, for when the data is suspected to
+        have changed underneath the ledger (files restored, a chain re-run by
+        hand, a count written by an older version).
+        """
         by_id = {c.chain_id: c for c in self.chains}
+        known: dict[str, int] = {}
+        needs_read: list[str] = []
+
+        for chain_id, record in ledger.chains.items():
+            target = record.get("target_bins", ledger.target_bins)
+            cached = record.get("bins")
+            if not deep and isinstance(cached, int) and cached >= target:
+                known[chain_id] = cached
+                continue
+            if not deep and not _has_active_job(record, states):
+                reported = _bins_reported_by_worker(record)
+                if reported is not None:
+                    known[chain_id] = reported
+                    continue
+            needs_read.append(chain_id)
+
+        if needs_read:
+            counts = _bin_counts(
+                [
+                    str(Path(ledger.chains[cid]["sim_dir"]) / "data.h5")
+                    for cid in needs_read
+                ],
+                self.counting_obs,
+            )
+            known.update(zip(needs_read, counts, strict=True))
+            # A chain whose Simulation was rebuilt shares Simulation.bin_count's
+            # cache, so keep that consistent with what was just read rather than
+            # letting a later call re-open the same file.
+            for chain_id in needs_read:
+                chain = by_id.get(chain_id)
+                if chain is not None:
+                    _bin_cache[
+                        (os.path.join(chain.sim_dir, "data.h5"), self.counting_obs)
+                    ] = known[chain_id]
+
+        return known
+
+    def status(
+        self, ledger: Ledger | None = None, deep: bool = False, persist: bool = True
+    ) -> list[ChainStatus]:
+        """Per-chain progress and a verdict, judged by bins rather than job state.
+
+        ``deep`` re-reads every chain's ``data.h5`` instead of trusting the
+        ledger's cached counts (see :meth:`_resolve_bins`). ``persist`` writes
+        the counts back, which is what makes the next check cheap; pass False
+        for a caller that must not touch the ledger.
+        """
+        ledger = ledger or Ledger.load(self.ledger_path)
+        absorbed = ledger.absorb_segment_records(skip_finished=not deep)
+
         all_jobs = [
             s["job_id"]
             for record in ledger.chains.values()
@@ -419,15 +494,14 @@ class Campaign:
         ]
         states = _get_slurm_status_bulk(all_jobs) if all_jobs else {}
         submit_dir = self.submitter.submit_dir
+        bins_by_id = self._resolve_bins(ledger, states, deep=deep)
+        moved = ledger.record_bins(bins_by_id)
+        if persist and (moved or absorbed):
+            ledger.save()
 
         def _chain_status(item: tuple[str, dict]) -> ChainStatus:
             chain_id, record = item
-            chain = by_id.get(chain_id)
-            bins = (
-                self.bins_on_disk(chain)
-                if chain
-                else _bins_in_dir(record["sim_dir"], self.counting_obs)
-            )
+            bins = bins_by_id.get(chain_id, 0)
             segments = record.get("segments", [])
             active = next(
                 (
@@ -472,12 +546,11 @@ class Campaign:
                 verdict=verdict,
             )
 
-        # Each chain's status costs a data.h5 read (and, for a chain whose last
-        # segment just ended, a submitit log read) -- both filesystem probes
-        # independent of every other chain. A campaign can hold thousands of
-        # them, so run them through the shared I/O pool instead of one at a
-        # time: on a networked filesystem the per-probe latency, not CPU, is
-        # what `make pipeline-status` was paying for.
+        # The bin counts are already resolved; what is left per chain is a
+        # submitit log read, and only for one whose last segment just ended.
+        # Those are independent filesystem probes, so they still go through the
+        # shared I/O pool -- on a networked filesystem it is the per-probe
+        # latency, not CPU, that a campaign of thousands of chains pays for.
         return _map_io(_chain_status, list(ledger.chains.items()))
 
     # --- repair -------------------------------------------------------------
@@ -498,9 +571,10 @@ class Campaign:
         and blindly requeueing it would loop.
         """
         ledger = Ledger.load(self.ledger_path)
-        ledger.absorb_segment_records()
+        # status() absorbs the worker records and saves the ledger itself, so
+        # doing either here would only scan every chain's segment directory a
+        # second time for what the first pass already folded in.
         statuses = self.status(ledger)
-        ledger.save()
 
         wanted = {"resumable", "unstarted"} | ({"suspect"} if force else set())
         needy = {s.chain_id for s in statuses if s.verdict in wanted}
@@ -566,19 +640,26 @@ class Campaign:
         return job_id
 
 
-def _bins_in_dir(sim_dir: str, counting_obs: str = DEFAULT_COUNTING_OBS) -> int:
-    """Bin count for a ledger entry with no rebuilt ``Simulation`` behind it.
-
-    Only called from Campaign.status()'s per-chain fan-out, so -- like
-    bins_on_disk -- the read goes through the process pool: h5py serializes
-    every call within one process regardless of thread count (see
-    _get_process_pool's docstring), and that fan-out is exactly the "many
-    chains at once" case the pool exists for.
-    """
-    path = Path(sim_dir) / "data.h5"
-    if not path.exists():
-        return 0
-    N_bins, _read_ok, _error_text = (
-        _get_process_pool().submit(_read_bin_count, str(path), counting_obs).result()
+def _has_active_job(record: dict[str, Any], states: dict[str, dict]) -> bool:
+    """True if any of this chain's segments is still queued or running."""
+    return any(
+        (states.get(s.get("job_id")) or {}).get("status") in ACTIVE_STATES
+        for s in record.get("segments", [])
     )
-    return int(N_bins)
+
+
+def _bins_reported_by_worker(record: dict[str, Any]) -> int | None:
+    """Highest ``bins_after`` this chain's workers recorded, or None if none did.
+
+    Only meaningful for a chain with nothing running: the worker writes this
+    after ALF has flushed, so for an idle chain it *is* what stands on disk, and
+    reading the file back would just confirm it. The maximum rather than the
+    last: segments are held in submission order, and a requeued attempt that
+    crashed early can record fewer bins than one that already succeeded.
+    """
+    reported = [
+        s["bins_after"]
+        for s in record.get("segments", [])
+        if isinstance(s.get("bins_after"), int)
+    ]
+    return max(reported) if reported else None

@@ -280,7 +280,10 @@ def _status_with(tmp_path, bins, segments, slurm_state=None):
     camp = _campaign(tmp_path)
     with (
         patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states),
-        patch("py_alf.campaign.campaign._bins_in_dir", return_value=bins),
+        patch(
+            "py_alf.campaign.campaign._bin_counts",
+            side_effect=lambda paths, *a, **k: [bins] * len(paths),
+        ),
     ):
         return camp.status(Ledger.load(tmp_path / "c.json"))[0]
 
@@ -315,6 +318,134 @@ def test_status_active_is_left_alone(tmp_path):
     got = _status_with(tmp_path, 10, [{"index": 0, "job_id": "1_0"}], "RUNNING")
     assert got.verdict == "active"
     assert got.active_job == "1_0"
+
+
+# --- Campaign.status: what it is allowed *not* to read ----------------------
+#
+# A status check that re-reads every chain's data.h5 costs one HDF5 open per
+# chain, which on a campaign-sized grid is the whole runtime. These pin the
+# three tiers that avoid it -- and, just as importantly, the cases where the
+# read must still happen.
+
+
+def _status_counting_reads(tmp_path, chains, states=None, **kwargs):
+    """Run status over a ledger of prebuilt chain records; report what it read."""
+    led = _ledger(tmp_path)
+    led.data["chains"].update(chains)
+    led.save()
+
+    read: list[str] = []
+
+    def _counted(paths, *a, **k):
+        read.extend(paths)
+        return [0] * len(paths)
+
+    camp = _campaign(tmp_path)
+    with (
+        patch(
+            "py_alf.campaign.campaign._get_slurm_status_bulk",
+            return_value=states or {},
+        ),
+        patch("py_alf.campaign.campaign._bin_counts", side_effect=_counted),
+    ):
+        return camp.status(Ledger.load(tmp_path / "c.json"), **kwargs), read
+
+
+def _record(sim_dir, segments=(), **extra):
+    return {"sim_dir": sim_dir, "point": {}, "segments": list(segments), **extra}
+
+
+def test_status_never_reopens_a_finished_chain(tmp_path):
+    """The cached count is trusted at the target: ALF only ever appends bins."""
+    statuses, read = _status_counting_reads(
+        tmp_path, {"a": _record(str(tmp_path / "sim"), bins=100)}
+    )
+    assert read == []
+    assert statuses[0].bins == 100
+    assert statuses[0].verdict == "done"
+
+
+def test_status_re_reads_a_finished_chain_when_asked(tmp_path):
+    """``deep`` is the escape hatch for data that changed under the ledger."""
+    _, read = _status_counting_reads(
+        tmp_path, {"a": _record(str(tmp_path / "sim"), bins=100)}, deep=True
+    )
+    assert read == [str(tmp_path / "sim" / "data.h5")]
+
+
+def test_status_trusts_the_worker_record_for_an_idle_chain(tmp_path):
+    """Nothing is running, so what the last segment flushed is what is on disk."""
+    segments = [{"index": 0, "job_id": "1_0", "bins_after": 40}]
+    statuses, read = _status_counting_reads(
+        tmp_path,
+        {"a": _record(str(tmp_path / "sim"), segments)},
+        states={"1_0": {"status": "FAILED"}},
+    )
+    assert read == []
+    assert statuses[0].bins == 40
+    assert statuses[0].verdict == "resumable"
+
+
+def test_status_reads_a_chain_whose_job_is_still_running(tmp_path):
+    """A live job is writing bins the worker has not recorded yet."""
+    segments = [{"index": 0, "job_id": "1_0", "bins_after": 40}]
+    _, read = _status_counting_reads(
+        tmp_path,
+        {"a": _record(str(tmp_path / "sim"), segments)},
+        states={"1_0": {"status": "RUNNING"}},
+    )
+    assert read == [str(tmp_path / "sim" / "data.h5")]
+
+
+def test_status_reads_a_chain_whose_worker_left_no_record(tmp_path):
+    """A segment killed before it could write one proves nothing about the file."""
+    _, read = _status_counting_reads(
+        tmp_path,
+        {"a": _record(str(tmp_path / "sim"), [{"index": 0, "job_id": "1_0"}])},
+        states={"1_0": {"status": "FAILED"}},
+    )
+    assert read == [str(tmp_path / "sim" / "data.h5")]
+
+
+def test_status_caches_what_it_read_for_the_next_run(tmp_path):
+    """The saved count is what makes the second check cheap."""
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = _record(str(tmp_path / "sim"))
+    led.save()
+    camp = _campaign(tmp_path)
+    with (
+        patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}),
+        patch(
+            "py_alf.campaign.campaign._bin_counts",
+            side_effect=lambda paths, *a, **k: [100] * len(paths),
+        ),
+    ):
+        camp.status(Ledger.load(tmp_path / "c.json"))
+    assert Ledger.load(tmp_path / "c.json").chains["a"]["bins"] == 100
+
+
+def test_a_racing_read_cannot_walk_the_count_backwards(tmp_path):
+    """A mid-write read comes back low; caching it would show lost progress."""
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = _record(str(tmp_path / "sim"), bins=60)
+    assert led.record_bins({"a": 80}) is True
+    assert led.record_bins({"a": 0}) is False
+    assert led.chains["a"]["bins"] == 80
+
+
+def test_the_worker_record_taken_is_the_highest_one(tmp_path):
+    """A requeued attempt that crashed early records fewer bins than it found."""
+    segments = [
+        {"index": 0, "job_id": "1_0", "bins_after": 40},
+        {"index": 1, "job_id": "1_0", "bins_after": 12},
+    ]
+    statuses, read = _status_counting_reads(
+        tmp_path,
+        {"a": _record(str(tmp_path / "sim"), segments)},
+        states={"1_0": {"status": "FAILED"}},
+    )
+    assert read == []
+    assert statuses[0].bins == 40
 
 
 def test_chain_status_complete_tracks_the_target():

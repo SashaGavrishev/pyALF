@@ -1653,3 +1653,71 @@ def test_read_bin_count_is_a_pure_module_level_function():
 
     assert _read_bin_count.__module__ == "py_alf.cluster_submission"
     assert _read_bin_count.__qualname__ == "_read_bin_count"
+
+
+# --- _bin_counts: the batched read behind Campaign.status ---
+
+
+def test_bin_counts_keeps_results_in_caller_order(tmp_path):
+    """Chunked pool.map returns results by task; they must map back to their file."""
+    from py_alf.cluster_submission import _bin_counts
+
+    paths = []
+    for i in range(12):
+        d = tmp_path / f"chain_{i}"
+        d.mkdir()
+        _write_bins(d / "data.h5", i + 1)
+        paths.append(str(d / "data.h5"))
+
+    assert _bin_counts(paths, force=True) == list(range(1, 13))
+
+
+def test_bin_counts_reports_zero_for_a_missing_file(tmp_path):
+    """An unstarted chain has no data.h5; that is 0 bins, not a failure."""
+    from py_alf.cluster_submission import _bin_counts
+
+    (tmp_path / "there").mkdir()
+    _write_bins(tmp_path / "there" / "data.h5", 7)
+    counts = _bin_counts(
+        [
+            str(tmp_path / "there" / "data.h5"),
+            str(tmp_path / "gone" / "data.h5"),
+            str(tmp_path / "there" / "data.h5"),
+        ],
+        force=True,
+    )
+    assert counts == [7, 0, 7]
+
+
+def test_bin_counts_skips_the_read_for_an_unchanged_file(tmp_path):
+    """The (mtime, size) short-circuit is what keeps a repeat check cheap."""
+    from py_alf.cluster_submission import _bin_counts
+
+    d = tmp_path / "chain"
+    d.mkdir()
+    _write_bins(d / "data.h5", 9)
+    _settle(d / "data.h5")
+    path = str(d / "data.h5")
+
+    assert _bin_counts([path]) == [9]
+    with patch(
+        "py_alf.cluster_submission._read_bin_count",
+        side_effect=AssertionError("re-read an unchanged file"),
+    ):
+        assert _bin_counts([path]) == [9]
+
+
+def test_bin_counts_sees_a_file_that_grew(tmp_path):
+    """A chain that ran more bins must not be masked by the previous reading."""
+    from py_alf.cluster_submission import _bin_counts
+
+    d = tmp_path / "grower"
+    d.mkdir()
+    _write_bins(d / "data.h5", 5)
+    _settle(d / "data.h5")
+    path = str(d / "data.h5")
+    assert _bin_counts([path]) == [5]
+
+    _write_bins(d / "data.h5", 25)
+    _settle(d / "data.h5")
+    assert _bin_counts([path]) == [25]

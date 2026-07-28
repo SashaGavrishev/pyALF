@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
+from itertools import repeat
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -2026,11 +2027,29 @@ def _bin_count(
         return _bin_cache[key]
 
     if use_process_pool:
-        N_bins, read_ok, error_text = (
+        read = (
             _get_process_pool().submit(_read_bin_count, filename, counting_obs).result()
         )
     else:
-        N_bins, read_ok, error_text = _read_bin_count(filename, counting_obs)
+        read = _read_bin_count(filename, counting_obs)
+
+    return _absorb_bin_read(key, filename, read, stat_sig, final)
+
+
+def _absorb_bin_read(
+    key: tuple[str, str],
+    filename: str,
+    read: tuple[int, bool, str | None],
+    stat_sig: tuple[int, int] | None,
+    final: bool,
+) -> int:
+    """Fold one :func:`_read_bin_count` result into the module caches.
+
+    Split out of :func:`_bin_count` so the batched path
+    (:func:`_bin_counts`) inherits the same caching, stale-value fallback and
+    failure bookkeeping instead of reimplementing them.
+    """
+    N_bins, read_ok, error_text = read
 
     if error_text is not None and not read_ok:
         fails = _bin_read_failures.get(key, 0) + 1
@@ -2069,6 +2088,66 @@ def _bin_count(
     if final and read_ok:
         _bin_final.add(key)
     return N_bins
+
+
+# Files per task handed to the process pool by _bin_counts. One file per task
+# makes every read cost a full pickle/IPC round trip, which on a campaign-sized
+# batch dominates the h5py open it was meant to overlap; a chunk amortises that
+# over many reads while staying small enough that the workers finish together.
+_BIN_BATCH_CHUNK = 64
+
+
+def _bin_counts(
+    filenames: list[str],
+    counting_obs: str = "Ener_scal",
+    final: bool = False,
+    force: bool = False,
+) -> list[int]:
+    """Bin counts for many ``data.h5`` paths at once, in caller order.
+
+    The batched counterpart of :func:`_bin_count`, for a caller holding
+    thousands of paths (:meth:`py_alf.campaign.Campaign.status`). It differs
+    only in *dispatch*: the cheap (mtime, size) short-circuit runs here, and
+    whatever survives it goes to :func:`_get_process_pool` as one chunked
+    ``map`` rather than one blocking ``submit``/``result`` per file. Reading
+    one file at a time through the pool costs an IPC round trip per read and
+    serialises on the executor's single work queue -- measured on a
+    24k-chain campaign, that fan-out achieved no concurrency at all.
+    """
+    keys = [(name, counting_obs) for name in filenames]
+    counts: list[int | None] = [None] * len(filenames)
+    stats: list[tuple[int, int] | None] = [None] * len(filenames)
+    pending: list[int] = []
+
+    for i, key in enumerate(keys):
+        if key in _bin_final:
+            counts[i] = _bin_cache.get(key, 0)
+            continue
+        try:
+            st = os.stat(filenames[i])
+            stats[i] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            pass
+        if not force and stats[i] is not None and _bin_stat.get(key) == stats[i]:
+            cached = _bin_cache.get(key)
+            if cached is not None:
+                counts[i] = cached
+                continue
+        pending.append(i)
+
+    if pending:
+        reads = _get_process_pool().map(
+            _read_bin_count,
+            [filenames[i] for i in pending],
+            repeat(counting_obs, len(pending)),
+            chunksize=max(
+                1, min(_BIN_BATCH_CHUNK, len(pending) // _process_pool_size())
+            ),
+        )
+        for i, read in zip(pending, reads):
+            counts[i] = _absorb_bin_read(keys[i], filenames[i], read, stats[i], final)
+
+    return [0 if c is None else c for c in counts]
 
 
 def _colorize_status(status: str) -> str:
