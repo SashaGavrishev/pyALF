@@ -588,6 +588,51 @@ def test_chain_status_complete_tracks_the_target():
     assert replace(base, bins=100).complete
 
 
+# --- the progress hook -------------------------------------------------------
+
+
+def test_status_reports_every_chain_to_the_progress_hook_exactly_once(tmp_path):
+    """A bar can only reach 100% if every tier accounts for the chains it took.
+
+    Each tier settles a different subset, so a tier that resolved chains without
+    reporting them would leave the caller's bar stuck short of the total for the
+    whole run -- and the miscount would scale with how much of the grid was in
+    that tier, which is exactly the state that varies over a campaign's life.
+    """
+    led = _ledger(tmp_path)
+    led.data["chains"] = {
+        "cached": dict(_chain_on_disk(tmp_path, "cached", 100, "1_0"), bins=100),
+        "worker": _chain_on_disk(tmp_path, "worker", 40, "1_1", worker_bins=40),
+        "read": _chain_on_disk(tmp_path, "read", 55, "1_2", worker_bins=30),
+        "unstarted": {"sim_dir": str(tmp_path / "no"), "point": {}, "segments": []},
+    }
+    led.save()
+    states = {"1_1": {"status": "FAILED"}, "1_2": {"status": "RUNNING"}}
+
+    seen: list[tuple[int, str]] = []
+    camp = _campaign(tmp_path)
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value=states):
+        statuses = camp.status(
+            Ledger.load(tmp_path / "c.json"),
+            on_progress=lambda n, p: seen.append((n, p)),
+        )
+
+    assert sum(n for n, _ in seen) == len(statuses) == 4
+    # Phases are announced even when they settle nothing, so a bar shows what it
+    # is waiting on rather than looking hung during the scan.
+    assert {"scanning", "cached", "reading"} <= {phase for _, phase in seen}
+
+
+def test_the_progress_hook_is_optional(tmp_path):
+    """Nothing reports unless a hook is passed; the core owns no bar."""
+    led = _ledger(tmp_path)
+    led.data["chains"]["a"] = _chain_on_disk(tmp_path, "a", 100, "1_0", worker_bins=100)
+    led.save()
+    camp = _campaign(tmp_path)
+    with patch("py_alf.campaign.campaign._get_slurm_status_bulk", return_value={}):
+        assert camp.status()[0].bins == 100  # must not raise
+
+
 # --- Campaign.launch and Campaign.reconcile ---------------------------------
 #
 # What these guard is the pairing between a chain and the bin count that sizes

@@ -2102,6 +2102,7 @@ def _bin_counts(
     counting_obs: str = "Ener_scal",
     final: bool = False,
     force: bool = False,
+    on_progress: Callable[[int], None] | None = None,
 ) -> list[int]:
     """Bin counts for many ``data.h5`` paths at once, in caller order.
 
@@ -2113,6 +2114,9 @@ def _bin_counts(
     one file at a time through the pool costs an IPC round trip per read and
     serialises on the executor's single work queue -- measured on a
     24k-chain campaign, that fan-out achieved no concurrency at all.
+
+    ``on_progress(n)`` is called with how many paths a step settled, so a caller
+    can drive a bar over a batch big enough to be worth watching.
     """
     keys = [(name, counting_obs) for name in filenames]
     counts: list[int | None] = [None] * len(filenames)
@@ -2135,6 +2139,11 @@ def _bin_counts(
                 continue
         pending.append(i)
 
+    # Everything settled by the caches above cost nothing, so report it in one
+    # step: a bar that inched through them would misrepresent where the time is.
+    if on_progress is not None and len(pending) < len(filenames):
+        on_progress(len(filenames) - len(pending))
+
     if pending:
         reads = _get_process_pool().map(
             _read_bin_count,
@@ -2146,6 +2155,8 @@ def _bin_counts(
         )
         for i, read in zip(pending, reads):
             counts[i] = _absorb_bin_read(keys[i], filenames[i], read, stats[i], final)
+            if on_progress is not None:
+                on_progress(1)
 
     return [0 if c is None else c for c in counts]
 

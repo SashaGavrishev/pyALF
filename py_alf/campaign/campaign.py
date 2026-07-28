@@ -54,6 +54,12 @@ from .worker import SegmentPlan, measured_hours_per_bin, run_segment
 # Job states meaning "this chain is still being worked on, leave it alone".
 ACTIVE_STATES = frozenset({"PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "COMPLETING"})
 
+# Reports progress out of a long scan: ``(n_settled, phase)``. A campaign can
+# hold tens of thousands of chains, so a caller driving one from a terminal
+# needs to see movement -- but which chains are cheap is this layer's business,
+# not the caller's, hence a hook rather than an exposed work breakdown.
+ProgressFn = Callable[[int, str], None]
+
 # Hours per bin assumed for a chain that has neither measured itself yet nor
 # been given a ``cost_model``. Deliberately model-free -- only the caller knows
 # what its Hamiltonian costs -- and only ever sizes the first segment, which the
@@ -414,6 +420,7 @@ class Campaign:
         ledger: Ledger,
         states: dict[str, dict[str, str | None]],
         deep: bool = False,
+        on_progress: ProgressFn | None = None,
     ) -> dict[str, int]:
         """Every chain's bin count, opening as few ``data.h5`` files as possible.
 
@@ -452,6 +459,11 @@ class Campaign:
                     continue
             needs_read.append(chain_id)
 
+        # The tiers above are pure dict lookups, so credit them in one step
+        # rather than pretending they took measurable time.
+        if on_progress is not None:
+            on_progress(len(known), "cached")
+
         if needs_read:
             counts = _bin_counts(
                 [
@@ -459,6 +471,9 @@ class Campaign:
                     for cid in needs_read
                 ],
                 self.counting_obs,
+                on_progress=(
+                    None if on_progress is None else lambda n: on_progress(n, "reading")
+                ),
             )
             known.update(zip(needs_read, counts, strict=True))
             # A chain whose Simulation was rebuilt shares Simulation.bin_count's
@@ -474,7 +489,11 @@ class Campaign:
         return known
 
     def status(
-        self, ledger: Ledger | None = None, deep: bool = False, persist: bool = True
+        self,
+        ledger: Ledger | None = None,
+        deep: bool = False,
+        persist: bool = True,
+        on_progress: ProgressFn | None = None,
     ) -> list[ChainStatus]:
         """Per-chain progress and a verdict, judged by bins rather than job state.
 
@@ -482,8 +501,21 @@ class Campaign:
         ledger's cached counts (see :meth:`_resolve_bins`). ``persist`` writes
         the counts back, which is what makes the next check cheap; pass False
         for a caller that must not touch the ledger.
+
+        ``on_progress(n, phase)`` is called as chains are resolved: ``n`` is how
+        many were settled by this step and ``phase`` names what is being done,
+        so a caller can drive a progress bar without knowing the tiers. Every
+        chain is reported exactly once, so the counts sum to the grid size.
+        Rendering is the caller's business -- this layer has no opinion about
+        terminals, and none of the reporting happens unless a hook is passed.
         """
         ledger = ledger or Ledger.load(self.ledger_path)
+        if on_progress is not None:
+            # No count: the scan is a fixed pass over the unfinished chains, and
+            # naming it is what keeps the bar from looking hung during it.
+            # Phase names stay terse -- they are a bar label, and a long one
+            # leaves tqdm no width to draw the bar itself in.
+            on_progress(0, "scanning")
         absorbed = ledger.absorb_segment_records(skip_finished=not deep)
 
         all_jobs = [
@@ -492,9 +524,13 @@ class Campaign:
             for s in record.get("segments", [])
             if s.get("job_id")
         ]
+        if on_progress is not None and all_jobs:
+            on_progress(0, "slurm")
         states = _get_slurm_status_bulk(all_jobs) if all_jobs else {}
         submit_dir = self.submitter.submit_dir
-        bins_by_id = self._resolve_bins(ledger, states, deep=deep)
+        bins_by_id = self._resolve_bins(
+            ledger, states, deep=deep, on_progress=on_progress
+        )
         moved = ledger.record_bins(bins_by_id)
         if persist and (moved or absorbed):
             ledger.save()
