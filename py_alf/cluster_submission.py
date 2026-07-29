@@ -1926,18 +1926,38 @@ def _get_process_pool() -> ProcessPoolExecutor:
         return _process_pool
 
 
-def _read_bin_count(filename: str, counting_obs: str) -> tuple[int, bool, str | None]:
+def _stat_sig(filename: str) -> tuple[int, int] | None:
+    """``(st_mtime_ns, st_size)`` of *filename*, or None if it cannot be stat'd."""
+    try:
+        st = os.stat(filename)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _read_bin_count(
+    filename: str, counting_obs: str
+) -> tuple[int, bool, str | None, tuple[int, int] | None]:
     """Open *filename* and read its bin count, retrying through a mid-write race.
 
     Pure function of its arguments -- no cache, no module state read or
     written -- so it is safe to run inside a worker process via
-    :func:`_get_process_pool`. The caller (:func:`_bin_count`, its only
-    caller) owns everything stateful: caching, the stale-value fallback, and
-    the failure-count bookkeeping, none of which a worker process could share
-    back with the caller's copy of those module dicts anyway.
+    :func:`_get_process_pool`. The caller owns everything stateful: caching,
+    the stale-value fallback, and the failure-count bookkeeping, none of which
+    a worker process could share back with the caller's copy of those module
+    dicts anyway.
+
+    The file's (mtime, size) is taken here and handed back rather than stat'd by
+    the caller, so that on a batch a grid's worth of stats runs across the pool
+    instead of serially in one process -- on a networked filesystem a stat is
+    milliseconds, which at campaign scale is minutes. Taken *before* the read
+    for the reason :func:`_bin_count` documents: a write landing in between then
+    leaves a stale signature that forces a re-read next time, which is the safe
+    direction to be wrong in.
     """
     import h5py
 
+    sig = _stat_sig(filename)
     N_bins = 0
     read_ok = False
     last_exc: BaseException | None = None
@@ -1960,7 +1980,7 @@ def _read_bin_count(filename: str, counting_obs: str) -> tuple[int, bool, str | 
                 break
             time.sleep(_H5_RETRY_DELAYS[attempt])
 
-    return N_bins, read_ok, repr(last_exc) if last_exc is not None else None
+    return N_bins, read_ok, repr(last_exc) if last_exc is not None else None, sig
 
 
 def _bin_count(
@@ -2033,23 +2053,23 @@ def _bin_count(
     else:
         read = _read_bin_count(filename, counting_obs)
 
-    return _absorb_bin_read(key, filename, read, stat_sig, final)
+    return _absorb_bin_read(key, filename, read, final)
 
 
 def _absorb_bin_read(
     key: tuple[str, str],
     filename: str,
-    read: tuple[int, bool, str | None],
-    stat_sig: tuple[int, int] | None,
+    read: tuple[int, bool, str | None, tuple[int, int] | None],
     final: bool,
 ) -> int:
     """Fold one :func:`_read_bin_count` result into the module caches.
 
     Split out of :func:`_bin_count` so the batched path
     (:func:`_bin_counts`) inherits the same caching, stale-value fallback and
-    failure bookkeeping instead of reimplementing them.
+    failure bookkeeping instead of reimplementing them. The signature travels
+    in ``read`` because the reader takes it (see :func:`_read_bin_count`).
     """
-    N_bins, read_ok, error_text = read
+    N_bins, read_ok, error_text, stat_sig = read
 
     if error_text is not None and not read_ok:
         fails = _bin_read_failures.get(key, 0) + 1
@@ -2120,22 +2140,26 @@ def _bin_counts(
     """
     keys = [(name, counting_obs) for name in filenames]
     counts: list[int | None] = [None] * len(filenames)
-    stats: list[tuple[int, int] | None] = [None] * len(filenames)
     pending: list[int] = []
 
     for i, key in enumerate(keys):
         if key in _bin_final:
             counts[i] = _bin_cache.get(key, 0)
             continue
-        try:
-            st = os.stat(filenames[i])
-            stats[i] = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            pass
-        if not force and stats[i] is not None and _bin_stat.get(key) == stats[i]:
-            cached = _bin_cache.get(key)
-            if cached is not None:
-                counts[i] = cached
+        # Stat only when there is a previous reading for the stat to validate.
+        # _bin_stat lives in this process, so a freshly started CLI holds none
+        # and every such stat is a guaranteed miss -- on a networked filesystem
+        # a stat is milliseconds, and a grid's worth of them cost more than they
+        # could ever save. The chains that do have one (a second pass within a
+        # run, e.g. reconcile's launch after its status) still short-circuit,
+        # and the reads themselves take their own signature inside the pool.
+        if not force and key in _bin_cache:
+            # Both sides return None when absent, so an unrecorded signature and
+            # a vanished file would otherwise compare equal and serve the cache
+            # without ever looking at the disk.
+            recorded = _bin_stat.get(key)
+            if recorded is not None and recorded == _stat_sig(filenames[i]):
+                counts[i] = _bin_cache[key]
                 continue
         pending.append(i)
 
@@ -2154,7 +2178,7 @@ def _bin_counts(
             ),
         )
         for i, read in zip(pending, reads):
-            counts[i] = _absorb_bin_read(keys[i], filenames[i], read, stats[i], final)
+            counts[i] = _absorb_bin_read(keys[i], filenames[i], read, final)
             if on_progress is not None:
                 on_progress(1)
 
