@@ -431,10 +431,16 @@ class Campaign:
         1. a chain the ledger records at its target is finished and is trusted
            outright -- bins only ever increase, and the worker stops on the
            target rather than past it;
-        2. a chain with no running job is however many bins its last segment
+        2. a chain with no running job whose cached count was itself taken while
+           it was idle, at the segment list it still has, keeps that count --
+           nothing writes to an idle chain's file, and no job has started since
+           (:meth:`~py_alf.campaign.ledger.Ledger.bins_still_stand`). This is
+           the tier that carries a mid-campaign grid, where almost nothing has
+           reached its target yet;
+        3. a chain with no running job is however many bins its last segment
            reported writing (:func:`py_alf.campaign.worker.run_segment` records
            ``bins_after``); nothing has touched the file since it ended;
-        3. anything else -- a live job, or a chain whose worker record is
+        4. anything else -- a live job, or a chain whose worker record is
            missing because it died before writing one -- is read from disk, as
            one batch.
 
@@ -453,6 +459,9 @@ class Campaign:
                 known[chain_id] = cached
                 continue
             if not deep and not _has_active_job(record, states):
+                if ledger.bins_still_stand(record) and isinstance(cached, int):
+                    known[chain_id] = cached
+                    continue
                 reported = _bins_reported_by_worker(record)
                 if reported is not None:
                     known[chain_id] = reported
@@ -531,7 +540,14 @@ class Campaign:
         bins_by_id = self._resolve_bins(
             ledger, states, deep=deep, on_progress=on_progress
         )
-        moved = ledger.record_bins(bins_by_id)
+        # Only a count taken while nothing was writing may be reused next time,
+        # so the caching side has to know which chains those were.
+        settled = {
+            chain_id
+            for chain_id, record in ledger.chains.items()
+            if not _has_active_job(record, states)
+        }
+        moved = ledger.record_bins(bins_by_id, settled=settled)
         if persist and (moved or absorbed):
             ledger.save()
 
