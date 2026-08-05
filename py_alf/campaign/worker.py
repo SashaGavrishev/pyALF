@@ -210,6 +210,10 @@ def run_segment(sim) -> None:
         "job_id": job_id,
         "index": plan.index,
         "chain_id": plan.chain_id,
+        # What this segment's bins were actually computed with, not what HEAD
+        # is now -- lets a later archival pass tell old-commit bins apart from
+        # current ones without trusting anything but the segment itself.
+        "alf_commit": getattr(sim.alf_src, "commit", lambda: None)(),
         "cpu_max": float(cpu_max),
         "hours_per_bin_used": hours_per_bin,
         "bins_before": bins_before,
