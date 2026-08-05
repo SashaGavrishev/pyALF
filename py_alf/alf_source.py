@@ -10,6 +10,7 @@ __license__ = "GPL"
 import copy
 import importlib.util
 import os
+import re
 import subprocess
 from collections import OrderedDict
 
@@ -101,6 +102,23 @@ class ALF_source:
         self._PARAMS_GENERIC = default_parameters_generic._PARAMS_GENERIC
 
         self.default_parameters = get_default_parameters(parse_ham_mod, self.alf_dir)
+
+    def commit(self):
+        """Git commit ALF was last *built* at, or None if never built.
+
+        Read from ``Prog/git.h``, written by ``Git_config.sh`` as part of
+        ``make`` (dirty trees get a ``-dirty`` suffix there). This is what was
+        actually compiled into the binary a job will run, which can differ
+        from the source tree's current HEAD if it moved since the last build.
+        """
+        git_h = os.path.join(self.alf_dir, "Prog", "git.h")
+        try:
+            with open(git_h, encoding="UTF-8") as f:
+                text = f.read()
+        except OSError:
+            return None
+        match = re.search(r'GIT_COMMIT_HASH\s+"([^"]+)"', text)
+        return match.group(1) if match else None
 
     def get_ham_names(self):
         """Return list of Hamiltonians."""
